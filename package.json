@@ -1,0 +1,31 @@
+{
+  "name": "@hsw1606/mcp-mysql-bastion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only MySQL MCP server that reaches its database through an SSH bastion, with per-environment profiles",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-mysql-bastion": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && shx chmod +x dist/index.js",
+    "watch": "tsc --watch",
+    "start:stage": "./bin/mcp-mysql-stage.sh",
+    "start:prod": "./bin/mcp-mysql-prod.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.15.1",
+    "dotenv": "^16.5.0",
+    "mysql2": "^3.14.1",
+    "node-sql-parser": "^5.3.9",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.50",
+    "@types/ssh2": "^1.15.5",
+    "shx": "^0.3.4",
+    "typescript": "^5.8.3"
+  }
+}

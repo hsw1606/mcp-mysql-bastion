@@ -1,0 +1,7 @@
+dist
+node_modules/
+
+# Real profile values. Only .env.example is committed.
+.env
+.env.*
+!.env.example

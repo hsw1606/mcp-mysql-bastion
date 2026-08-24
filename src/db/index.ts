@@ -1,0 +1,640 @@
+import { performance } from "perf_hooks";
+import { isMultiDbMode } from "./../config/index.js";
+
+import {
+  isDDLAllowedForSchema,
+  isInsertAllowedForSchema,
+  isUpdateAllowedForSchema,
+  isDeleteAllowedForSchema,
+} from "./permissions.js";
+import {
+  extractSchemaFromQuery,
+  getQueryTypes,
+  containsSelectStar,
+  findPIIColumnReferences,
+  isIntrospectionQuery,
+} from "./utils.js";
+
+import * as mysql2 from "mysql2/promise";
+import { log } from "./../utils/index.js";
+import {
+  ensureTunnel,
+  getTunnelFatalError,
+  describeTunnel,
+} from "./../ssh/tunnel.js";
+import {
+  mcpConfig as config,
+  MYSQL_PROFILE,
+  PROFILE_LABEL,
+  IS_WRITE_FORBIDDEN_PROFILE,
+  MULTI_DB_WRITE_MODE,
+  MYSQL_DISABLE_READ_ONLY_TRANSACTIONS,
+  ENABLE_PII_REDACTION,
+  PII_EXTRA_COLUMNS,
+  PII_EXTRA_COLUMN_PATTERNS,
+  PII_REDACT_JSON_STRINGS,
+  PII_ALLOW_SELECT_STAR,
+  PII_ALLOW_REFERENCES,
+  PII_ALLOW_INTROSPECTION,
+  PII_BLOCK_INTROSPECTION,
+} from "./../config/index.js";
+import {
+  redactPII,
+  isPIIColumn,
+  DEFAULT_PII_COLUMNS,
+  filterIntrospectionRows,
+  type FilterableIntrospectionKind,
+} from "./../security/redact.js";
+
+// Force read-only mode in multi-DB mode unless explicitly configured otherwise
+if (isMultiDbMode && !MULTI_DB_WRITE_MODE) {
+  log("error", "Multi-DB mode detected - enabling read-only mode for safety");
+}
+
+// @INFO: Check if running in test mode
+const isTestEnvironment = process.env.NODE_ENV === "test" || process.env.VITEST;
+
+// @INFO: Safe way to exit process (not during tests)
+function safeExit(code: number): void {
+  if (!isTestEnvironment) {
+    process.exit(code);
+  } else {
+    log("error", `[Test mode] Would have called process.exit(${code})`);
+  }
+}
+
+// @INFO: Lazy load MySQL pool
+let poolPromise: Promise<mysql2.Pool> | undefined;
+
+/**
+ * Create the connection pool, opening an SSH tunnel first when one is
+ * configured.
+ *
+ * The tunnel is awaited before `createPool` is called, and `ensureTunnel()`
+ * only resolves once the local port is actually listening — so the pool is
+ * never handed an address that nothing is bound to yet. When no tunnel is
+ * configured this behaves exactly as upstream did.
+ *
+ * A failure here is not cached: `poolPromise` is cleared so the next query can
+ * retry once the bastion or database is reachable again.
+ */
+const getPool = (): Promise<mysql2.Pool> => {
+  if (!poolPromise) {
+    poolPromise = (async (): Promise<mysql2.Pool> => {
+      const endpoint = await ensureTunnel();
+
+      // Point the pool at the tunnel's loopback address. `socketPath` is
+      // dropped because mysql2 prefers it over host/port, which would silently
+      // bypass the tunnel we just opened.
+      const mysqlConfig = endpoint
+        ? (() => {
+            const { socketPath: _ignored, ...rest } = config.mysql as Record<
+              string,
+              unknown
+            >;
+            return { ...rest, host: endpoint.host, port: endpoint.port };
+          })()
+        : config.mysql;
+
+      const pool = mysql2.createPool(mysqlConfig as mysql2.PoolOptions);
+      log(
+        "info",
+        `MySQL pool created successfully (profile: ${PROFILE_LABEL}` +
+          (endpoint
+            ? `, via ${endpoint.reused ? "reused" : "new"} tunnel ${endpoint.host}:${endpoint.port}`
+            : "") +
+          ")",
+      );
+      return pool;
+    })();
+
+    poolPromise.catch((error) => {
+      log("error", "Error creating MySQL pool:", error);
+      poolPromise = undefined;
+    });
+  }
+  return poolPromise;
+};
+
+/**
+ * Reject early with a clear message when the tunnel has permanently dropped.
+ * Without this the caller would instead see an opaque ECONNRESET from mysql2
+ * against a loopback port whose listener no longer forwards anywhere.
+ */
+function assertTunnelHealthy(): void {
+  const fatal = getTunnelFatalError();
+  if (fatal) throw fatal;
+}
+
+/**
+ * One-line banner prepended to every tool response so the environment behind a
+ * result is never ambiguous.
+ */
+function profileBanner(): string {
+  const parts = [`profile: ${PROFILE_LABEL}`];
+  parts.push(IS_WRITE_FORBIDDEN_PROFILE ? "READ-ONLY (enforced)" : "read-only");
+  const db = config.mysql.database || "multi-db";
+  parts.push(`database: ${db}`);
+  const tunnel = describeTunnel();
+  if (tunnel) parts.push(tunnel);
+  return `[${parts.join(" | ")}]`;
+}
+
+async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
+  let connection;
+  try {
+    assertTunnelHealthy();
+    const pool = await getPool();
+    connection = await pool.getConnection();
+    const result = await connection.query(sql, params);
+    return (Array.isArray(result) ? result[0] : result) as T;
+  } catch (error) {
+    log("error", "Error executing query:", error);
+    throw error;
+  } finally {
+    if (connection) {
+      connection.release();
+      log("error", "Connection released");
+    }
+  }
+}
+
+// @INFO: New function to handle write operations
+async function executeWriteQuery<T>(sql: string): Promise<T> {
+  let connection;
+
+  // Defence in depth. `src/config/index.ts` already forces every ALLOW_* flag
+  // and schema override to false for a write-forbidden profile, so this branch
+  // should be unreachable. It exists so that a future refactor of the routing
+  // logic in `executeReadOnlyQuery` cannot reintroduce a write path to prod.
+  if (IS_WRITE_FORBIDDEN_PROFILE) {
+    log(
+      "error",
+      `Refusing write operation: profile "${MYSQL_PROFILE}" is read-only by policy.`,
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `${profileBanner()} Error: write operations are disabled by policy for profile "${MYSQL_PROFILE}". ` +
+            `This cannot be enabled through configuration.`,
+        },
+      ],
+      isError: true,
+    } as T;
+  }
+
+  try {
+    assertTunnelHealthy();
+    const pool = await getPool();
+    connection = await pool.getConnection();
+    log("error", "Write connection acquired");
+
+    // Extract schema for permissions (if needed)
+    const schema = extractSchemaFromQuery(sql);
+
+    // @INFO: Begin transaction for write operation
+    await connection.beginTransaction();
+
+    try {
+      // @INFO: Execute the write query
+      const startTime = performance.now();
+      const result = await connection.query(sql);
+      const endTime = performance.now();
+      const duration = endTime - startTime;
+      const response = Array.isArray(result) ? result[0] : result;
+
+      // @INFO: Commit the transaction
+      await connection.commit();
+
+      // @INFO: Format the response based on operation type
+      let responseText;
+
+      // Check the type of query
+      const queryTypes = await getQueryTypes(sql);
+      const isUpdateOperation = queryTypes.some((type) =>
+        ["update"].includes(type),
+      );
+      const isInsertOperation = queryTypes.some((type) =>
+        ["insert"].includes(type),
+      );
+      const isDeleteOperation = queryTypes.some((type) =>
+        ["delete"].includes(type),
+      );
+      const isDDLOperation = queryTypes.some((type) =>
+        ["create", "alter", "drop", "truncate"].includes(type),
+      );
+
+      // @INFO: Type assertion for ResultSetHeader which has affectedRows, insertId, etc.
+      if (isInsertOperation) {
+        const resultHeader = response as mysql2.ResultSetHeader;
+        responseText = `Insert successful on schema '${schema || "default"}'. Affected rows: ${resultHeader.affectedRows}, Last insert ID: ${resultHeader.insertId}`;
+      } else if (isUpdateOperation) {
+        const resultHeader = response as mysql2.ResultSetHeader;
+        responseText = `Update successful on schema '${schema || "default"}'. Affected rows: ${resultHeader.affectedRows}, Changed rows: ${resultHeader.changedRows || 0}`;
+      } else if (isDeleteOperation) {
+        const resultHeader = response as mysql2.ResultSetHeader;
+        responseText = `Delete successful on schema '${schema || "default"}'. Affected rows: ${resultHeader.affectedRows}`;
+      } else if (isDDLOperation) {
+        responseText = `DDL operation successful on schema '${schema || "default"}'.`;
+      } else {
+        responseText = JSON.stringify(response, null, 2);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: responseText,
+          },
+          {
+            type: "text",
+            text: `Query execution time: ${duration.toFixed(2)} ms`,
+          },
+        ],
+        isError: false,
+      } as T;
+    } catch (error: unknown) {
+      // @INFO: Rollback on error
+      log("error", "Error executing write query:", error);
+      await connection.rollback();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error executing write operation: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+  } catch (error: unknown) {
+    log("error", "Error in write operation transaction:", error);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Database connection error: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ],
+      isError: true,
+    } as T;
+  } finally {
+    if (connection) {
+      connection.release();
+      log("error", "Write connection released");
+    }
+  }
+}
+
+async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
+  let connection;
+  try {
+    assertTunnelHealthy();
+    // PII redaction works hand-in-hand with explicit column projection: the
+    // schema endpoint hides redacted columns, so the LLM should never need
+    // SELECT *. Refusing wildcard projections here prevents the LLM from
+    // accidentally pulling redacted columns it never saw in the schema.
+    if (
+      ENABLE_PII_REDACTION &&
+      !PII_ALLOW_SELECT_STAR &&
+      containsSelectStar(sql)
+    ) {
+      log(
+        "error",
+        "Refusing query with SELECT * while PII redaction is enabled; project explicit columns instead.",
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Error: SELECT * (and `table.*`) is not permitted while PII redaction is enabled. " +
+              "Project an explicit column list (e.g. SELECT col1, col2 FROM ...) so redacted columns are not accidentally returned. " +
+              "Set PII_ALLOW_SELECT_STAR=true to override this policy.",
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+
+    // Introspection guard. Three sub-policies under ENABLE_PII_REDACTION:
+    //   - filterable (SHOW COLUMNS / DESCRIBE / SHOW INDEX): execute, then
+    //     drop PII rows from the result.
+    //   - passthrough (SHOW TABLES / SHOW DATABASES / charset / collation /
+    //     etc.): execute unchanged. These expose only schema topology (table
+    //     and database names), no column-level PII.
+    //   - rejected (SHOW CREATE TABLE, information_schema.*, mysql.*, plus
+    //     any unrecognised SHOW): blocked, because we can't safely filter
+    //     them and they can leak column names verbatim.
+    // PII_ALLOW_INTROSPECTION=true bypasses the guard entirely.
+    // PII_BLOCK_INTROSPECTION=true restores the old hard-block behaviour for
+    // every introspection kind, including filterable and passthrough.
+    let introspectionFilterKind: FilterableIntrospectionKind | null = null;
+    let isIntrospectionPassThrough = false;
+    if (ENABLE_PII_REDACTION && !PII_ALLOW_INTROSPECTION) {
+      const intro = isIntrospectionQuery(sql);
+      if (intro.kind) {
+        const filterable: FilterableIntrospectionKind | null =
+          intro.kind === "show_columns" ||
+          intro.kind === "describe" ||
+          intro.kind === "show_index"
+            ? intro.kind
+            : null;
+        const passthrough = intro.kind === "show_passthrough";
+
+        if (PII_BLOCK_INTROSPECTION || (!filterable && !passthrough)) {
+          log(
+            "error",
+            `Refusing introspection query (${intro.kind}) while PII redaction is enabled.`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Error: SQL introspection (${intro.kind}) is not permitted while PII redaction is enabled. ` +
+                  `Use the mysql://tables and mysql://tables/{name} MCP resources to inspect schemas (PII columns are filtered there), ` +
+                  `or use SHOW COLUMNS / DESCRIBE / SHOW INDEX (PII columns will be filtered from the result). ` +
+                  `Set PII_ALLOW_INTROSPECTION=true to bypass this policy entirely.`,
+              },
+            ],
+            isError: true,
+          } as T;
+        }
+        if (filterable) {
+          // Filterable kind: allow through; we'll drop PII rows from the
+          // result before returning it.
+          introspectionFilterKind = filterable;
+        } else if (passthrough) {
+          // Passthrough kind: nothing to set up — just skip the queryTypes /
+          // permissions block below (the parser doesn't model these
+          // statements) and let the executor run the SQL as-is.
+          isIntrospectionPassThrough = true;
+        }
+      }
+    }
+
+    // PII column-reference guard: refuse queries that mention any redacted
+    // column anywhere in the AST (projection, WHERE, JOIN ON, ORDER BY,
+    // subqueries, ...). This closes alias-bypasses such as
+    // `CONCAT(first_name, ' ', last_name) AS NAME` where the result-key
+    // redactor never gets a chance because the output column is renamed.
+    if (ENABLE_PII_REDACTION && !PII_ALLOW_REFERENCES) {
+      const piiList = [...DEFAULT_PII_COLUMNS, ...PII_EXTRA_COLUMNS];
+      const hits = findPIIColumnReferences(sql, (col) =>
+        isPIIColumn(col, piiList, PII_EXTRA_COLUMN_PATTERNS),
+      );
+      if (hits.length > 0) {
+        const names = hits
+          .map((h) => (h.table ? `${h.table}.${h.column}` : h.column))
+          .join(", ");
+        log(
+          "error",
+          `Refusing query referencing redacted column(s): ${names}.`,
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Error: query references redacted column(s): ${names}. ` +
+                `These columns are protected by PII redaction policy and cannot be projected, ` +
+                `filtered, joined, or ordered on. Choose a different projection, ` +
+                `or set PII_ALLOW_REFERENCES=true to override this policy.`,
+            },
+          ],
+          isError: true,
+        } as T;
+      }
+    }
+
+    // Introspection statements (filterable + passthrough) are inherently
+    // read-only and `node-sql-parser` doesn't model most of them (SHOW TABLE
+    // STATUS, SHOW SCHEMAS, SHOW CHARSET fail to parse outright). Skip the
+    // queryType + permission + write-routing block entirely for these and
+    // execute them directly below.
+    let queryTypes: string[] = [];
+    let schema: string | null = null;
+    let isUpdateOperation = false;
+    let isInsertOperation = false;
+    let isDeleteOperation = false;
+    let isDDLOperation = false;
+
+    if (!introspectionFilterKind && !isIntrospectionPassThrough) {
+      queryTypes = await getQueryTypes(sql);
+      schema = extractSchemaFromQuery(sql);
+      isUpdateOperation = queryTypes.some((type) => ["update"].includes(type));
+      isInsertOperation = queryTypes.some((type) => ["insert"].includes(type));
+      isDeleteOperation = queryTypes.some((type) => ["delete"].includes(type));
+      isDDLOperation = queryTypes.some((type) =>
+        ["create", "alter", "drop", "truncate"].includes(type),
+      );
+    }
+
+    // Check schema-specific permissions
+    if (isInsertOperation && !isInsertAllowedForSchema(schema)) {
+      log(
+        "error",
+        `INSERT operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_INSERT_PERMISSIONS.`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: INSERT operations are not allowed for schema '${schema || "default"}'. Ask the administrator to update SCHEMA_INSERT_PERMISSIONS.`,
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+
+    if (isUpdateOperation && !isUpdateAllowedForSchema(schema)) {
+      log(
+        "error",
+        `UPDATE operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_UPDATE_PERMISSIONS.`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: UPDATE operations are not allowed for schema '${schema || "default"}'. Ask the administrator to update SCHEMA_UPDATE_PERMISSIONS.`,
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+
+    if (isDeleteOperation && !isDeleteAllowedForSchema(schema)) {
+      log(
+        "error",
+        `DELETE operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_DELETE_PERMISSIONS.`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: DELETE operations are not allowed for schema '${schema || "default"}'. Ask the administrator to update SCHEMA_DELETE_PERMISSIONS.`,
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+
+    if (isDDLOperation && !isDDLAllowedForSchema(schema)) {
+      log(
+        "error",
+        `DDL operations are not allowed for schema '${schema || "default"}'. Configure SCHEMA_DDL_PERMISSIONS.`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: DDL operations are not allowed for schema '${schema || "default"}'. Ask the administrator to update SCHEMA_DDL_PERMISSIONS.`,
+          },
+        ],
+        isError: true,
+      } as T;
+    }
+
+    // For write operations that are allowed, use executeWriteQuery
+    if (
+      (isInsertOperation && isInsertAllowedForSchema(schema)) ||
+      (isUpdateOperation && isUpdateAllowedForSchema(schema)) ||
+      (isDeleteOperation && isDeleteAllowedForSchema(schema)) ||
+      (isDDLOperation && isDDLAllowedForSchema(schema))
+    ) {
+      return executeWriteQuery(sql);
+    }
+
+    // For read-only operations, continue with the original logic
+    const pool = await getPool();
+    connection = await pool.getConnection();
+    log("error", "Read-only connection acquired");
+
+    // Set read-only mode (unless disabled via environment variable)
+    if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
+      await connection.query("SET SESSION TRANSACTION READ ONLY");
+    } else {
+      log("info", "Read-only transactions disabled via MYSQL_DISABLE_READ_ONLY_TRANSACTIONS=true");
+    }
+
+    // Begin transaction
+    await connection.beginTransaction();
+
+    try {
+      // Execute query - in multi-DB mode, we may need to handle USE statements specially
+      const startTime = performance.now();
+      const result = await connection.query(sql);
+      const endTime = performance.now();
+      const duration = endTime - startTime;
+      const rows = Array.isArray(result) ? result[0] : result;
+
+      // Rollback transaction (since it's read-only)
+      await connection.rollback();
+
+      // Reset to read-write mode (only if we set it to read-only)
+      if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
+        await connection.query("SET SESSION TRANSACTION READ WRITE");
+      }
+
+      // For introspection results we drop PII rows BEFORE the value-level
+      // redactor runs. The order matters because once a row is dropped, its
+      // metadata (e.g. column type, comment) can't leak via the redactor
+      // either. Fail closed on unrecognised row shape — the classifier
+      // believed this was a filterable introspection statement, but the
+      // result rows don't have the expected `Field`/`Column_name` key. That
+      // mismatch usually means an EXPLAIN of a non-table slipped through;
+      // we'd rather refuse than return raw metadata.
+      let intermediate: unknown = rows;
+      if (introspectionFilterKind) {
+        const piiList = [...DEFAULT_PII_COLUMNS, ...PII_EXTRA_COLUMNS];
+        const filtered = filterIntrospectionRows(
+          rows,
+          introspectionFilterKind,
+          (col) => isPIIColumn(col, piiList, PII_EXTRA_COLUMN_PATTERNS),
+        );
+        if (filtered === null) {
+          log(
+            "error",
+            `Refusing introspection result (${introspectionFilterKind}): unrecognised row shape, cannot filter PII safely.`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Error: could not safely filter introspection result for kind '${introspectionFilterKind}'. ` +
+                  `Use SHOW COLUMNS / DESCRIBE / SHOW INDEX against a real table, ` +
+                  `or set PII_ALLOW_INTROSPECTION=true to bypass filtering.`,
+              },
+            ],
+            isError: true,
+          } as T;
+        }
+        intermediate = filtered;
+      }
+
+      const payload = ENABLE_PII_REDACTION
+        ? redactPII(intermediate, {
+            extraColumns: PII_EXTRA_COLUMNS,
+            columnPatterns: PII_EXTRA_COLUMN_PATTERNS,
+            parseJsonStrings: PII_REDACT_JSON_STRINGS,
+          })
+        : intermediate;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(payload, null, 2),
+          },
+          {
+            type: "text",
+            text: `Query execution time: ${duration.toFixed(2)} ms`,
+          },
+        ],
+        isError: false,
+      } as T;
+    } catch (error) {
+      // Rollback transaction on query error
+      log("error", "Error executing read-only query:", error);
+      await connection.rollback();
+      throw error;
+    }
+  } catch (error) {
+    // Ensure we rollback and reset transaction mode on any error
+    log("error", "Error in read-only query transaction:", error);
+    try {
+      if (connection) {
+        await connection.rollback();
+        // Reset to read-write mode (only if we set it to read-only)
+        if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
+          await connection.query("SET SESSION TRANSACTION READ WRITE");
+        }
+      }
+    } catch (cleanupError) {
+      // Ignore errors during cleanup
+      log("error", "Error during cleanup:", cleanupError);
+    }
+    throw error;
+  } finally {
+    if (connection) {
+      connection.release();
+      log("error", "Read-only connection released");
+    }
+  }
+}
+
+export {
+  profileBanner,
+  isTestEnvironment,
+  safeExit,
+  executeQuery,
+  getPool,
+  executeWriteQuery,
+  executeReadOnlyQuery,
+  poolPromise,
+};
