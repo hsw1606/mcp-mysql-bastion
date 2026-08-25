@@ -22,7 +22,7 @@ client and nothing else.
 ## What you get
 
 - **SSH tunnel.** Opened before the connection pool exists, closed on shutdown.
-  Reuses an existing forward instead of opening a duplicate.
+  Each server owns its own tunnel, so instances never interfere.
 - **Profiles.** `MYSQL_PROFILE` picks `.env.<profile>`. Every response says which
   environment answered it.
 - **Read-only by default, unbreakable for prod.** `prod`/`production` refuse all
@@ -233,7 +233,8 @@ environment too, since that is what a model reads before choosing a tool.
 | `MYSQL_SSH_USER` | from alias | Bastion user. |
 | `MYSQL_SSH_PRIVATE_KEY_PATH` | `~/.ssh/id_rsa` | Key used to authenticate to the bastion. |
 | `MYSQL_SSH_PASSPHRASE` | *(unset)* | Only for an encrypted key. |
-| `MYSQL_SSH_LOCAL_PORT` | alias `LocalForward`, else `0` | Loopback port. `0` auto-assigns a free one. |
+| `MYSQL_SSH_LOCAL_PORT` | alias `LocalForward`, else `0` | Preferred loopback port. `0` auto-assigns. If the port is taken, an auto-assigned one is used instead. |
+| `MYSQL_SSH_REUSE_EXISTING` | `false` | Attach to a forward already on that port instead of opening our own. See the warning below. |
 
 Explicit variables always win over the alias, so one profile can override a
 single field without touching `~/.ssh/config`.
@@ -294,13 +295,31 @@ Behaviour worth knowing:
 
 - The listener binds to `127.0.0.1` only. It grants unauthenticated access to
   the forwarded database and must never be reachable from the network.
-- If the port already accepts connections, that forward is reused and no second
-  tunnel is opened — a manual `ssh -L` in another terminal counts. Reuse is
-  judged by a successful TCP handshake, so give each profile its own port.
+- **Each server owns its tunnel.** `MYSQL_SSH_LOCAL_PORT` is a preference, not a
+  requirement: if the port is already taken, this server opens its own tunnel on
+  an OS-assigned port. Nothing downstream cares about the number, since the pool
+  is told where to connect.
 - On an unexpected drop the SSH transport is re-established up to three times
   with exponential backoff (1s, 2s, 4s). After that, queries fail with an
   explicit message rather than an opaque `ECONNRESET`.
 - Teardown happens on `SIGINT`, `SIGTERM`, and when the client closes stdin.
+
+### Why tunnels are not shared by default
+
+An earlier version attached to any forward already listening on the profile's
+port, to avoid opening a second SSH session. That turned out to be the wrong
+trade.
+
+A borrowed tunnel lives and dies with the process that opened it, and MCP
+clients start and stop servers constantly — `codex exec` tears its server down
+at the end of every invocation. So the owner routinely exits first, and every
+borrower's in-flight query dies with `PROTOCOL_CONNECTION_LOST`. It presents as
+an intermittent, unreproducible tool failure.
+
+Owning a tunnel per server costs one extra SSH session and removes the failure
+mode entirely. Set `MYSQL_SSH_REUSE_EXISTING=true` only when the forward is
+externally managed and outlives every client — a long-running `ssh -L` you
+started yourself.
 
 ## Read-only enforcement
 
@@ -349,8 +368,11 @@ gave up. The error names the bastion. Restart the server once it is reachable.
 **Server exits immediately.** Run the wrapper by hand — startup failures print
 the reason to stderr regardless of `ENABLE_LOGGING`.
 
-**Both profiles answer from the same database.** Two profiles sharing a local
-port will reuse one tunnel. Give each its own.
+**A query fails with `PROTOCOL_CONNECTION_LOST` or `Connection lost`.** The
+tunnel went away mid-query. With the default settings each server owns its
+tunnel, so suspect the bastion or the network. If you set
+`MYSQL_SSH_REUSE_EXISTING=true`, the far more likely cause is that the process
+owning the shared forward exited — turn the flag back off.
 
 **`git push` rejected: "refusing to allow an OAuth App to create or update
 workflow".** An HTTPS remote with a token lacking the `workflow` scope. Use an

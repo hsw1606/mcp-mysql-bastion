@@ -29,12 +29,36 @@ export interface TunnelEndpoint {
   reused: boolean;
 }
 
+/**
+ * Raised when the local port was claimed by another process between our probe
+ * and our `listen()`. Not a failure on its own — the caller converts it into
+ * tunnel reuse.
+ */
+class LocalPortTakenError extends Error {}
+
 const RECONNECT_MAX_ATTEMPTS = 3;
 const RECONNECT_BASE_DELAY_MS = 1000;
 const PROBE_TIMEOUT_MS = 750;
 const SSH_READY_TIMEOUT_MS = 20000;
 
 export const SSH_ENABLED = process.env.MYSQL_SSH_ENABLED === "true";
+
+/**
+ * Attach to a forward that is already listening on the profile's local port
+ * instead of opening our own.
+ *
+ * Off by default, and that default is deliberate. Reuse makes this process's
+ * database access depend on the lifetime of whichever process opened the
+ * tunnel: MCP clients start and stop servers constantly, so the owner routinely
+ * exits first and every borrower's connections drop mid-query with
+ * PROTOCOL_CONNECTION_LOST. Owning our own tunnel costs one extra SSH session
+ * and removes that entire failure mode.
+ *
+ * Enable it only when an externally managed forward (a long-lived `ssh -L`) is
+ * meant to be shared.
+ */
+export const SSH_REUSE_EXISTING =
+  process.env.MYSQL_SSH_REUSE_EXISTING === "true";
 
 function optionalEnv(name: string): string | undefined {
   const raw = process.env[name];
@@ -310,7 +334,10 @@ function attachDropHandler(client: SSHClient, cfg: TunnelConfig): void {
  * own `forwardOut` channel on the shared SSH connection, which is how mysql2's
  * pool ends up with several independent MySQL connections over one SSH session.
  */
-function startLocalServer(cfg: TunnelConfig): Promise<number> {
+function startLocalServer(
+  cfg: TunnelConfig,
+  requestedPort: number,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer((socket) => {
       const client = sshClient;
@@ -351,23 +378,22 @@ function startLocalServer(cfg: TunnelConfig): Promise<number> {
     server.once("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         reject(
-          new Error(
-            `Local port ${cfg.localPort} is already in use by a process that did not accept our probe. ` +
-              `Free the port, or set MYSQL_SSH_LOCAL_PORT=0 to auto-assign one.`,
+          new LocalPortTakenError(
+            `Local port ${requestedPort} was claimed by another process.`,
           ),
         );
         return;
       }
       reject(
         new Error(
-          `Failed to open local tunnel listener on port ${cfg.localPort}: ${err.message}`,
+          `Failed to open local tunnel listener on port ${requestedPort}: ${err.message}`,
         ),
       );
     });
 
     // Bind to loopback only — this port grants unauthenticated access to the
     // forwarded database and must never be reachable from the network.
-    server.listen(cfg.localPort, "127.0.0.1", () => {
+    server.listen(requestedPort, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
         reject(new Error("Local tunnel listener reported no TCP address."));
@@ -398,11 +424,16 @@ export function ensureTunnel(): Promise<TunnelEndpoint | null> {
       const cfg = resolveTunnelConfig();
       activeConfig = cfg;
 
-      // Reuse an existing forward on this port rather than duplicating it.
-      if (cfg.localPort !== 0 && (await probeLocalPort(cfg.localPort))) {
+      // Opt-in only: attach to a forward someone else is running. See
+      // SSH_REUSE_EXISTING for why this is not the default.
+      if (
+        SSH_REUSE_EXISTING &&
+        cfg.localPort !== 0 &&
+        (await probeLocalPort(cfg.localPort))
+      ) {
         log(
           "error",
-          `[ssh] 127.0.0.1:${cfg.localPort} is already accepting connections; reusing the existing tunnel.`,
+          `[ssh] 127.0.0.1:${cfg.localPort} is already accepting connections; reusing it (MYSQL_SSH_REUSE_EXISTING=true).`,
         );
         return { host: "127.0.0.1", port: cfg.localPort, reused: true };
       }
@@ -418,11 +449,31 @@ export function ensureTunnel(): Promise<TunnelEndpoint | null> {
 
       let port: number;
       try {
-        port = await startLocalServer(cfg);
+        port = await startLocalServer(cfg, cfg.localPort);
       } catch (err) {
-        client.destroy();
-        sshClient = null;
-        throw err;
+        if (!(err instanceof LocalPortTakenError)) {
+          client.destroy();
+          sshClient = null;
+          throw err;
+        }
+
+        // The profile's preferred port is taken — either by another instance of
+        // this server or by a manual forward. Rather than borrowing that
+        // tunnel (whose owner may exit at any moment) or failing outright, fall
+        // back to an OS-assigned port and keep our own. The pool is told where
+        // to connect, so the port number itself does not matter to anything
+        // downstream.
+        log(
+          "error",
+          `[ssh] local port ${cfg.localPort} is taken; opening our own tunnel on an auto-assigned port instead.`,
+        );
+        try {
+          port = await startLocalServer(cfg, 0);
+        } catch (fallbackErr) {
+          client.destroy();
+          sshClient = null;
+          throw fallbackErr;
+        }
       }
 
       attachDropHandler(client, cfg);
