@@ -28,6 +28,8 @@ import {
   ENABLE_PII_REDACTION,
   PII_EXTRA_COLUMNS,
   PII_EXTRA_COLUMN_PATTERNS,
+  APP_SCHEMAS,
+  CODE_BRANCH,
 } from "./src/config/index.js";
 import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
 import {
@@ -109,6 +111,39 @@ if (
 } else {
   // Only read operations are allowed
   toolDescription += " (READ-ONLY)";
+}
+
+// Everything below is here to spare the model a discovery round-trip. A tool
+// description is read before the first call; anything it does not say has to be
+// found with a query, and `SHOW DATABASES` followed by guesswork is both slow
+// and easy to get wrong.
+
+if (CODE_BRANCH) {
+  toolDescription +=
+    `\n\nCODE REVISION: this database matches the \`${CODE_BRANCH}\` branch. ` +
+    `Read entities, migrations, and queries from that branch when correlating code with data.`;
+}
+
+if (APP_SCHEMAS.length > 0) {
+  toolDescription +=
+    "\n\nAPP -> SCHEMA (authoritative — use these directly; do not run SHOW DATABASES " +
+    "or search information_schema to find a schema):";
+  for (const entry of APP_SCHEMAS) {
+    toolDescription +=
+      `\n  - ${entry.app} -> ${entry.schema}` +
+      (entry.description ? ` — ${entry.description}` : "");
+  }
+  toolDescription +=
+    "\nQualify every table with its schema (schema.table). Any schema not listed here is " +
+    "either absent from this environment or not owned by an application.";
+  const needsQuoting = APP_SCHEMAS.find(
+    (entry) => !/^[A-Za-z0-9_$]+$/.test(entry.schema),
+  );
+  if (needsQuoting) {
+    toolDescription +=
+      `\nA schema name that is not a bare identifier must be backtick-quoted, ` +
+      `e.g. SELECT ... FROM \`${needsQuoting.schema}\`.some_table.`;
+  }
 }
 
 // Determine if we're in read-only mode (no write operations enabled)
@@ -253,6 +288,18 @@ export default function createMcpServer() {
         mimeType: "application/json",
       });
 
+      // The declared app -> schema map, for clients that read resources rather
+      // than the tool description.
+      if (APP_SCHEMAS.length > 0) {
+        resources.push({
+          uri: "mysql://schemas",
+          name: "App schemas",
+          title: "Application to schema map",
+          description: `Which schema each application owns in ${PROFILE_LABEL}`,
+          mimeType: "application/json",
+        });
+      }
+
       return { resources };
     } catch (error) {
       log("error", "Error in ListResourcesRequest handler:", error);
@@ -264,6 +311,29 @@ export default function createMcpServer() {
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     try {
       log("info", "Handling ReadResourceRequest:", request.params.uri);
+
+      // The app -> schema map is configuration, not data: answer it without
+      // touching the database, and before the table-name parsing below can
+      // mistake "schemas" for a table.
+      if (request.params.uri === "mysql://schemas") {
+        return {
+          contents: [
+            {
+              uri: request.params.uri,
+              mimeType: "application/json",
+              text: JSON.stringify(
+                {
+                  profile: PROFILE_LABEL,
+                  ...(CODE_BRANCH ? { codeBranch: CODE_BRANCH } : {}),
+                  apps: APP_SCHEMAS,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
 
       // Parse the URI to extract table name and optional database name
       const uriParts = request.params.uri.split("/");

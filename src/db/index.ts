@@ -26,6 +26,7 @@ import {
   mcpConfig as config,
   MYSQL_PROFILE,
   PROFILE_LABEL,
+  CODE_BRANCH,
   IS_WRITE_FORBIDDEN_PROFILE,
   MULTI_DB_WRITE_MODE,
   MYSQL_DISABLE_READ_ONLY_TRANSACTIONS,
@@ -135,6 +136,10 @@ function profileBanner(): string {
   parts.push(IS_WRITE_FORBIDDEN_PROFILE ? "READ-ONLY (enforced)" : "read-only");
   const db = config.mysql.database || "multi-db";
   parts.push(`database: ${db}`);
+  // Repeated on every result, not just at tool-selection time: a long session
+  // reading both environments should never have to scroll back to remember
+  // which branch the rows in front of it belong to.
+  if (CODE_BRANCH) parts.push(`code: ${CODE_BRANCH} branch`);
   const tunnel = describeTunnel();
   if (tunnel) parts.push(tunnel);
   return `[${parts.join(" | ")}]`;
