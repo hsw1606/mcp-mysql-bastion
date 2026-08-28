@@ -1,6 +1,6 @@
 import * as dotenv from "dotenv";
 import * as fs from "fs";
-import { SchemaPermissions } from "../types/index.js";
+import { AppSchemaEntry, SchemaPermissions } from "../types/index.js";
 import { parseSchemaPermissions, parseMySQLConnectionString } from "../utils/index.js";
 
 /**
@@ -113,6 +113,96 @@ export const IS_WRITE_FORBIDDEN_PROFILE =
 export const PROFILE_LABEL = MYSQL_PROFILE
   ? MYSQL_PROFILE.toUpperCase()
   : "UNSPECIFIED";
+
+/**
+ * Git branch whose code matches the data in this environment.
+ *
+ * A model reasoning about a query almost always needs the code that wrote the
+ * rows, and picking the wrong branch is a silent error — stage schema read
+ * against `main` looks like a missing column rather than a wrong checkout. So
+ * the branch is declared here and repeated in the tool description and in
+ * every response banner.
+ *
+ * `MYSQL_CODE_BRANCH` overrides; otherwise the conventional mapping for the
+ * profile is used, and an unknown profile simply says nothing.
+ */
+const DEFAULT_CODE_BRANCH: Readonly<Record<string, string>> = {
+  stage: "develop",
+  staging: "develop",
+  dev: "develop",
+  develop: "develop",
+  prod: "main",
+  production: "main",
+};
+
+export const CODE_BRANCH: string =
+  process.env.MYSQL_CODE_BRANCH?.trim() || DEFAULT_CODE_BRANCH[MYSQL_PROFILE] || "";
+
+/**
+ * Parse `MYSQL_APP_SCHEMAS` into the application-to-schema map.
+ *
+ * Entries are separated by `;` or newlines — not commas, so a description can
+ * read like a sentence. Each entry is `app:schema` with an optional third
+ * field: `app:schema:what lives in it`. Only the first two colons split, so a
+ * description may contain colons of its own.
+ *
+ * An app may appear more than once: one service legitimately owns several
+ * schemas (a per-tenant one alongside a shared one), and dropping all but the
+ * last mapping would hide a schema the model needs. Only an exact repeat of the
+ * same app-and-schema pair is treated as a mistake.
+ *
+ * A malformed entry is reported and skipped rather than thrown: a typo in one
+ * line must not take the server down, and the remaining mappings are still
+ * worth having.
+ */
+function parseAppSchemas(raw: string | undefined): AppSchemaEntry[] {
+  if (!raw) return [];
+  const entries: AppSchemaEntry[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw.split(/[;\n]/)) {
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    const firstColon = trimmed.indexOf(":");
+    if (firstColon === -1) {
+      console.error(
+        `[config] ignoring MYSQL_APP_SCHEMAS entry "${trimmed}": expected "app:schema" or "app:schema:description".`,
+      );
+      continue;
+    }
+    const app = trimmed.slice(0, firstColon).trim();
+    const rest = trimmed.slice(firstColon + 1);
+    const secondColon = rest.indexOf(":");
+    const schema = (secondColon === -1 ? rest : rest.slice(0, secondColon)).trim();
+    const description =
+      secondColon === -1 ? undefined : rest.slice(secondColon + 1).trim() || undefined;
+
+    if (!app || !schema) {
+      console.error(
+        `[config] ignoring MYSQL_APP_SCHEMAS entry "${trimmed}": app and schema must both be non-empty.`,
+      );
+      continue;
+    }
+    const pair = `${app.toLowerCase()}\u0000${schema.toLowerCase()}`;
+    if (seen.has(pair)) {
+      console.error(
+        `[config] MYSQL_APP_SCHEMAS repeats "${app}:${schema}"; keeping the first.`,
+      );
+      continue;
+    }
+    seen.add(pair);
+    entries.push({ app, schema, description });
+  }
+  return entries;
+}
+
+/**
+ * Declared application-to-schema map. Empty is a valid configuration — the
+ * server then behaves exactly as it did before this existed.
+ */
+export const APP_SCHEMAS: readonly AppSchemaEntry[] = parseAppSchemas(
+  process.env.MYSQL_APP_SCHEMAS,
+);
 
 // @INFO: Parse connection string if provided
 // Connection string takes precedence over individual environment variables
