@@ -1,44 +1,46 @@
 # mcp-mysql-bastion
 
-A read-only MySQL MCP server for databases that are only reachable through an
-SSH bastion, with one named profile per environment.
+SSH bastion을 거쳐야만 닿을 수 있는 MySQL을 위한 읽기 전용 MCP 서버. 환경마다
+이름 붙은 profile 하나씩을 둡니다.
 
-It opens the tunnel itself. You point it at an `~/.ssh/config` alias you already
-have, and it handles the forward, the connection pool, and the teardown. A
-profile named `prod` cannot write, and that is decided in code rather than in
-configuration.
+Tunnel은 서버가 직접 엽니다. 이미 쓰고 있는 `~/.ssh/config` alias 하나만 가리켜
+주면 forwarding, connection pool, teardown까지 알아서 처리합니다. `prod`라는 이름의 profile은
+쓰기가 불가능하며, 이는 설정이 아니라 코드에서 결정됩니다.
 
-## Attribution
+## 출처
 
-Derived from [benborla/mcp-server-mysql](https://github.com/benborla/mcp-server-mysql)
-(MIT). The MCP server, query routing, permission model, and PII redaction come
-from that project; see [LICENSE.md](LICENSE.md).
+[benborla/mcp-server-mysql](https://github.com/benborla/mcp-server-mysql)(MIT)에서
+파생됐습니다. MCP 서버, 쿼리 routing, 권한 모델, PII redaction은 그 프로젝트에서
+왔습니다. [LICENSE.md](LICENSE.md)를 참고하세요.
 
-New here: the SSH tunnel layer (`src/ssh/`), the profile system, the wrapper
-scripts, and stderr-only logging. The remote HTTP transport, test suite, eval
-harness, and Docker packaging were dropped — this serves stdio to a local MCP
-client and nothing else.
+이 저장소에서 새로 추가된 것: SSH tunnel 계층(`src/ssh/`), profile 체계, wrapper
+스크립트, stderr 전용 로깅. 원격 HTTP transport, test suite, eval harness,
+Docker packaging은 걷어냈습니다 — 이 서버는 로컬 MCP 클라이언트에 stdio로
+서비스할 뿐, 그 외의 일은 하지 않습니다.
 
-## What you get
+## 제공하는 것
 
-- **SSH tunnel.** Opened before the connection pool exists, closed on shutdown.
-  Each server owns its own tunnel, so instances never interfere.
-- **Profiles.** `MYSQL_PROFILE` picks `.env.<profile>`. Every response says which
-  environment answered it.
-- **Read-only by default, unbreakable for prod.** `prod`/`production` refuse all
-  writes regardless of configuration.
-- **stdio-safe logging.** All diagnostics go to stderr, so `ENABLE_LOGGING=true`
-  never corrupts the MCP stream.
+- **SSH tunnel.** Connection pool이 생기기 전에 열리고, 종료 시 닫힙니다. 각 서버가
+  자기 tunnel을 소유하므로 instance끼리 간섭하지 않습니다.
+- **Profile.** `MYSQL_PROFILE`이 `.env.<profile>`을 고릅니다. 모든 응답이 어느
+  환경에서 온 답인지 밝힙니다.
+- **기본 읽기 전용, prod는 깨뜨릴 수 없음.** `prod`/`production`은 설정과
+  무관하게 모든 쓰기를 거부합니다.
+- **Map은 탐색이 아니라 선언.** 각 profile이 어떤 schema가 어떤 application의
+  것인지, 데이터가 어느 git branch에 대응하는지를 명시하므로, 모델은 이를
+  뒤져서 알아내는 대신 툴 설명에서 읽습니다.
+- **stdio에 안전한 로깅.** 모든 진단 출력이 stderr로 가므로
+  `ENABLE_LOGGING=true`가 MCP 스트림을 망가뜨리는 일이 없습니다.
 
-## Requirements
+## 요구 사항
 
-- Node.js 20+
-- SSH access to the bastion, with the key already working (`ssh <alias>` succeeds)
-- A MySQL user on the target database
+- Node.js 20 이상
+- Bastion에 대한 SSH 접근 권한, 그리고 이미 동작하는 키(`ssh <alias>`가 성공할 것)
+- 대상 데이터베이스의 MySQL 사용자 계정
 
-## Setup
+## 설치
 
-### 1. Install and build
+### 1. 설치와 빌드
 
 ```bash
 git clone <this repo>
@@ -47,12 +49,12 @@ npm install
 npm run build
 ```
 
-The build emits `dist/index.js`, which is what the MCP clients execute.
+빌드는 `dist/index.js`를 만들며, MCP 클라이언트가 실행하는 것이 바로 이 파일입니다.
 
-### 2. Describe the bastion in `~/.ssh/config`
+### 2. `~/.ssh/config`에 bastion 기술하기
 
-The server can read everything it needs from a Host alias, which keeps
-credentials and hostnames out of this repo entirely:
+서버는 필요한 정보를 Host alias에서 모두 읽어올 수 있습니다. 이렇게 하면
+credentials과 호스트명을 이 저장소 바깥에 온전히 둘 수 있습니다:
 
 ```sshconfig
 Host my-stage-db
@@ -61,21 +63,21 @@ Host my-stage-db
     LocalForward 3307 db-stage.cluster-ro.example.rds.amazonaws.com:3306
 ```
 
-`HostName`, `User`, `Port`, `IdentityFile`, and the first `LocalForward` are all
-picked up. Verify it works on its own before going further:
+`HostName`, `User`, `Port`, `IdentityFile`, 그리고 첫 번째 `LocalForward`를
+읽어갑니다. 다음 단계로 넘어가기 전에 alias 자체가 동작하는지 확인하세요:
 
 ```bash
 ssh my-stage-db "echo ok"
 ```
 
-### 3. Create a profile
+### 3. Profile 만들기
 
 ```bash
 cp .env.example .env.stage
 chmod 600 .env.stage
 ```
 
-With an alias in place, a profile is short:
+alias이 있다면 profile은 짧습니다:
 
 ```dotenv
 MYSQL_PROFILE=stage
@@ -93,26 +95,27 @@ ALLOW_DELETE_OPERATION=false
 ALLOW_DDL_OPERATION=false
 ```
 
-Leave `MYSQL_DB` empty for multi-DB mode (`SHOW DATABASES`, cross-schema
-queries). Repeat for `.env.prod` with `MYSQL_PROFILE=prod`.
+multi-DB 모드(`SHOW DATABASES`, schema 간 쿼리)를 쓰려면 `MYSQL_DB`를 비워
+두세요. `.env.prod`도 `MYSQL_PROFILE=prod`로 같은 방식으로 만듭니다.
 
-`.env.*` files are gitignored; only `.env.example` is committed. Never put a
-real password in a file that gets committed.
+`.env.*` 파일은 gitignore 대상이며, 커밋되는 것은 `.env.example`뿐입니다.
+커밋되는 파일에는 절대 실제 비밀번호를 넣지 마세요.
 
-### 4. Check the profile before registering it
+### 4. 등록하기 전에 profile 점검하기
 
-Run the wrapper directly. It validates the env file, the credentials, and the
-SSH key, then waits for MCP traffic on stdin:
+Wrapper를 직접 실행하세요. env 파일, credentials, SSH 키를 검증한 뒤 stdin에서 MCP
+트래픽을 기다립니다:
 
 ```bash
 ./bin/mcp-mysql-stage.sh
 ```
 
-Silence is success — it means the server is up and stdout is clean. `Ctrl-C` to
-stop. A misconfiguration prints the reason to stderr and exits non-zero.
+아무 출력이 없으면 성공입니다 — 서버가 떴고 stdout이 깨끗하다는 뜻입니다.
+`Ctrl-C`로 중단하세요. 설정이 잘못됐다면 이유를 stderr에 찍고 0이 아닌 코드로
+종료합니다.
 
-To see what it is doing, set `ENABLE_LOGGING=true` in the profile and look for
-the `[ssh]` lines:
+무슨 일을 하는지 보고 싶다면 profile에 `ENABLE_LOGGING=true`를 넣고 `[ssh]`
+줄을 확인하세요:
 
 ```text
 [ssh] resolved alias "my-stage-db" from ~/.ssh/config: {...}
@@ -120,40 +123,40 @@ the `[ssh]` lines:
 [ssh] tunnel listening on 127.0.0.1:3307
 ```
 
-### 5. Register with Claude Code
+### 5. Claude Code에 등록하기
 
-Use absolute paths — the client does not resolve `~` or relative paths:
+절대 경로를 쓰세요 — 클라이언트는 `~`나 상대 경로를 해석하지 않습니다:
 
 ```bash
 claude mcp add mysql-stage -s user -- /absolute/path/to/mcp-mysql-bastion/bin/mcp-mysql-stage.sh
 claude mcp add mysql-prod  -s user -- /absolute/path/to/mcp-mysql-bastion/bin/mcp-mysql-prod.sh
 ```
 
-`-s user` registers for every project. Use `-s local` to scope to the current
-one. Confirm:
+`-s user`는 모든 프로젝트에 등록합니다. 현재 프로젝트로만 한정하려면
+`-s local`을 쓰세요. 확인:
 
 ```bash
 claude mcp list
 ```
 
-Both should report `✔ Connected`. The registration lands in `~/.claude.json`
-under the top-level `mcpServers` key; prefer the CLI over editing that file,
-since it also holds per-project state.
+둘 다 `✔ Connected`로 나와야 합니다. 등록 내용은 `~/.claude.json`의 최상위
+`mcpServers` 키에 들어갑니다. 이 파일은 프로젝트별 상태도 함께 담고 있으니
+직접 편집하기보다 CLI를 쓰는 편이 좋습니다.
 
-To change the path later, remove and re-add:
+나중에 경로를 바꾸려면 제거 후 다시 추가하세요:
 
 ```bash
 claude mcp remove mysql-stage -s user
 claude mcp add mysql-stage -s user -- /new/path/bin/mcp-mysql-stage.sh
 ```
 
-A server already running in an open session keeps its old path until that
-session restarts.
+이미 열려 있는 세션에서 돌고 있는 서버는 그 세션을 재시작하기 전까지 이전
+경로를 그대로 씁니다.
 
-### 6. Register with Codex
+### 6. Codex에 등록하기
 
-Codex has no `mcp add`, so append to `~/.codex/config.toml` — append, do not
-overwrite:
+Codex에는 `mcp add`가 없으므로 `~/.codex/config.toml`에 추가하세요 — 덮어쓰지
+말고 append 해야 합니다:
 
 ```toml
 [mcp_servers.mysql-stage]
@@ -169,39 +172,40 @@ startup_timeout_sec = 30
 tool_timeout_sec = 120
 ```
 
-Back the file up first; it holds your other MCP servers and their credentials.
+먼저 파일을 백업하세요. 다른 MCP 서버들과 그 credentials이 함께 들어 있는
+파일입니다.
 
 ```bash
 cp ~/.codex/config.toml ~/.codex/config.toml.bak
-codex mcp list          # both should show as enabled
+codex mcp list          # 둘 다 enabled로 보여야 합니다
 ```
 
-**On the timeouts.** `startup_timeout_sec` covers the MCP handshake only, which
-takes about 0.2s here — the tunnel is opened lazily on the first query, not
-during startup, so it does not block `initialize`. The first query pays the SSH
-handshake and lands around 3s, which is what `tool_timeout_sec` needs to
-accommodate. The values above are roughly 10x the measured numbers.
+**timeout에 대해.** `startup_timeout_sec`은 MCP handshake만 포함하며, 여기서는
+0.2초 정도 걸립니다 — tunnel은 시작 시점이 아니라 첫 쿼리에서 지연 생성되므로
+`initialize`를 막지 않습니다. 첫 쿼리가 SSH handshake 비용을 치르며 3초 안팎이
+걸리는데, `tool_timeout_sec`이 감당해야 하는 것이 이 값입니다. 위 설정값은 실측치의
+대략 10배입니다.
 
-**On the sandbox.** MCP servers run outside the sandbox that `sandbox_mode`
-applies to Codex's own shell, so no sandbox change is needed for the server to
-read your SSH key or reach the bastion.
+**sandbox에 대해.** MCP 서버는 `sandbox_mode`가 Codex 자체 shell에 적용하는
+sandbox 바깥에서 돌아갑니다. 따라서 서버가 SSH 키를 읽거나 bastion에 닿기 위해
+sandbox 설정을 바꿀 필요는 없습니다.
 
-Verify end to end:
+전 구간 확인:
 
 ```bash
 codex exec "Using mysql-stage, run: SELECT 1"
 ```
 
-## Usage
+## 사용법
 
-Ask in terms of the profile, and the environment comes back in the answer:
+Profile 이름으로 물어보면 답변에 환경이 함께 돌아옵니다:
 
 ```text
 Using mysql-stage, how many rows are in app.users?
 ```
 
 ```text
-[profile: STAGE | read-only | database: multi-db | ssh tunnel: dev@bastion.stage.example.com -> db-stage.cluster-ro.example:3306]
+[profile: STAGE | read-only | database: multi-db | code: develop branch | ssh tunnel: dev@bastion.stage.example.com -> db-stage.cluster-ro.example:3306]
 [
   {
     "c": 13369
@@ -209,191 +213,260 @@ Using mysql-stage, how many rows are in app.users?
 ]
 ```
 
-Every response carries that banner — success and refusal alike — so a stage
-result cannot be mistaken for a prod one. The tool description names the
-environment too, since that is what a model reads before choosing a tool.
+모든 응답이 — 성공이든 거부든 — 이 banner를 달고 나오므로 stage 결과를 prod
+결과로 착각할 수 없습니다. 툴 설명에도 환경 이름이 들어갑니다. 모델이 툴을
+고르기 전에 읽는 것이 바로 툴 설명이기 때문입니다.
 
-## Environment variables
+## 모델에게 무엇이 어디 있는지 알려주기
+
+내버려 두면 모델은 "lead는 어느 schema에 있지?"라는 질문에 `SHOW DATABASES`와
+`information_schema` 쿼리 몇 번, 그리고 추측으로 답합니다. 하나하나가 왕복
+비용이고, 추측은 가끔 틀립니다. 모델에게 없는 이 두 가지 사실은 운영자가 이미
+알고 있는 것이므로, profile이 이를 명시합니다.
+
+### `MYSQL_APP_SCHEMAS` — 어떤 schema가 어떤 앱의 것인가
+
+항목 구분자는 `;` 또는 개행입니다 — 쉼표가 아니므로 설명을 문장처럼 쓸 수
+있습니다. 각 항목은 `app:schema`, 또는 `app:schema:설명` 형식입니다:
+
+```dotenv
+MYSQL_APP_SCHEMAS="core-api:haulla:Main product service - the primary schema;
+core-api:haulla-shared:Tenant-shared data, also owned by core-api;
+tycoon-api:tycoon:Internal sales/CRM tool"
+```
+
+한 앱이 여러 번 나올 수 있습니다. 테넌트별 schema와 공용 schema를 함께 갖는
+서비스는 둘 다 적으세요 — 뒤엣것만 남기면 모델에게 필요한 schema가 사라집니다.
+같은 `app:schema` 쌍이 정확히 반복될 때만 실수로 봅니다. 설명에는 `;`를 쓸 수
+없습니다. 항목이 쪼개집니다.
+
+이 map은 툴 설명 뒤에 붙습니다. 모델이 첫 호출 전에 읽는 것이 툴 설명입니다:
+
+```text
+APP -> SCHEMA (authoritative — use these directly; do not run SHOW DATABASES
+or search information_schema to find a schema):
+  - core-api -> haulla — Main product service - the primary schema
+  - core-api -> haulla-shared — Tenant-shared data, also owned by core-api
+  - tycoon-api -> tycoon — Internal sales/CRM tool
+  ...
+```
+
+**여기에는 migration을 넘겨서도 살아남는 사실만 적으세요.** schema의 테이블
+목록을 나열하면 `SHOW TABLES` 한 번을 아끼는 대신 조용히 낡습니다. 그리고 이
+map은 authoritative하다고 선언되므로, **틀린 목록은 없는 목록보다 나쁩니다** —
+모델이 "그런 테이블은 없다"고 단정해 버립니다. 어떤 앱이 어떤 schema를 쓰는지는
+사람만 알고 데이터베이스에 물어볼 수 없는 사실이지만, 그 schema에 어떤 테이블이
+있는지는 모델이 직접 찾으면 됩니다.
+
+resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 제공됩니다. 이름이
+단순 식별자가 아닌 schema(`haulla-shared`)가 있으면 backtick으로 감싸야 한다는
+안내가 덧붙습니다. 이 map이 유발할 수 있는 유일한 문법 오류가 그것이기
+때문입니다.
+
+이 map은 filter가 아니라 문서입니다 — 무엇을 쿼리할 수 있는지는 제한하지
+않습니다. 설정하지 않으면 이전 동작 그대로입니다.
+
+형식이 잘못된 항목은 stderr에 보고하고 건너뜁니다. 오타 하나 때문에 map 전체를
+잃어서는 안 되므로, 나머지 항목은 그대로 로드됩니다.
+
+### `MYSQL_CODE_BRANCH` — 데이터가 어느 branch에 대응하는가
+
+행과 코드를 대조하는 모델에게는 올바른 checkout이 필요한데, 틀렸을 때 조용히
+실패합니다. stage column을 `main` 기준으로 읽으면 branch가 잘못된 것이 아니라
+migration이 빠진 것처럼 보이기 때문입니다. 그래서 각 profile이 자기 branch를
+명시하며, 이 값은 툴 설명과 응답 banner 양쪽에 나타납니다:
+
+```dotenv
+MYSQL_CODE_BRANCH=develop    # .env.stage
+MYSQL_CODE_BRANCH=main       # .env.prod
+```
+
+설정하지 않으면 profile에 따라 기본값이 정해집니다 —
+`stage`/`staging`/`dev`/`develop`은 `develop`, `prod`/`production`은 `main`이며,
+그 밖의 profile에서는 아무것도 말하지 않습니다.
+
+## 환경 변수
 
 ### Profile
 
-| Variable | Default | Meaning |
+| 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `MYSQL_PROFILE` | *(unset)* | Environment label. `prod`/`production` forces read-only. |
-| `MYSQL_ENV_FILE` | *(unset)* | Load exactly this env file instead of `.env.<profile>`. |
+| `MYSQL_PROFILE` | *(미설정)* | 환경 label. `prod`/`production`은 읽기 전용을 강제합니다. |
+| `MYSQL_ENV_FILE` | *(미설정)* | `.env.<profile>` 대신 정확히 이 env 파일을 로드합니다. |
+| `MYSQL_APP_SCHEMAS` | *(미설정)* | `;`로 구분된 `app:schema[:설명]` 항목. 툴 설명과 `mysql://schemas`에 노출됩니다. |
+| `MYSQL_CODE_BRANCH` | profile별 | 이 환경의 데이터가 대응하는 git branch. `stage`→`develop`, `prod`→`main`. |
 
 ### SSH tunnel
 
-| Variable | Default | Meaning |
+| 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `MYSQL_SSH_ENABLED` | `false` | Open a tunnel before connecting. |
-| `MYSQL_SSH_CONFIG_HOST` | *(unset)* | `~/.ssh/config` Host alias to read `HostName`, `User`, `Port`, `IdentityFile`, and the first `LocalForward` from. |
-| `MYSQL_SSH_HOST` | from alias | Bastion hostname. |
-| `MYSQL_SSH_PORT` | `22` | Bastion SSH port. |
-| `MYSQL_SSH_USER` | from alias | Bastion user. |
-| `MYSQL_SSH_PRIVATE_KEY_PATH` | `~/.ssh/id_rsa` | Key used to authenticate to the bastion. |
-| `MYSQL_SSH_PASSPHRASE` | *(unset)* | Only for an encrypted key. |
-| `MYSQL_SSH_LOCAL_PORT` | alias `LocalForward`, else `0` | Preferred loopback port. `0` auto-assigns. If the port is taken, an auto-assigned one is used instead. |
-| `MYSQL_SSH_REUSE_EXISTING` | `false` | Attach to a forward already on that port instead of opening our own. See the warning below. |
+| `MYSQL_SSH_ENABLED` | `false` | 접속 전에 tunnel을 엽니다. |
+| `MYSQL_SSH_CONFIG_HOST` | *(미설정)* | `HostName`, `User`, `Port`, `IdentityFile`, 첫 `LocalForward`를 읽어올 `~/.ssh/config`의 Host alias. |
+| `MYSQL_SSH_HOST` | alias에서 | bastion 호스트명. |
+| `MYSQL_SSH_PORT` | `22` | bastion SSH 포트. |
+| `MYSQL_SSH_USER` | alias에서 | bastion 사용자. |
+| `MYSQL_SSH_PRIVATE_KEY_PATH` | `~/.ssh/id_rsa` | bastion 인증에 쓰는 키. |
+| `MYSQL_SSH_PASSPHRASE` | *(미설정)* | 암호화된 키일 때만 필요합니다. |
+| `MYSQL_SSH_LOCAL_PORT` | alias `LocalForward`, 없으면 `0` | 선호하는 loopback 포트. `0`은 자동 할당. 포트가 이미 쓰이고 있으면 자동 할당된 포트를 대신 씁니다. |
+| `MYSQL_SSH_REUSE_EXISTING` | `false` | 직접 열지 않고 해당 포트에 이미 떠 있는 forward에 붙습니다. 아래 경고를 참고하세요. |
 
-Explicit variables always win over the alias, so one profile can override a
-single field without touching `~/.ssh/config`.
+명시적으로 지정한 변수가 항상 alias보다 우선하므로, `~/.ssh/config`를 건드리지
+않고 한 profile에서 필드 하나만 덮어쓸 수 있습니다.
 
 ### MySQL
 
-| Variable | Default | Meaning |
+| 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `MYSQL_HOST` | `127.0.0.1` | With a tunnel, the database **as seen from the bastion** — the forwarding target, not the address the pool dials. An alias's `LocalForward` target takes precedence. |
-| `MYSQL_PORT` | `3306` | Same. |
-| `MYSQL_USER` / `MYSQL_PASS` | — | Database credentials. Required. |
-| `MYSQL_DB` | *(empty)* | Empty enables multi-DB mode. |
-| `MYSQL_POOL_SIZE` | `10` | Pool size. |
-| `MYSQL_CONNECT_TIMEOUT` | `10000` | Connect timeout, ms. |
-| `MYSQL_BIG_NUMBER_STRINGS` | `false` | Return BIGINT/DECIMAL as strings. Set this if the schema uses snowflake IDs. |
-| `MYSQL_DATE_STRINGS` | `false` | Return dates as strings instead of `Date`. |
-| `MYSQL_SSL` | `false` | TLS to MySQL (independent of the SSH tunnel). |
+| `MYSQL_HOST` | `127.0.0.1` | tunnel을 쓸 때는 **bastion에서 바라본** 데이터베이스 — pool이 접속하는 주소가 아니라 forwarding 대상입니다. alias의 `LocalForward` 대상이 우선합니다. |
+| `MYSQL_PORT` | `3306` | 위와 같습니다. |
+| `MYSQL_USER` / `MYSQL_PASS` | — | 데이터베이스 credentials. 필수입니다. |
+| `MYSQL_DB` | *(비어 있음)* | 비어 있으면 multi-DB 모드가 켜집니다. |
+| `MYSQL_POOL_SIZE` | `10` | pool 크기. |
+| `MYSQL_CONNECT_TIMEOUT` | `10000` | 접속 timeout(ms). |
+| `MYSQL_BIG_NUMBER_STRINGS` | `false` | BIGINT/DECIMAL을 문자열로 반환합니다. schema가 snowflake ID를 쓴다면 켜세요. |
+| `MYSQL_DATE_STRINGS` | `false` | 날짜를 `Date`가 아닌 문자열로 반환합니다. |
+| `MYSQL_SSL` | `false` | MySQL로의 TLS(SSH tunnel과는 별개). |
 
-### Writes
+### 쓰기
 
-All default to `false`, and are forced to `false` for a write-forbidden profile
-no matter what they are set to.
+모두 기본값은 `false`이며, 쓰기 금지 profile에서는 어떤 값을 넣든 `false`로
+강제됩니다.
 
-| Variable | Meaning |
+| 변수 | 의미 |
 | --- | --- |
-| `ALLOW_INSERT_OPERATION` | Permit INSERT. |
-| `ALLOW_UPDATE_OPERATION` | Permit UPDATE. |
-| `ALLOW_DELETE_OPERATION` | Permit DELETE. |
-| `ALLOW_DDL_OPERATION` | Permit CREATE/ALTER/DROP/TRUNCATE. |
-| `MULTI_DB_WRITE_MODE` | Permit writes while in multi-DB mode. |
-| `SCHEMA_*_PERMISSIONS` | Per-schema overrides, `"db1:true,db2:false"`. |
+| `ALLOW_INSERT_OPERATION` | INSERT 허용. |
+| `ALLOW_UPDATE_OPERATION` | UPDATE 허용. |
+| `ALLOW_DELETE_OPERATION` | DELETE 허용. |
+| `ALLOW_DDL_OPERATION` | CREATE/ALTER/DROP/TRUNCATE 허용. |
+| `MULTI_DB_WRITE_MODE` | multi-DB 모드에서의 쓰기 허용. |
+| `SCHEMA_*_PERMISSIONS` | schema별 override, `"db1:true,db2:false"`. |
 
-### Diagnostics
+### 진단
 
-| Variable | Default | Meaning |
+| 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `ENABLE_LOGGING` | `false` | Diagnostics to stderr. Safe with any MCP client. |
-| `ENABLE_PII_REDACTION` | `false` | Mask likely PII in results. Inherited from upstream. |
+| `ENABLE_LOGGING` | `false` | 진단 출력을 stderr로. 어떤 MCP 클라이언트에서도 안전합니다. |
+| `ENABLE_PII_REDACTION` | `false` | 결과에서 PII로 보이는 값을 redaction 처리합니다. 원본 프로젝트에서 물려받았습니다. |
 
-## How the tunnel works
+## Tunnel이 동작하는 방식
 
-The forward is in-process, via `ssh2` — not a spawned `ssh -N -L`. A loopback
-listener fronts one SSH connection, and each accepted socket gets its own
-`forwardOut` channel, so the pool ends up with several independent MySQL
-connections over a single SSH session.
+Forwarding은 `ssh -N -L`을 spawn 하는 대신 `ssh2`를 통해 프로세스 내부에서
+이뤄집니다. loopback listener 하나가 SSH 연결 하나를 앞에서 받고, 수락된 socket마다
+자기 `forwardOut` channel을 갖습니다. 그 결과 pool은 SSH 세션 하나 위에서 서로
+독립적인 MySQL connection 여러 개를 갖게 됩니다.
 
-That was chosen over a child process for three reasons:
+자식 프로세스 대신 이 방식을 고른 이유는 세 가지입니다:
 
-1. **Cleanup is structural.** The tunnel's lifetime is the process's lifetime.
-   There is no child that can outlive the server, so a dangling `ssh` holding a
-   forwarded port open is not a failure mode that exists.
-2. **Readiness is exact.** "Create the pool only after the port is listening" is
-   a `server.listen()` callback rather than a poll.
-3. **No borrowed stderr.** A spawned `ssh` writes its own warnings, and some
-   bastions are chatty. Nothing it says can reach stdout here.
+1. **Teardown이 구조적으로 보장됩니다.** tunnel의 수명이 곧 프로세스의 수명입니다.
+   서버보다 오래 살아남을 자식이 없으므로, forwarding된 포트를 붙잡은 채 남아
+   있는 `ssh`라는 실패 양상 자체가 존재하지 않습니다.
+2. **준비 완료 시점이 정확합니다.** "포트가 listening을 시작한 뒤에만 pool을
+   만든다"가 polling이 아니라 `server.listen()` callback입니다.
+3. **남의 stderr를 떠안지 않습니다.** spawn된 `ssh`는 자기 경고를 뱉고, 어떤
+   bastion은 말이 많습니다. 여기서는 그것이 stdout에 닿을 수 없습니다.
 
-Behaviour worth knowing:
+알아둘 만한 동작:
 
-- The listener binds to `127.0.0.1` only. It grants unauthenticated access to
-  the forwarded database and must never be reachable from the network.
-- **Each server owns its tunnel.** `MYSQL_SSH_LOCAL_PORT` is a preference, not a
-  requirement: if the port is already taken, this server opens its own tunnel on
-  an OS-assigned port. Nothing downstream cares about the number, since the pool
-  is told where to connect.
-- On an unexpected drop the SSH transport is re-established up to three times
-  with exponential backoff (1s, 2s, 4s). After that, queries fail with an
-  explicit message rather than an opaque `ECONNRESET`.
-- Teardown happens on `SIGINT`, `SIGTERM`, and when the client closes stdin.
+- Listener는 `127.0.0.1`에만 bind 합니다. forwarding된 데이터베이스에 인증 없이
+  접근할 수 있게 해주므로, 네트워크에서 절대 닿을 수 있어서는 안 됩니다.
+- **각 서버는 자기 tunnel을 소유합니다.** `MYSQL_SSH_LOCAL_PORT`는 요구 사항이
+  아니라 선호일 뿐입니다. 포트가 이미 쓰이고 있으면 이 서버는 OS가 할당한
+  포트에 자기 tunnel을 엽니다. pool은 어디로 접속할지 전달받으므로 뒷단에서는
+  포트 번호에 신경 쓰지 않습니다.
+- 예기치 않게 끊기면 SSH transport를 지수 backoff(1초, 2초, 4초)로 최대 세 번
+  다시 세웁니다. 그 뒤에는 알 수 없는 `ECONNRESET` 대신 명시적인 메시지와
+  함께 쿼리가 실패합니다.
+- Teardown은 `SIGINT`, `SIGTERM`, 그리고 클라이언트가 stdin을 닫을 때 일어납니다.
 
-### Why tunnels are not shared by default
+### 기본값에서 tunnel을 공유하지 않는 이유
 
-An earlier version attached to any forward already listening on the profile's
-port, to avoid opening a second SSH session. That turned out to be the wrong
-trade.
+이전 버전은 SSH 세션을 하나 더 여는 것을 피하려고, profile 포트에 이미 떠 있는
+forward가 있으면 거기에 붙었습니다. 결과적으로 잘못된 선택이었습니다.
 
-A borrowed tunnel lives and dies with the process that opened it, and MCP
-clients start and stop servers constantly — `codex exec` tears its server down
-at the end of every invocation. So the owner routinely exits first, and every
-borrower's in-flight query dies with `PROTOCOL_CONNECTION_LOST`. It presents as
-an intermittent, unreproducible tool failure.
+빌려 쓴 tunnel은 그것을 연 프로세스와 생사를 함께하는데, MCP 클라이언트는 서버를
+쉴 새 없이 띄우고 내립니다 — `codex exec`는 호출이 끝날 때마다 자기 서버를
+내립니다. 그래서 소유자가 먼저 종료되는 일이 흔하고, 그때마다 빌려 쓰던 쪽의
+진행 중인 쿼리가 `PROTOCOL_CONNECTION_LOST`로 죽습니다. 겉보기에는 간헐적이고
+재현되지 않는 툴 실패로 나타납니다.
 
-Owning a tunnel per server costs one extra SSH session and removes the failure
-mode entirely. Set `MYSQL_SSH_REUSE_EXISTING=true` only when the forward is
-externally managed and outlives every client — a long-running `ssh -L` you
-started yourself.
+서버마다 tunnel을 소유하면 SSH 세션 하나를 더 쓰는 대신 이 실패 양상이 통째로
+사라집니다. `MYSQL_SSH_REUSE_EXISTING=true`는 forward가 외부에서 관리되고 모든
+클라이언트보다 오래 사는 경우 — 직접 띄워 둔 장수 `ssh -L` 같은 경우 — 에만
+켜세요.
 
-## Read-only enforcement
+## 읽기 전용 강제
 
-For a profile named `prod` or `production`, `src/config/index.ts` forces
-`ALLOW_INSERT`, `ALLOW_UPDATE`, `ALLOW_DELETE`, `ALLOW_DDL`, and
-`MULTI_DB_WRITE_MODE` to `false`, and blanks the `SCHEMA_*_PERMISSIONS`
-overrides.
+Profile 이름이 `prod` 또는 `production`이면 `src/config/index.ts`가
+`ALLOW_INSERT`, `ALLOW_UPDATE`, `ALLOW_DELETE`, `ALLOW_DDL`,
+`MULTI_DB_WRITE_MODE`를 `false`로 강제하고 `SCHEMA_*_PERMISSIONS` override를
+비웁니다.
 
-Blanking the overrides is the part that matters: they are per-schema exceptions
-to the global flags, so leaving them intact would let
-`SCHEMA_UPDATE_PERMISSIONS=some_db:true` reopen the door the global veto just
-closed. `executeWriteQuery` also refuses outright, as a second line of defence
-against a future refactor of the routing logic.
+핵심은 override를 비우는 부분입니다. 이들은 전역 flag에 대한 schema별
+예외이므로, 그대로 두면 `SCHEMA_UPDATE_PERMISSIONS=some_db:true`가 방금 전역
+거부로 닫은 문을 다시 열어버립니다. routing logic이 앞으로 refactoring될 경우를
+대비한 2차 방어선으로, `executeWriteQuery`도 별도로 거부합니다.
 
-The practical consequence: no env file, shell export, or MCP client setting can
-make a prod profile write. Attempting it logs the ignored flags to stderr and
-carries on read-only.
+실질적인 귀결: 어떤 env 파일도, shell export도, MCP 클라이언트 설정도 prod
+profile이 쓰게 만들 수 없습니다. 시도하면 무시된 flag를 stderr에 기록하고
+읽기 전용으로 계속 동작합니다.
 
-Other profiles are read-only by default but can opt in, since their `ALLOW_*`
-flags are ordinary configuration.
+다른 profile은 기본적으로 읽기 전용이지만 켤 수 있습니다. 그쪽의 `ALLOW_*`
+flag는 평범한 설정이기 때문입니다.
 
-## Troubleshooting
+## 문제 해결
 
-**Client reports a handshake or JSON parse error.** Something wrote to stdout,
-which carries the MCP framing. This server routes all logging to stderr, so
-suspect a shell profile that echoes on startup (`~/.zshrc`, `~/.bash_profile`)
-or a custom wrapper. Check with:
+**클라이언트가 handshake 또는 JSON parsing 오류를 보고합니다.** 무언가가 MCP
+framing을 나르는 stdout에 썼다는 뜻입니다. 이 서버는 모든 로깅을 stderr로
+보내므로, 시작할 때 뭔가를 출력하는 shell profile(`~/.zshrc`, `~/.bash_profile`)이나
+custom wrapper를 의심하세요. 확인 방법:
 
 ```bash
 ./bin/mcp-mysql-stage.sh < /dev/null | head
 ```
 
-Any output at all is the bug.
+출력이 조금이라도 있다면 그것이 버그입니다.
 
-**`SSH private key not found` or a permission error.** The key path is wrong or
-unreadable. `MYSQL_SSH_PRIVATE_KEY_PATH` defaults to `~/.ssh/id_rsa`; the key
-must be `chmod 600` and, if encrypted, needs `MYSQL_SSH_PASSPHRASE`.
+**`SSH private key not found` 또는 권한 오류.** 키 경로가 틀렸거나 읽을 수
+없습니다. `MYSQL_SSH_PRIVATE_KEY_PATH`의 기본값은 `~/.ssh/id_rsa`이며, 키는
+`chmod 600`이어야 하고 암호화되어 있다면 `MYSQL_SSH_PASSPHRASE`가 필요합니다.
 
-**`Local port N is already in use`.** Something holds the port but refused our
-probe. Find it with `lsof -nP -i :N`, or set `MYSQL_SSH_LOCAL_PORT=0` to
-auto-assign.
+**`Local port N is already in use`.** 무언가가 포트를 잡고 있으면서 우리 탐지에
+응답하지 않았습니다. `lsof -nP -i :N`으로 찾거나, `MYSQL_SSH_LOCAL_PORT=0`으로
+자동 할당하세요.
 
-**Queries fail after working for a while.** The tunnel dropped and reconnection
-gave up. The error names the bastion. Restart the server once it is reachable.
+**한동안 잘 되다가 쿼리가 실패합니다.** tunnel이 끊겼고 재연결이 포기한
+것입니다. 오류 메시지에 bastion 이름이 담깁니다. bastion에 닿을 수 있게 되면
+서버를 재시작하세요.
 
-**Server exits immediately.** Run the wrapper by hand — startup failures print
-the reason to stderr regardless of `ENABLE_LOGGING`.
+**서버가 즉시 종료됩니다.** wrapper를 직접 실행해 보세요. 시작 실패는
+`ENABLE_LOGGING`과 무관하게 이유를 stderr에 찍습니다.
 
-**A query fails with `PROTOCOL_CONNECTION_LOST` or `Connection lost`.** The
-tunnel went away mid-query. With the default settings each server owns its
-tunnel, so suspect the bastion or the network. If you set
-`MYSQL_SSH_REUSE_EXISTING=true`, the far more likely cause is that the process
-owning the shared forward exited — turn the flag back off.
+**쿼리가 `PROTOCOL_CONNECTION_LOST` 또는 `Connection lost`로 실패합니다.**
+쿼리 도중 tunnel이 사라졌습니다. 기본 설정에서는 각 서버가 자기 tunnel을 소유하므로
+bastion이나 네트워크를 의심하세요. `MYSQL_SSH_REUSE_EXISTING=true`를 켜 뒀다면,
+공유 forward를 소유한 프로세스가 종료된 것이 훨씬 유력한 원인입니다 — flag를
+다시 끄세요.
 
-**`git push` rejected: "refusing to allow an OAuth App to create or update
-workflow".** An HTTPS remote with a token lacking the `workflow` scope. Use an
-SSH remote:
+**`git push`가 "refusing to allow an OAuth App to create or update workflow"로
+거부됩니다.** `workflow` scope가 없는 토큰으로 HTTPS remote를 쓰고 있습니다.
+SSH remote를 쓰세요:
 
 ```bash
 git remote set-url origin git@github.com:<owner>/<repo>.git
 ```
 
-## Layout
+## 구성
 
 ```text
-index.ts              MCP server, tool + resource handlers, shutdown
-src/config/           env loading, profile policy, mysql2 options
-src/db/               query routing, permission checks, pool
-src/security/         PII redaction (upstream)
+index.ts              MCP 서버, tool + resource handler, 종료 처리
+src/config/           env 로딩, profile 정책, mysql2 옵션
+src/db/               쿼리 routing, 권한 검사, pool
+src/security/         PII redaction (원본 프로젝트)
 src/ssh/config.ts     ~/.ssh/config Host alias parser
-src/ssh/tunnel.ts     tunnel lifecycle: open, reuse, reconnect, close
-bin/                  profile wrappers for MCP clients
+src/ssh/tunnel.ts     tunnel lifecycle: 열기, 재사용, 재연결, 닫기
+bin/                  MCP 클라이언트용 profile wrapper
 ```
 
-## License
+## 라이선스
 
-MIT. See [LICENSE.md](LICENSE.md).
+MIT. [LICENSE.md](LICENSE.md)를 참고하세요.
