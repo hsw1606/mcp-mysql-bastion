@@ -95,6 +95,18 @@ export class CatalogDocuments {
     return this.disabledReason;
   }
 
+  /**
+   * Forget that this session already woke the document axis, so the next wake
+   * re-reads the ref. The server never runs `git fetch`, so this is the only
+   * way a fetch the user ran mid-session becomes visible without a restart.
+   * Clearing the failure reason too gives a repaired repository a second
+   * chance: otherwise one transient git error disables documents for good.
+   */
+  resetWake(): void {
+    this.attempted = false;
+    this.disabledReason = null;
+  }
+
   private async git(args: string[]): Promise<string> {
     if (!this.options.repo) throw new Error("MYSQL_DOCS_REPO is not configured.");
     console.error(`[catalog] git -C ${this.options.repo} ${args.join(" ")}`);

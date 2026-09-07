@@ -294,6 +294,9 @@ primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 �
   읽습니다.
 - `link`: 모델이 판단한 table↔문서 연결을 배열로 한꺼번에 저장합니다.
 - `unlink`: 연결을 지우거나 해당 table에 연결할 문서가 없음을 기록합니다.
+- `refresh`: 지정한 범위를 강제로 다시 수집합니다. `target`이 `schema.table`이면
+  그 table의 column·index·foreign key, 선언된 schema 이름이면 table inventory,
+  `docs`면 문서 ref입니다. `target`을 생략하면 inventory와 문서를 함께 갱신합니다.
 
 문서 catalog는 서버 시작 시 git을 실행하지 않습니다. 첫 `docs_list`, `docs_read`,
 `describe`, `map` 호출이나 문서 미확인 table의 query가 있을 때 한 번 깨어납니다.
@@ -305,6 +308,14 @@ Catalog에는 문서 내용이 아니라 경로와 ref commit만 저장됩니다
 내용 수정은 경로를 낡게 만들지 않으므로 별도 작업을 하지 않습니다. 연결된 문서는
 `describe` 응답에서 경로, ref, 바로 실행할 수 있는 `git show` 명령을 함께 제공합니다.
 마지막 ref commit이 30일보다 오래됐으면 동작은 계속하되 응답에 경고를 붙입니다.
+
+Query가 없는 column이나 table을 참조해 실패하면 서버는 해당 항목을 즉시 stale로
+표시하고 다시 수집합니다. 이 자동 무효화는 catalog가 실제보다 **많이** 알고 있는
+경우만 잡아냅니다. Migration이 column, index, foreign key를 **추가**한 경우는
+오류가 나지 않으므로 아무것도 stale이 되지 않고, catalog는 TTL이 지날 때까지 덜
+알고 있는 상태로 답합니다. 이쪽이 더 위험합니다. 새로 생긴 `deletedAt`을 모르는
+상태로 쓴 SQL은 성공하면서 삭제된 row를 조용히 함께 반환합니다. Migration 직후나
+결과가 catalog의 설명과 어긋날 때 `refresh`를 쓰십시오. 비용은 query 한 번입니다.
 
 Catalog는 기본적으로
 `~/.cache/mcp-mysql-bastion/catalog/<profile>-<database-target-hash>.json`에

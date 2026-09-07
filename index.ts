@@ -168,7 +168,10 @@ const mysqlCatalogTool = {
     "Read the local schema catalog without rediscovering database metadata. " +
     "Use map for the app/schema overview, search to find tables or known columns, " +
     "describe before writing SQL, and docs_list/docs_read to inspect domain documents. " +
-    "Use link or unlink to record the model's document decision.",
+    "Use link or unlink to record the model's document decision. " +
+    "Use refresh when cached metadata contradicts what a query actually returned, " +
+    "or right after a migration: added columns and indexes raise no error, so " +
+    "nothing else invalidates them.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -182,6 +185,7 @@ const mysqlCatalogTool = {
           "docs_read",
           "link",
           "unlink",
+          "refresh",
         ],
         description: "Catalog operation to perform",
       },
@@ -209,6 +213,14 @@ const mysqlCatalogTool = {
       path: {
         type: "string",
         description: "Cataloged model.md path for docs_read",
+      },
+      target: {
+        type: "string",
+        description:
+          'What to re-collect for refresh: "schema.table" for one table\'s ' +
+          'columns, indexes and foreign keys; a declared schema name for the ' +
+          'table inventory; "docs" to re-read the document ref after a git ' +
+          "fetch. Omit it to refresh the inventory and the documents together.",
       },
       links: {
         type: "array",
@@ -667,6 +679,11 @@ export default function createMcpServer() {
             throw new Error('mysql_catalog unlink requires "table" as schema.table.');
           }
           text = await catalog.unlink(args.table);
+        } else if (action === "refresh") {
+          if (args.target !== undefined && typeof args.target !== "string") {
+            throw new Error('mysql_catalog refresh takes "target" as a string.');
+          }
+          text = await catalog.refresh(args.target);
         } else {
           throw new Error(`Unknown mysql_catalog action: ${String(action)}`);
         }

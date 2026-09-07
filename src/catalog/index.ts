@@ -264,6 +264,162 @@ export class SchemaCatalog {
     );
   }
 
+  /**
+   * Force re-collection of what the server derives on its own.
+   *
+   * The automatic invalidation is error-driven: a query that names a column or
+   * table the database does not have marks that entry stale. That only detects
+   * the catalog claiming too much. It is blind the other way — a migration that
+   * *adds* a column, index or foreign key produces no error, because a model
+   * never names something it does not know exists, so nothing marks the entry
+   * stale and the catalog under-reports for up to a full TTL. That case is
+   * worse than a failed query: SQL written without a freshly added `deletedAt`
+   * succeeds and silently returns soft-deleted rows. This is the manual way out
+   * of that window, and it costs one query.
+   */
+  async refresh(target?: string): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    const requested = (target ?? "").replace(/`/g, "").trim();
+    const at = new Date().toISOString();
+
+    if (!requested) {
+      await this.collector.collectInventory(true);
+      return JSON.stringify(
+        {
+          refreshed: "inventory",
+          ...this.inventoryReport(),
+          ...(this.documents.isConfigured()
+            ? { documents: await this.refreshDocuments() }
+            : {}),
+          at,
+        },
+        null,
+        2,
+      );
+    }
+
+    if (normalizeName(requested) === "docs") {
+      return JSON.stringify(
+        {
+          refreshed: "documents",
+          documents: await this.refreshDocuments(),
+          hint: 'A table actually named "docs" must be written as schema.docs.',
+          at,
+        },
+        null,
+        2,
+      );
+    }
+
+    // A declared schema name wins over a table of the same name, because this
+    // environment really does have a `call` schema and tables named after
+    // schemas are possible. Qualifying with a dot always means the table.
+    const declared = requested.includes(".")
+      ? undefined
+      : this.options.appSchemas.find((entry) => sameName(entry.schema, requested));
+    if (declared) {
+      // One query covers every declared schema, so the whole inventory is
+      // rescanned regardless of which schema was named. Report it honestly.
+      await this.collector.collectInventory(true);
+      return JSON.stringify(
+        {
+          refreshed: "inventory",
+          requestedSchema: declared.schema,
+          note: "인벤토리는 선언된 모든 스키마를 쿼리 한 번으로 함께 갱신합니다.",
+          ...this.inventoryReport(),
+          at,
+        },
+        null,
+        2,
+      );
+    }
+
+    let resolved = this.resolveTable(requested);
+    if (!resolved && requested.includes(".")) {
+      // A table a migration just created is not in the inventory yet, and
+      // asking about it is exactly why someone calls refresh. A qualified name
+      // is an explicit claim that this table exists, so spend the one query to
+      // check. A bare unknown word is far likelier a typo and gets no query.
+      await this.collector.collectInventory(true);
+      resolved = this.resolveTable(requested);
+    }
+    if (resolved) {
+      await this.collector.collectTableDetail(resolved.schema, resolved.table, true);
+      const entry = this.store.readTable(resolved.schema, resolved.table);
+      return JSON.stringify(
+        {
+          refreshed: "table",
+          table: `${resolved.schema}.${resolved.table}`,
+          detailScannedAt: entry?.detailScannedAt ?? null,
+          columns: entry?.columns.length ?? 0,
+          indexes: entry?.indexes.length ?? 0,
+          foreignKeys: entry?.fks.length ?? 0,
+          at,
+        },
+        null,
+        2,
+      );
+    }
+
+    throw new Error(
+      `Unknown refresh target "${requested}". Use schema.table for one table's ` +
+        'columns, a declared schema name for the table inventory, "docs" for the ' +
+        "document axis, or omit target for both.",
+    );
+  }
+
+  private inventoryReport(): {
+    schemas: number;
+    tables: number;
+    scannedAt: string | null;
+  } {
+    const catalog = this.store.snapshot();
+    const schemas = Object.values(catalog.schemas);
+    return {
+      schemas: schemas.length,
+      tables: schemas.reduce(
+        (total, schema) => total + Object.keys(schema.tables).length,
+        0,
+      ),
+      scannedAt: schemas[0]?.scannedAt ?? null,
+    };
+  }
+
+  private async refreshDocuments(): Promise<{
+    refreshed: boolean;
+    ref: string | null;
+    refCommit?: string | null;
+    paths?: number;
+    error?: string;
+  }> {
+    if (!this.documents.isConfigured()) {
+      return {
+        refreshed: false,
+        ref: null,
+        error:
+          "The document axis is disabled because MYSQL_DOCS_REPO or MYSQL_CODE_BRANCH is not configured.",
+      };
+    }
+    this.documents.resetWake();
+    try {
+      await this.documents.ensureAwake();
+      const docs = this.store.docsView();
+      return {
+        refreshed: true,
+        ref: docs.ref,
+        refCommit: docs.refCommit,
+        paths: docs.paths.length,
+      };
+    } catch (error) {
+      // A broken document repository must not fail the database refresh.
+      return {
+        refreshed: false,
+        ref: this.options.docsRef,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
   async docsList(schemaName: string): Promise<string> {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
     return this.documents.list(schemaName);
