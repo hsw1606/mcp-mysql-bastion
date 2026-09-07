@@ -29,6 +29,8 @@ Docker packaging은 걷어냈습니다 — 이 서버는 로컬 MCP 클라이언
 - **Map은 탐색이 아니라 선언.** 각 profile이 어떤 schema가 어떤 application의
   것인지, 데이터가 어느 git branch에 대응하는지를 명시하므로, 모델은 이를
   뒤져서 알아내는 대신 툴 설명에서 읽습니다.
+- **로컬 schema catalog.** 선언된 schema의 table 목록을 시작할 때 한 번 읽고,
+  실제 query에 등장한 table의 column·index·foreign key를 필요할 때만 수집합니다.
 - **stdio에 안전한 로깅.** 모든 진단 출력이 stderr로 가므로
   `ENABLE_LOGGING=true`가 MCP 스트림을 망가뜨리는 일이 없습니다.
 
@@ -256,7 +258,7 @@ or search information_schema to find a schema):
 map은 authoritative하다고 선언되므로, **틀린 목록은 없는 목록보다 나쁩니다** —
 모델이 "그런 테이블은 없다"고 단정해 버립니다. 어떤 앱이 어떤 schema를 쓰는지는
 사람만 알고 데이터베이스에 물어볼 수 없는 사실이지만, 그 schema에 어떤 테이블이
-있는지는 모델이 직접 찾으면 됩니다.
+있는지는 catalog가 데이터베이스에서 자동으로 갱신합니다.
 
 resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 제공됩니다. 이름이
 단순 식별자가 아닌 schema(`haulla-shared`)가 있으면 backtick으로 감싸야 한다는
@@ -268,6 +270,31 @@ resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 �
 
 형식이 잘못된 항목은 stderr에 보고하고 건너뜁니다. 오타 하나 때문에 map 전체를
 잃어서는 안 되므로, 나머지 항목은 그대로 로드됩니다.
+
+### Schema catalog — 이미 알아낸 구조를 다시 찾지 않기
+
+서버는 `MYSQL_APP_SCHEMAS`에 선언된 schema만 로컬 JSON catalog에 기록합니다.
+시작할 때 table 이름·comment·예상 row 수를 query 한 번으로 갱신합니다. Column,
+primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 비동기로
+수집합니다. 이 작업은 `mysql_query`의 실행 시간에 포함되지 않습니다.
+
+모델은 `mysql_catalog`의 세 action으로 DB를 다시 탐색하지 않고 구조를 읽습니다:
+
+- `map`: application, schema, 자주 쓰는 table의 개요를 봅니다.
+- `search`: table·수집된 column·memo·alias를 keyword로 찾습니다.
+- `describe`: 한 table의 column, key, index, foreign key를 봅니다. 상세 정보가
+  아직 없거나 TTL이 지났다면 이 호출이 갱신을 기다립니다.
+
+Catalog는 기본적으로
+`~/.cache/mcp-mysql-bastion/catalog/<profile>-<host-hash>.json`에 저장됩니다.
+파일 mode는 `0600`입니다. Profile과 host가 파일명에 들어가므로 stage와 prod가
+같은 catalog를 읽지 않습니다. 저장 실패 시 서버는 catalog만 끄고 기존 query
+기능을 계속 제공합니다.
+
+Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지문만
+들어갑니다. SQL 원문과 row data는 저장하지 않습니다. PII redaction이 켜지면 PII
+column은 저장과 응답에서 모두 제외합니다. `MYSQL_CATALOG_ENABLED=false`로 끄면
+도구와 resource 동작은 변경 전과 같아집니다.
 
 ### `MYSQL_CODE_BRANCH` — 데이터가 어느 branch에 대응하는가
 
@@ -295,6 +322,10 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | `MYSQL_ENV_FILE` | *(미설정)* | `.env.<profile>` 대신 정확히 이 env 파일을 로드합니다. |
 | `MYSQL_APP_SCHEMAS` | *(미설정)* | `;`로 구분된 `app:schema[:설명]` 항목. 툴 설명과 `mysql://schemas`에 노출됩니다. |
 | `MYSQL_CODE_BRANCH` | profile별 | 이 환경의 데이터가 대응하는 git branch. `stage`→`develop`, `prod`→`main`. |
+| `MYSQL_CATALOG_ENABLED` | `true` | 로컬 schema catalog를 켭니다. `false`이면 기존 동작을 유지합니다. |
+| `MYSQL_CATALOG_PATH` | `~/.cache/mcp-mysql-bastion/catalog` | profile·host별 JSON 파일을 둘 directory입니다. |
+| `MYSQL_CATALOG_TTL_HOURS` | `24` | DB metadata를 stale로 보는 시간입니다. |
+| `MYSQL_DOCS_REPO` | *(미설정)* | `model.md`가 있는 git 저장소. 미설정이면 문서 catalog만 비활성입니다. |
 
 ### SSH tunnel
 
@@ -460,6 +491,7 @@ git remote set-url origin git@github.com:<owner>/<repo>.git
 ```text
 index.ts              MCP 서버, tool + resource handler, 종료 처리
 src/config/           env 로딩, profile 정책, mysql2 옵션
+src/catalog/          로컬 schema catalog, DB metadata 수집과 검색
 src/db/               쿼리 routing, 권한 검사, pool
 src/security/         PII redaction (원본 프로젝트)
 src/ssh/config.ts     ~/.ssh/config Host alias parser
