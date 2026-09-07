@@ -209,7 +209,9 @@ const mysqlCatalogTool = {
       },
       table: {
         type: "string",
-        description: "Qualified schema.table name for describe",
+        description:
+          "Qualified schema.table name for describe, or for unlink. note and " +
+          "forget take the same name as target instead.",
       },
       schema: {
         type: "string",
@@ -356,8 +358,21 @@ export default function createMcpServer() {
         "Set PII_ALLOW_INTROSPECTION=true to allow the catalog to collect it.",
     );
   }
+  // MYSQL_APP_SCHEMAS is the declared scan range, and nothing outside it is
+  // collected (D-1). With none declared the catalog has nothing to scan, so
+  // leaving it on would advertise mysql_catalog and tell the model to call
+  // describe, and then answer every call with an empty map or an error. Off is
+  // the honest state.
+  const noDeclaredSchemas = APP_SCHEMAS.length === 0;
+  if (noDeclaredSchemas && MYSQL_CATALOG_ENABLED && !introspectionHardBlocked) {
+    console.error(
+      "[catalog] disabled: MYSQL_APP_SCHEMAS declares no schema, so there is " +
+        "nothing to catalog. Declare the app -> schema map to enable it.",
+    );
+  }
   const catalog = new SchemaCatalog({
-    enabled: MYSQL_CATALOG_ENABLED && !introspectionHardBlocked,
+    enabled:
+      MYSQL_CATALOG_ENABLED && !introspectionHardBlocked && !noDeclaredSchemas,
     profile: MYSQL_PROFILE || "default",
     fingerprint: identity.fingerprint,
     filePath: identity.filePath,

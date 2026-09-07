@@ -63,19 +63,29 @@ function shortHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
+/**
+ * The file name and the fingerprint have to be built from the same inputs. The
+ * fingerprint decides whether a loaded catalog may be reused, and a mismatch
+ * skips the merge and overwrites — so any input the fingerprint counts but the
+ * name does not gives two servers one file that each discards on start and
+ * clobbers on every flush. The user belongs in both because two accounts on one
+ * host hold different grants, and therefore see different tables.
+ */
 export function catalogIdentity(identity: CatalogIdentity): {
   filePath: string;
   fingerprint: string;
 } {
   const profile = identity.profile || "default";
   const safeProfile = profile.replace(/[^A-Za-z0-9_.-]/g, "_");
-  const targetHash = shortHash(identity.target);
+  // NUL separates the parts because it cannot appear in a host name or a
+  // MySQL user, so no two distinct endpoints can collapse onto one identity.
+  const endpointHash = shortHash(`${identity.target}\u0000${identity.user}`);
   const directory =
     identity.customPath ??
     path.join(os.homedir(), ".cache", "mcp-mysql-bastion", "catalog");
   return {
-    filePath: path.join(directory, `${safeProfile}-${targetHash}.json`),
-    fingerprint: shortHash(`${identity.target}\u0000${identity.user}`),
+    filePath: path.join(directory, `${safeProfile}-${endpointHash}.json`),
+    fingerprint: endpointHash,
   };
 }
 
