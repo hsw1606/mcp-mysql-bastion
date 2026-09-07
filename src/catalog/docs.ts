@@ -76,6 +76,10 @@ function shellQuote(value: string): string {
 export class CatalogDocuments {
   private attempted = false;
   private wakePromise: Promise<void> | null = null;
+  // Set when a reset lands on a wake that is already in flight. That wake read
+  // the ref before the reset, so its answer is the stale one the caller is
+  // discarding, and the next ensureAwake has to start a fresh read.
+  private wakeSpent = false;
   private disabledReason: string | null = null;
 
   constructor(
@@ -105,6 +109,7 @@ export class CatalogDocuments {
   resetWake(): void {
     this.attempted = false;
     this.disabledReason = null;
+    this.wakeSpent = this.wakePromise !== null;
   }
 
   private async git(args: string[]): Promise<string> {
@@ -126,19 +131,33 @@ export class CatalogDocuments {
     }
     if (this.disabledReason) throw new Error(this.disabledReason);
     if (this.attempted && !this.wakePromise) return;
-    if (!this.wakePromise) {
+    let promise = this.wakePromise;
+    if (!promise || this.wakeSpent) {
       this.attempted = true;
-      this.wakePromise = this.wake().catch((error) => {
-        this.disabledReason =
-          `The document catalog is unavailable: ${error instanceof Error ? error.message : String(error)}`;
-        console.error(`[catalog] document axis disabled: ${this.disabledReason}`);
-        throw new Error(this.disabledReason);
-      });
+      // A spent wake is queued behind rather than raced. Two concurrent wakes
+      // rewrite the same document paths, and the older one landing last would
+      // persist exactly the commit the reset asked to replace. Its failure is
+      // swallowed so a repaired repository still gets its fresh read.
+      const previous =
+        promise && this.wakeSpent ? promise.catch(() => undefined) : null;
+      this.wakeSpent = false;
+      promise = (previous ?? Promise.resolve())
+        .then(() => this.wake())
+        .catch((error) => {
+          this.disabledReason =
+            `The document catalog is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          console.error(`[catalog] document axis disabled: ${this.disabledReason}`);
+          throw new Error(this.disabledReason);
+        });
+      this.wakePromise = promise;
     }
     try {
-      await this.wakePromise;
+      await promise;
     } finally {
-      this.wakePromise = null;
+      // Only the call that installed this handle clears it. Clearing from every
+      // awaiter let a late one drop a newer wake's handle, and the next
+      // ensureAwake then returned before the paths were populated.
+      if (this.wakePromise === promise) this.wakePromise = null;
     }
   }
 
