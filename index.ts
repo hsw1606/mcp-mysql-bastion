@@ -51,6 +51,7 @@ import {
   SSH_ENABLED,
   describeTunnel,
   ensureTunnel,
+  resolveTunnelConfig,
   stopTunnel,
 } from "./src/ssh/tunnel.js";
 
@@ -282,9 +283,21 @@ log(
  */
 export default function createMcpServer() {
   const mysqlSettings = config.mysql as Record<string, unknown>;
+  const catalogTarget = SSH_ENABLED
+    ? (() => {
+        const tunnel = resolveTunnelConfig();
+        return JSON.stringify(["tcp", tunnel.remoteHost, tunnel.remotePort]);
+      })()
+    : typeof mysqlSettings.socketPath === "string"
+      ? JSON.stringify(["unix", mysqlSettings.socketPath])
+      : JSON.stringify([
+          "tcp",
+          String(mysqlSettings.host ?? "127.0.0.1"),
+          Number(mysqlSettings.port ?? 3306),
+        ]);
   const identity = catalogIdentity({
     profile: MYSQL_PROFILE,
-    host: String(mysqlSettings.host ?? mysqlSettings.socketPath ?? "local"),
+    target: catalogTarget,
     user: String(mysqlSettings.user ?? ""),
     customPath: MYSQL_CATALOG_PATH,
   });

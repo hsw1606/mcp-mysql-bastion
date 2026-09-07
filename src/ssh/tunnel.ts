@@ -60,6 +60,11 @@ export const SSH_ENABLED = process.env.MYSQL_SSH_ENABLED === "true";
 export const SSH_REUSE_EXISTING =
   process.env.MYSQL_SSH_REUSE_EXISTING === "true";
 
+// Catalog identity and tunnel creation must resolve the same remote target.
+// Cache the immutable process configuration so an SSH config edit between
+// those two steps cannot make the cache describe a different database.
+let resolvedTunnelConfig: TunnelConfig | null = null;
+
 function optionalEnv(name: string): string | undefined {
   const raw = process.env[name];
   if (raw === undefined) return undefined;
@@ -91,6 +96,7 @@ function parsePort(raw: string | undefined, label: string): number | undefined {
  * tunnelled setup those name the database as seen *from the bastion*.
  */
 export function resolveTunnelConfig(): TunnelConfig {
+  if (resolvedTunnelConfig) return resolvedTunnelConfig;
   const configHost = optionalEnv("MYSQL_SSH_CONFIG_HOST");
 
   let fromConfig: ReturnType<typeof readSSHConfigHost> = null;
@@ -161,7 +167,7 @@ export function resolveTunnelConfig(): TunnelConfig {
     );
   }
 
-  return {
+  resolvedTunnelConfig = {
     sshHost: sshHost!,
     sshPort,
     sshUser: sshUser!,
@@ -171,6 +177,7 @@ export function resolveTunnelConfig(): TunnelConfig {
     remoteHost: remoteHost!,
     remotePort,
   };
+  return resolvedTunnelConfig;
 }
 
 /**
