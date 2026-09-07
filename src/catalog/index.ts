@@ -4,14 +4,20 @@ import * as path from "path";
 import type { TableRow } from "../types/index.js";
 import { CatalogCollector } from "./collect.js";
 import { CatalogDocuments } from "./docs.js";
-import { renderDescribe, renderMap, searchCatalog } from "./render.js";
+import {
+  renderDescribe,
+  renderMap,
+  renderToolDescriptionSuffix,
+  searchCatalog,
+} from "./render.js";
 import { CatalogStore } from "./store.js";
 import type {
   CatalogOptions,
+  CatalogForgetScope,
   PreparedCatalogQuery,
   TableReference,
 } from "./types.js";
-import { normalizeName } from "./types.js";
+import { emptyUsage, normalizeName } from "./types.js";
 import { prepareCatalogQuery, resultColumnNames } from "./usage.js";
 
 const UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS = 60_000;
@@ -22,6 +28,8 @@ const UNKNOWN_REFERENCE_MEMORY_LIMIT = 256;
 // shutdown drains it. The deadline is what keeps a wedged git call or query
 // from holding the shutdown path open before the tunnel is torn down.
 const CLOSE_DRAIN_DEADLINE_MS = 3_000;
+const NOTE_MAX_LENGTH = 1_000;
+const ALIAS_MAX_LENGTH = 200;
 
 /**
  * A referenced timer, plus the means to cancel it. Referenced on purpose: an
@@ -96,20 +104,33 @@ export class SchemaCatalog {
     return this.store.isEnabled();
   }
 
-  startInventory(): void {
+  startInventory(onInitialFill?: () => void | Promise<void>): void {
     if (!this.isEnabled() || this.closing) return;
     // Deliberately not forced. MCP clients start a fresh server per session,
     // so forcing here would rescan on every session and make
     // MYSQL_CATALOG_TTL_HOURS meaningless for the inventory. An empty or
     // expired inventory still refreshes: `inventoryNeedsRefresh` treats a
     // missing `scannedAt` as expired.
+    const wasEmpty = this.store.tableCount() === 0;
     this.trackBackgroundTask(
-      this.collector.collectInventory(false).catch((error) => {
-        console.error(
-          `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }),
+      this.collector
+        .collectInventory(false)
+        .then(async () => {
+          if (wasEmpty && this.store.tableCount() > 0 && onInitialFill) {
+            await onInitialFill();
+          }
+        })
+        .catch((error) => {
+          console.error(
+            `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }),
     );
+  }
+
+  toolDescriptionSuffix(): string {
+    if (!this.isEnabled()) return "";
+    return renderToolDescriptionSuffix(this.store.snapshot());
   }
 
   private trackBackgroundTask(task: Promise<void>): void {
@@ -261,6 +282,7 @@ export class SchemaCatalog {
         warning: documentError ?? this.documents.staleWarning(),
         schema: resolved.schema,
       },
+      this.store.readJoins(resolved.schema, resolved.table),
     );
   }
 
@@ -451,6 +473,101 @@ export class SchemaCatalog {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
     const resolved = await this.ensureKnownTable(input);
     return this.documents.unlink(resolved.schema, resolved.table);
+  }
+
+  async note(
+    input: string,
+    value: { text?: string; alias?: string },
+  ): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    const hasText =
+      typeof value.text === "string" && value.text.trim().length > 0;
+    const hasAlias =
+      typeof value.alias === "string" && value.alias.trim().length > 0;
+    if (hasText === hasAlias) {
+      throw new Error('mysql_catalog note requires exactly one of "text" or "alias".');
+    }
+    const resolved = await this.ensureKnownTable(input);
+    const kind = hasText ? "note" : "alias";
+    const content = (hasText ? value.text : value.alias)?.trim() as string;
+    const limit = hasText ? NOTE_MAX_LENGTH : ALIAS_MAX_LENGTH;
+    if (content.length > limit) {
+      throw new Error(`${kind} exceeds the ${limit}-character limit.`);
+    }
+    this.store.update((catalog) => {
+      const curated =
+        catalog.schemas[resolved.schema].tables[resolved.table].curated;
+      if (hasText) {
+        if (!curated.notes.includes(content)) curated.notes.push(content);
+      } else if (
+        !curated.aliases.some(
+          (alias) => normalizeName(alias) === normalizeName(content),
+        )
+      ) {
+        curated.aliases.push(content);
+      }
+    });
+    const table = this.store.readTable(resolved.schema, resolved.table);
+    return JSON.stringify(
+      {
+        target: `${resolved.schema}.${resolved.table}`,
+        added: { [kind]: content },
+        notes: table?.curated.notes ?? [],
+        aliases: table?.curated.aliases ?? [],
+      },
+      null,
+      2,
+    );
+  }
+
+  async forget(input: string, scope: CatalogForgetScope): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    const resolved = await this.ensureKnownTable(input);
+    const qualified = `${resolved.schema}.${resolved.table}`;
+    let removed = 0;
+    this.store.update((catalog) => {
+      const table = catalog.schemas[resolved.schema].tables[resolved.table];
+      if (scope === "notes") {
+        removed = table.curated.notes.length;
+        table.curated.notes = [];
+      } else if (scope === "aliases") {
+        removed = table.curated.aliases.length;
+        table.curated.aliases = [];
+      } else if (scope === "usage") {
+        removed = table.usage.count;
+        table.usage = emptyUsage();
+      } else if (scope === "joins") {
+        const prefix = `${qualified}.`.toLowerCase();
+        const before = catalog.joins.length;
+        catalog.joins = catalog.joins.filter(
+          (edge) =>
+            !edge.a.toLowerCase().startsWith(prefix) &&
+            !edge.b.toLowerCase().startsWith(prefix),
+        );
+        removed = before - catalog.joins.length;
+      } else {
+        removed =
+          table.columns.length + table.indexes.length + table.fks.length;
+        table.columns = [];
+        table.pk = [];
+        table.indexes = [];
+        table.fks = [];
+        table.detailScannedAt = null;
+        table.detailStale = true;
+      }
+    });
+    return JSON.stringify(
+      {
+        target: qualified,
+        forgotten: scope,
+        removed,
+        ...(scope === "metadata"
+          ? { next: "The next describe or successful query refreshes table metadata." }
+          : {}),
+      },
+      null,
+      2,
+    );
   }
 
   queryDocumentGuidance(prepared: PreparedCatalogQuery): string | null {
@@ -783,4 +900,8 @@ export class SchemaCatalog {
   }
 }
 
-export type { CatalogOptions, TableReference } from "./types.js";
+export type {
+  CatalogForgetScope,
+  CatalogOptions,
+  TableReference,
+} from "./types.js";

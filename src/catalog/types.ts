@@ -45,6 +45,19 @@ export interface CatalogUsage {
   >;
 }
 
+export interface CatalogJoin {
+  a: string;
+  b: string;
+  count: number;
+}
+
+export type CatalogForgetScope =
+  | "notes"
+  | "aliases"
+  | "usage"
+  | "joins"
+  | "metadata";
+
 export interface CatalogDocumentLink {
   path: string;
   linkedBy: "model" | "user";
@@ -105,11 +118,7 @@ export interface CatalogFile {
   fingerprint: string;
   docs: CatalogDocs;
   schemas: Record<string, CatalogSchema>;
-  joins: Array<{
-    a: string;
-    b: string;
-    count: number;
-  }>;
+  joins: CatalogJoin[];
 }
 
 export interface InventoryRow {
@@ -187,15 +196,19 @@ export function emptyTable(): CatalogTable {
     pk: [],
     indexes: [],
     fks: [],
-    usage: {
-      count: 0,
-      successCount: 0,
-      failureCount: 0,
-      lastUsedAt: null,
-      columns: {},
-      fingerprints: {},
-    },
+    usage: emptyUsage(),
     curated: { notes: [], aliases: [] },
+  };
+}
+
+export function emptyUsage(): CatalogUsage {
+  return {
+    count: 0,
+    successCount: 0,
+    failureCount: 0,
+    lastUsedAt: null,
+    columns: {},
+    fingerprints: {},
   };
 }
 
