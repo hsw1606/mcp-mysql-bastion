@@ -49,6 +49,25 @@ export interface CatalogJoin {
   a: string;
   b: string;
   count: number;
+  lastUsedAt: string;
+}
+
+// Observed joins are the one axis that grows without a natural bound: every
+// new column pair a query equates adds an edge and nothing ever retires it.
+// The bound is generous because an edge costs a single short line in the file.
+export const JOIN_EDGE_LIMIT = 500;
+
+/**
+ * Cap the observed joins, dropping the least recently seen first — the policy
+ * the per-table fingerprints already use. Recency rather than count on purpose:
+ * evicting the rarest edge would turn the cap into a wall that a join path
+ * discovered later could never cross.
+ */
+export function pruneJoins(joins: CatalogJoin[]): CatalogJoin[] {
+  if (joins.length <= JOIN_EDGE_LIMIT) return joins;
+  return [...joins]
+    .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt))
+    .slice(0, JOIN_EDGE_LIMIT);
 }
 
 export type CatalogForgetScope =

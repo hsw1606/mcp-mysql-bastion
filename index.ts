@@ -849,6 +849,15 @@ export default function createMcpServer() {
     return toolsResponse;
   });
 
+  // The hot-table list in mysql_query's description fills on the first query
+  // that reads a table, not at startup. The catalog calls this once, which is
+  // what holds the notification to one a session; a client that ignores it
+  // still gets the fresh description from its next tools/list, so a failure
+  // here needs neither retry nor warning.
+  catalog.onToolDescriptionFilled(async () => {
+    await server.sendToolListChanged().catch(() => undefined);
+  });
+
   // Initialize database connection and set up shutdown handlers
   (async () => {
     try {
@@ -869,15 +878,7 @@ export default function createMcpServer() {
       connection.release();
       // Inventory collection is intentionally detached. The MCP client can
       // receive query responses while this single metadata query runs.
-      let toolListChangedSent = false;
-      catalog.startInventory(async () => {
-        if (toolListChangedSent) return;
-        toolListChangedSent = true;
-        // Some clients do not listen for this optional notification. The first
-        // tools/list response still contains the fresh description, so failure
-        // here needs no retry or warning.
-        await server.sendToolListChanged().catch(() => undefined);
-      });
+      catalog.startInventory();
     } catch (error) {
       // Startup failure is the one place where the operator needs the reason
       // regardless of ENABLE_LOGGING — a silent exit here looks to the MCP
