@@ -7,7 +7,7 @@ import type {
   DetailRow,
   InventoryRow,
 } from "./types.js";
-import { emptyTable } from "./types.js";
+import { emptyTable, normalizeName } from "./types.js";
 
 export interface CatalogCollectorOptions {
   schemas: readonly string[];
@@ -35,10 +35,9 @@ export class CatalogCollector {
   ) {}
 
   inventoryNeedsRefresh(): boolean {
-    const catalog = this.store.snapshot();
     return this.options.schemas.some((name) => {
-      const schema = catalog.schemas[name];
-      return !schema || isExpired(schema.scannedAt, this.options.ttlHours);
+      const state = this.store.schemaState(name);
+      return !state || isExpired(state.scannedAt, this.options.ttlHours);
     });
   }
 
@@ -65,42 +64,66 @@ export class CatalogCollector {
        ORDER BY table_schema, table_name`,
       [...this.options.schemas],
     );
+    // `information_schema` compares schema names case-insensitively, so the
+    // SQL above matches rows whose spelling differs from the declaration in
+    // MYSQL_APP_SCHEMAS. Group by the declared spelling instead of comparing
+    // exactly, or every such row is dropped here and the schema is cached as
+    // empty for a full TTL.
+    const declaredBySchema = new Map(
+      this.options.schemas.map((name) => [normalizeName(name), name]),
+    );
+    const rowsBySchema = new Map<string, InventoryRow[]>();
+    for (const row of rows) {
+      const declared = declaredBySchema.get(normalizeName(String(row.table_schema)));
+      if (!declared) continue;
+      const bucket = rowsBySchema.get(declared);
+      if (bucket) bucket.push(row);
+      else rowsBySchema.set(declared, [row]);
+    }
     const now = new Date().toISOString();
     this.store.update((catalog) => {
       for (const schemaName of this.options.schemas) {
         const schema = catalog.schemas[schemaName];
         if (!schema) continue;
         const nextTables = Object.fromEntries(
-          rows
-            .filter((row) => row.table_schema === schemaName)
-            .map((row) => {
-              const existing = schema.tables[row.table_name] ?? emptyTable();
-              const numericRows = Number(row.table_rows);
-              return [
-                row.table_name,
-                {
-                  ...existing,
-                  comment: row.table_comment ?? "",
-                  rowsEstimate: Number.isFinite(numericRows) ? numericRows : null,
-                },
-              ];
-            }),
+          (rowsBySchema.get(schemaName) ?? []).map((row) => {
+            const existing = schema.tables[row.table_name] ?? emptyTable();
+            const numericRows = Number(row.table_rows);
+            return [
+              row.table_name,
+              {
+                ...existing,
+                comment: row.table_comment ?? "",
+                rowsEstimate: Number.isFinite(numericRows) ? numericRows : null,
+              },
+            ];
+          }),
         );
         schema.tables = nextTables;
         schema.scannedAt = now;
       }
     });
+    // An empty declared schema is almost always a typo in MYSQL_APP_SCHEMAS or
+    // a permission the tunnel user lacks. Say so instead of silently caching
+    // nothing for the rest of the TTL.
+    for (const schemaName of this.options.schemas) {
+      if (!rowsBySchema.has(schemaName)) {
+        console.error(
+          `[catalog] declared schema "${schemaName}" returned no tables; check MYSQL_APP_SCHEMAS and the account's grants.`,
+        );
+      }
+    }
     console.error(
       `[catalog] inventory scan complete: ${this.options.schemas.length} schemas, ${rows.length} tables`,
     );
   }
 
   detailNeedsRefresh(schemaName: string, tableName: string): boolean {
-    const table = this.store.snapshot().schemas[schemaName]?.tables[tableName];
+    const meta = this.store.tableMeta(schemaName, tableName);
     return Boolean(
-      table &&
-        (table.detailStale ||
-          isExpired(table.detailScannedAt, this.options.ttlHours)),
+      meta &&
+        (meta.detailStale ||
+          isExpired(meta.detailScannedAt, this.options.ttlHours)),
     );
   }
 

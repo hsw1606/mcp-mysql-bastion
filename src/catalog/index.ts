@@ -8,13 +8,34 @@ import { renderDescribe, renderMap, searchCatalog } from "./render.js";
 import { CatalogStore } from "./store.js";
 import type {
   CatalogOptions,
-  CatalogTable,
   PreparedCatalogQuery,
   TableReference,
 } from "./types.js";
+import { normalizeName } from "./types.js";
 import { prepareCatalogQuery, resultColumnNames } from "./usage.js";
 
 const UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS = 60_000;
+// One entry per distinct table name we could not resolve. Bounded so a session
+// that keeps naming tables which do not exist cannot grow this without limit.
+const UNKNOWN_REFERENCE_MEMORY_LIMIT = 256;
+// Background work is deliberately started after the response is sent, so
+// shutdown drains it. The deadline is what keeps a wedged git call or query
+// from holding the shutdown path open before the tunnel is torn down.
+const CLOSE_DRAIN_DEADLINE_MS = 3_000;
+
+/**
+ * A referenced timer, plus the means to cancel it. Referenced on purpose: an
+ * unreferenced deadline never fires once the hung task is the only thing left
+ * on the loop, which is exactly the case the deadline exists for. Cancelling
+ * it after the race keeps it from outliving its usefulness.
+ */
+function deadlineTimer(ms: number): { expired: Promise<void>; cancel: () => void } {
+  let timer: NodeJS.Timeout;
+  const expired = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return { expired, cancel: () => clearTimeout(timer) };
+}
 
 export interface CatalogIdentity {
   profile: string;
@@ -45,7 +66,7 @@ export function catalogIdentity(identity: CatalogIdentity): {
 }
 
 function sameName(a: string, b: string): boolean {
-  return a.localeCompare(b, undefined, { sensitivity: "accent" }) === 0;
+  return normalizeName(a) === normalizeName(b);
 }
 
 export class SchemaCatalog {
@@ -99,33 +120,32 @@ export class SchemaCatalog {
     );
   }
 
-  private resolveTable(input: string): {
-    schema: string;
-    table: string;
-    entry: CatalogTable;
-  } | null {
+  /**
+   * Canonical schema and table names for a reference written in any casing.
+   * Resolves through the store's name index rather than a snapshot: this runs
+   * several times per query, and cloning the catalog each time put tens of
+   * milliseconds of blocked event loop on every response.
+   */
+  private resolveTable(input: string): { schema: string; table: string } | null {
     const cleaned = input.replace(/`/g, "").trim();
     const dot = cleaned.indexOf(".");
     const requestedSchema = dot === -1 ? null : cleaned.slice(0, dot);
     const requestedTable = dot === -1 ? cleaned : cleaned.slice(dot + 1);
-    const catalog = this.store.snapshot();
-    const matches: Array<{ schema: string; table: string; entry: CatalogTable }> = [];
-    for (const [schemaName, schema] of Object.entries(catalog.schemas)) {
-      if (requestedSchema && !sameName(schemaName, requestedSchema)) continue;
-      for (const [tableName, entry] of Object.entries(schema.tables)) {
-        if (sameName(tableName, requestedTable)) {
-          matches.push({ schema: schemaName, table: tableName, entry });
-        }
-      }
-    }
+    const matches = this.store.lookup(requestedSchema, requestedTable);
     if (matches.length === 1) return matches[0];
     if (!requestedSchema && this.options.defaultSchema) {
       return (
-        matches.find((match) => sameName(match.schema, this.options.defaultSchema as string)) ??
-        null
+        matches.find((match) =>
+          sameName(match.schema, this.options.defaultSchema as string),
+        ) ?? null
       );
     }
     return null;
+  }
+
+  /** Whether a model or user already recorded a document decision. */
+  private documentReviewed(schema: string, table: string): boolean {
+    return this.store.tableMeta(schema, table)?.docReviewed === true;
   }
 
   private catalogKeyForReference(reference: TableReference): string | null {
@@ -139,11 +159,9 @@ export class SchemaCatalog {
       : null;
   }
 
-  private resolveReferences(references: TableReference[]): Array<{
-    schema: string;
-    table: string;
-    entry: CatalogTable;
-  }> {
+  private resolveReferences(
+    references: TableReference[],
+  ): Array<{ schema: string; table: string }> {
     return references
       .map((reference) =>
         this.resolveTable(
@@ -155,11 +173,9 @@ export class SchemaCatalog {
       .filter((value): value is NonNullable<typeof value> => value !== null);
   }
 
-  private async ensureKnownTable(input: string): Promise<{
-    schema: string;
-    table: string;
-    entry: CatalogTable;
-  }> {
+  private async ensureKnownTable(
+    input: string,
+  ): Promise<{ schema: string; table: string }> {
     let resolved = this.resolveTable(input);
     if (!resolved) {
       await this.collector.collectInventory(false);
@@ -218,8 +234,6 @@ export class SchemaCatalog {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
     const resolved = await this.ensureKnownTable(input);
     await this.collector.collectTableDetail(resolved.schema, resolved.table);
-    let current = this.resolveTable(`${resolved.schema}.${resolved.table}`);
-    if (!current) throw new Error(`Table disappeared during refresh: ${input}`);
     let documentError: string | null = null;
     if (this.documents.isConfigured()) {
       try {
@@ -228,21 +242,24 @@ export class SchemaCatalog {
         documentError = error instanceof Error ? error.message : String(error);
       }
     }
-    current = this.resolveTable(`${resolved.schema}.${resolved.table}`);
-    if (!current) throw new Error(`Table disappeared during document refresh: ${input}`);
+    // Read the table once, after both refreshes. Waking the document axis can
+    // drop a link whose file no longer exists at the ref, so an earlier read
+    // would render a document that has just been unlinked.
+    const entry = this.store.readTable(resolved.schema, resolved.table);
+    if (!entry) throw new Error(`Table disappeared during refresh: ${input}`);
     return renderDescribe(
-      `${current.schema}.${current.table}`,
-      current.entry,
+      `${resolved.schema}.${resolved.table}`,
+      entry,
       this.options.isPIIColumn,
       {
         configured: this.documents.isConfigured(),
         available: this.documents.isAvailable(),
         ref: this.options.docsRef,
-        command: current.entry.curated.doc
-          ? this.documents.documentCommand(current.entry.curated.doc.path)
+        command: entry.curated.doc
+          ? this.documents.documentCommand(entry.curated.doc.path)
           : null,
         warning: documentError ?? this.documents.staleWarning(),
-        schema: current.schema,
+        schema: resolved.schema,
       },
     );
   }
@@ -297,10 +314,7 @@ export class SchemaCatalog {
           ? `${reference.schema}.${reference.table}`
           : reference.table,
       );
-      if (
-        resolved &&
-        !Object.prototype.hasOwnProperty.call(resolved.entry.curated, "doc")
-      ) {
+      if (resolved && !this.documentReviewed(resolved.schema, resolved.table)) {
         unresolved.set(`${resolved.schema}.${resolved.table}`, resolved.schema);
       }
     }
@@ -385,8 +399,7 @@ export class SchemaCatalog {
           : reference.table,
       );
       return Boolean(
-        resolved &&
-          !Object.prototype.hasOwnProperty.call(resolved.entry.curated, "doc"),
+        resolved && !this.documentReviewed(resolved.schema, resolved.table),
       );
     });
   }
@@ -430,12 +443,12 @@ export class SchemaCatalog {
       );
       if (inventoryWasStale) {
         for (const key of unresolvedKeys) {
-          this.unknownReferenceRefreshes.set(key, now);
+          this.rememberUnknownReference(key, now);
         }
       } else if (needsUnknownRefresh) {
         await this.collector.collectInventory(true);
         for (const key of unresolvedKeys) {
-          this.unknownReferenceRefreshes.set(key, now);
+          this.rememberUnknownReference(key, now);
         }
         resolved = this.resolveReferences(references);
       }
@@ -445,8 +458,8 @@ export class SchemaCatalog {
     );
     if (
       this.documents.isAvailable() &&
-      [...unique.values()].some((value) =>
-        !Object.prototype.hasOwnProperty.call(value.entry.curated, "doc"),
+      [...unique.values()].some(
+        (value) => !this.documentReviewed(value.schema, value.table),
       )
     ) {
       await this.documents.ensureAwake().catch(() => {
@@ -562,13 +575,19 @@ export class SchemaCatalog {
     });
   }
 
-  markTableStale(input: string): void {
-    const resolved = this.resolveTable(input);
-    if (!resolved) return;
-    this.store.update((catalog) => {
-      const table = catalog.schemas[resolved.schema]?.tables[resolved.table];
-      if (table) table.detailStale = true;
-    });
+  /**
+   * Record that we have just refreshed the inventory for an unresolvable name,
+   * evicting the oldest entries once the map reaches its bound. A Map iterates
+   * in insertion order, so re-inserting the key keeps eviction chronological.
+   */
+  private rememberUnknownReference(key: string, at: number): void {
+    this.unknownReferenceRefreshes.delete(key);
+    this.unknownReferenceRefreshes.set(key, at);
+    while (this.unknownReferenceRefreshes.size > UNKNOWN_REFERENCE_MEMORY_LIMIT) {
+      const oldest = this.unknownReferenceRefreshes.keys().next();
+      if (oldest.done) break;
+      this.unknownReferenceRefreshes.delete(oldest.value);
+    }
   }
 
   async close(): Promise<void> {
@@ -578,8 +597,28 @@ export class SchemaCatalog {
         // A stdio client commonly closes stdin immediately after receiving its
         // final tool result. Inventory, detail, and document work deliberately
         // runs after that result, so drain it before the last durable flush.
+        //
+        // The deadline is the point: our caller closes the pool and the SSH
+        // tunnel after us, and a task that never settles would leak both.
+        // Whatever is already recorded still gets persisted.
+        const deadline = Date.now() + CLOSE_DRAIN_DEADLINE_MS;
         while (this.backgroundTasks.size > 0) {
-          await Promise.allSettled([...this.backgroundTasks]);
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            console.error(
+              `[catalog] ${this.backgroundTasks.size} background task(s) did not finish within ${CLOSE_DRAIN_DEADLINE_MS}ms; persisting what is already recorded`,
+            );
+            break;
+          }
+          const deadlineReached = deadlineTimer(remaining);
+          try {
+            await Promise.race([
+              Promise.allSettled([...this.backgroundTasks]),
+              deadlineReached.expired,
+            ]);
+          } finally {
+            deadlineReached.cancel();
+          }
         }
         await this.store.close();
       })();

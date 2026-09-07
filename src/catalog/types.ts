@@ -72,6 +72,17 @@ export interface CatalogTable {
   curated: CatalogCurated;
 }
 
+/**
+ * Small read-only facts about one table. Callers that only need these must not
+ * clone the whole catalog to get them — see `CatalogStore.tableMeta`.
+ */
+export interface CatalogTableMeta {
+  detailScannedAt: string | null;
+  detailStale: boolean;
+  /** True once a model or user recorded a document decision: link or unlink. */
+  docReviewed: boolean;
+}
+
 export interface CatalogSchema {
   app: string;
   description?: string;
@@ -156,6 +167,15 @@ export interface CatalogOptions {
   defaultSchema: string | null;
   piiRedactionEnabled: boolean;
   isPIIColumn: (column: string) => boolean;
+}
+
+/**
+ * Canonical form for a schema or table name. MySQL compares identifiers
+ * case-insensitively in `information_schema`, and the declared spelling in
+ * `MYSQL_APP_SCHEMAS` is written by hand, so every lookup normalizes first.
+ */
+export function normalizeName(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 export function emptyTable(): CatalogTable {

@@ -1,5 +1,23 @@
 import type { CatalogFile, CatalogTable } from "./types.js";
 
+// `map` is an overview. Both unlinked lists grow with the schema — 164 tables
+// and 91 documents on a cold catalog — so they are sampled and counted rather
+// than emitted whole. describe and docs_list give the per-table detail.
+const UNLINKED_SAMPLE_LIMIT = 30;
+
+function sampled(values: string[]): {
+  total: number;
+  sample: string[];
+  truncated?: true;
+} {
+  const sample = values.slice(0, UNLINKED_SAMPLE_LIMIT);
+  return {
+    total: values.length,
+    sample,
+    ...(values.length > sample.length ? { truncated: true as const } : {}),
+  };
+}
+
 export interface SearchResult {
   table: string;
   score: number;
@@ -41,8 +59,8 @@ export function renderMap(catalog: CatalogFile, warning: string | null = null): 
     {
       profile: catalog.profile,
       schemas,
-      unlinkedTables,
-      unlinkedDocuments: catalog.docs.unlinked,
+      unlinkedTables: sampled(unlinkedTables),
+      unlinkedDocuments: sampled(catalog.docs.unlinked),
       ...(warning ? { warning } : {}),
     },
     null,

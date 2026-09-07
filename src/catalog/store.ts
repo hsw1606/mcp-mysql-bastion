@@ -2,18 +2,41 @@ import * as fs from "fs";
 import * as path from "path";
 import type {
   CatalogCurated,
+  CatalogDocs,
   CatalogFile,
   CatalogOptions,
   CatalogSchema,
   CatalogTable,
+  CatalogTableMeta,
 } from "./types.js";
-import { CATALOG_VERSION, emptyCatalog, emptyTable } from "./types.js";
+import {
+  CATALOG_VERSION,
+  emptyCatalog,
+  emptyTable,
+  normalizeName,
+} from "./types.js";
 import { fingerprintColumnNames } from "./usage.js";
 
 const FLUSH_DELAY_MS = 2_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_WAIT_MS = 15_000;
+// Shutdown cannot afford the full wait. The client that closed our stdin is
+// already gone, and blocking here only risks the process being killed before
+// the SSH tunnel is torn down.
+const LOCK_CLOSE_WAIT_MS = 2_000;
 const LOCK_STALE_MS = 30_000;
+const CLOSE_FLUSH_ATTEMPTS = 2;
+// A fingerprint's PII verdict cannot change within a process, so the SQL parse
+// behind it is cached. The bound only guards against an unexpectedly large
+// cache: the catalog itself keeps at most 100 fingerprints per table.
+const FINGERPRINT_VERDICT_LIMIT = 20_000;
+
+/**
+ * Raised when another writer held the lock for the whole wait. Recoverable on
+ * its own: nothing is corrupt and the unflushed revision is still in memory,
+ * so the caller retries instead of disabling the catalog.
+ */
+class CatalogLockTimeoutError extends Error {}
 
 interface CatalogLockRecord {
   pid: number;
@@ -42,9 +65,10 @@ function delay(ms: number): Promise<void> {
 
 async function acquireCatalogLock(
   filePath: string,
+  waitMs: number,
 ): Promise<() => Promise<void>> {
   const lockPath = `${filePath}.lock`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   const record: CatalogLockRecord = {
     pid: process.pid,
     token: `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -121,7 +145,9 @@ async function acquireCatalogLock(
       }
 
       if (Date.now() >= deadline) {
-        throw new Error(`timed out waiting for catalog lock ${lockPath}`);
+        throw new CatalogLockTimeoutError(
+          `timed out after ${waitMs}ms waiting for catalog lock ${lockPath}`,
+        );
       }
       await delay(LOCK_RETRY_MS + Math.floor(Math.random() * LOCK_RETRY_MS));
     }
@@ -383,6 +409,13 @@ export class CatalogStore {
   private flushPromise: Promise<void> | null = null;
   private revision = 0;
   private flushedRevision = 0;
+  private closing = false;
+  /** Case-insensitive name lookup, rebuilt lazily after every mutation. */
+  private nameIndex: Map<
+    string,
+    { schema: string; tables: Map<string, string> }
+  > | null = null;
+  private readonly fingerprintVerdicts = new Map<string, boolean>();
 
   constructor(private readonly options: CatalogOptions) {
     this.enabled = options.enabled;
@@ -421,6 +454,7 @@ export class CatalogStore {
       return;
     }
     this.data = this.sanitizeLoaded(parsed as CatalogFile);
+    this.invalidateNameIndex();
     this.baseData = structuredClone(this.data);
     // Rewriting also removes PII columns left by a cache that was created
     // before redaction was enabled for this profile.
@@ -474,14 +508,7 @@ export class CatalogStore {
             ),
             fingerprints: Object.fromEntries(
               Object.entries(raw.usage?.fingerprints ?? {}).filter(
-                ([fingerprint]) => {
-                  if (!this.options.piiRedactionEnabled) return true;
-                  const columns = fingerprintColumnNames(fingerprint);
-                  return (
-                    columns !== null &&
-                    !columns.some(this.options.isPIIColumn)
-                  );
-                },
+                ([fingerprint]) => this.fingerprintIsAllowed(fingerprint),
               ),
             ),
           },
@@ -528,19 +555,119 @@ export class CatalogStore {
     return this.enabled;
   }
 
+  /**
+   * Deciding whether a stored fingerprint may be persisted requires parsing it.
+   * The verdict is fixed for the life of the process, so it is cached: without
+   * this, every flush re-parsed every fingerprint of every table twice while
+   * holding the on-disk lock.
+   */
+  private fingerprintIsAllowed(fingerprint: string): boolean {
+    if (!this.options.piiRedactionEnabled) return true;
+    const cached = this.fingerprintVerdicts.get(fingerprint);
+    if (cached !== undefined) return cached;
+    const columns = fingerprintColumnNames(fingerprint);
+    const allowed = columns !== null && !columns.some(this.options.isPIIColumn);
+    if (this.fingerprintVerdicts.size >= FINGERPRINT_VERDICT_LIMIT) {
+      this.fingerprintVerdicts.clear();
+    }
+    this.fingerprintVerdicts.set(fingerprint, allowed);
+    return allowed;
+  }
+
+  private invalidateNameIndex(): void {
+    this.nameIndex = null;
+  }
+
+  private ensureNameIndex(): Map<
+    string,
+    { schema: string; tables: Map<string, string> }
+  > {
+    if (this.nameIndex) return this.nameIndex;
+    const index = new Map<
+      string,
+      { schema: string; tables: Map<string, string> }
+    >();
+    for (const [schemaName, schema] of Object.entries(this.data.schemas)) {
+      const tables = new Map<string, string>();
+      for (const tableName of Object.keys(schema.tables)) {
+        tables.set(normalizeName(tableName), tableName);
+      }
+      index.set(normalizeName(schemaName), { schema: schemaName, tables });
+    }
+    this.nameIndex = index;
+    return index;
+  }
+
+  /**
+   * Full copy of the catalog. Deliberately expensive: only `map`, `search` and
+   * the document actions need every table at once. Anything on the query path
+   * uses the targeted readers below, which is why they exist — resolving a
+   * table name used to clone the entire catalog once per reference.
+   */
   snapshot(): CatalogFile {
     return structuredClone(this.data);
+  }
+
+  /** Copy of the document axis alone. Cheap enough for the response path. */
+  docsView(): CatalogDocs {
+    return structuredClone(this.data.docs);
+  }
+
+  /**
+   * Canonical spellings for a possibly differently-cased reference. Returns
+   * every match so an ambiguous unqualified name stays ambiguous to the caller.
+   */
+  lookup(
+    schemaHint: string | null,
+    table: string,
+  ): Array<{ schema: string; table: string }> {
+    const index = this.ensureNameIndex();
+    const wanted = normalizeName(table);
+    const scopes = schemaHint
+      ? [index.get(normalizeName(schemaHint))]
+      : [...index.values()];
+    const matches: Array<{ schema: string; table: string }> = [];
+    for (const scope of scopes) {
+      if (!scope) continue;
+      const canonical = scope.tables.get(wanted);
+      if (canonical) matches.push({ schema: scope.schema, table: canonical });
+    }
+    return matches;
+  }
+
+  /** Whether a schema is declared, and when its inventory was last scanned. */
+  schemaState(schema: string): { scannedAt: string | null } | null {
+    const entry = this.data.schemas[schema];
+    return entry ? { scannedAt: entry.scannedAt } : null;
+  }
+
+  /** Scalar facts about one table, copied without cloning the catalog. */
+  tableMeta(schema: string, table: string): CatalogTableMeta | null {
+    const entry = this.data.schemas[schema]?.tables[table];
+    if (!entry) return null;
+    return {
+      detailScannedAt: entry.detailScannedAt,
+      detailStale: entry.detailStale === true,
+      docReviewed: Object.prototype.hasOwnProperty.call(entry.curated, "doc"),
+    };
+  }
+
+  /** One table, cloned. Costs a fraction of a full snapshot. */
+  readTable(schema: string, table: string): CatalogTable | null {
+    const entry = this.data.schemas[schema]?.tables[table];
+    return entry ? structuredClone(entry) : null;
   }
 
   update(mutator: (catalog: CatalogFile) => void): void {
     if (!this.enabled) return;
     mutator(this.data);
+    this.invalidateNameIndex();
     this.revision += 1;
     this.scheduleFlush();
   }
 
   scheduleFlush(): void {
-    if (!this.enabled || this.flushTimer) return;
+    if (!this.enabled || this.closing || this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       void this.flush();
@@ -562,39 +689,47 @@ export class CatalogStore {
     let tempPath: string | null = null;
     let releaseLock: (() => Promise<void>) | null = null;
     try {
-      releaseLock = await acquireCatalogLock(this.options.filePath);
+      releaseLock = await acquireCatalogLock(
+        this.options.filePath,
+        this.closing ? LOCK_CLOSE_WAIT_MS : LOCK_WAIT_MS,
+      );
       tempPath = `${this.options.filePath}.${process.pid}.${Date.now()}.tmp`;
       const writingRevision = this.revision;
       // Keep persistence as a second PII boundary. Collectors filter on input,
       // but future catalog writers must not be able to bypass that policy.
       let toWrite = this.sanitizeLoaded(structuredClone(this.data));
-      if (fs.existsSync(this.options.filePath)) {
-        // The lock serializes writers. Always merge the latest file instead of
-        // relying on mtime resolution to prove that no other process wrote it.
-        const external = JSON.parse(
-          fs.readFileSync(this.options.filePath, "utf8"),
-        ) as CatalogFile;
-        if (
-          external.version === CATALOG_VERSION &&
-          external.profile === this.options.profile &&
-          external.fingerprint === this.options.fingerprint
-        ) {
-          toWrite = mergeCatalog(
-            this.sanitizeLoaded(external),
-            toWrite,
-            this.baseData,
-          );
-          this.data = toWrite;
-        }
+      // The lock serializes writers. Always merge the latest file instead of
+      // relying on mtime resolution to prove that no other process wrote it.
+      const external = this.readExternal();
+      if (
+        external &&
+        external.version === CATALOG_VERSION &&
+        external.profile === this.options.profile &&
+        external.fingerprint === this.options.fingerprint
+      ) {
+        toWrite = mergeCatalog(
+          this.sanitizeLoaded(external),
+          toWrite,
+          this.baseData,
+        );
+        this.data = toWrite;
+        this.invalidateNameIndex();
       }
-      await fs.promises.writeFile(tempPath, `${JSON.stringify(toWrite, null, 2)}\n`, {
+      // Serialize the payload and record the merge ancestor before the first
+      // await. `this.data` now aliases `toWrite`, so `update()` can still
+      // increment counters while the write is in flight — and those increments
+      // are not in the file. Recording them as the ancestor would make the next
+      // three-way merge subtract them from themselves and drop them.
+      const payload = `${JSON.stringify(toWrite, null, 2)}\n`;
+      const persisted = structuredClone(toWrite);
+      await fs.promises.writeFile(tempPath, payload, {
         encoding: "utf8",
         mode: 0o600,
         flag: "wx",
       });
       await fs.promises.rename(tempPath, this.options.filePath);
       await fs.promises.chmod(this.options.filePath, 0o600);
-      this.baseData = structuredClone(toWrite);
+      this.baseData = persisted;
       this.flushedRevision = writingRevision;
       if (this.revision !== this.flushedRevision) this.scheduleFlush();
     } catch (error) {
@@ -604,6 +739,14 @@ export class CatalogStore {
         } catch {
           // A failed write often means the temporary file was never created.
         }
+      }
+      if (error instanceof CatalogLockTimeoutError) {
+        // Losing a race for the lock is not a reason to stop cataloguing for
+        // the rest of the session. Nothing was written, the pending revision is
+        // still in memory, and `close()` drives its own bounded retries.
+        console.error(`[catalog] ${error.message}; will retry`);
+        this.scheduleFlush();
+        return;
       }
       this.disable(
         `cannot write ${this.options.filePath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -621,14 +764,45 @@ export class CatalogStore {
     }
   }
 
+  /**
+   * Read whatever another writer left behind. A truncated or hand-edited file
+   * must not disable the catalog: the atomic rename that follows replaces it
+   * with our own valid content.
+   */
+  private readExternal(): CatalogFile | null {
+    if (!fs.existsSync(this.options.filePath)) return null;
+    try {
+      return JSON.parse(
+        fs.readFileSync(this.options.filePath, "utf8"),
+      ) as CatalogFile;
+    } catch (error) {
+      console.error(
+        `[catalog] ignoring unreadable ${this.options.filePath}; it will be replaced: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    while (this.enabled && this.revision !== this.flushedRevision) {
+    // Bounded, because a lock timeout leaves the revision unflushed and would
+    // otherwise spin here forever while the caller still has to reach
+    // `stopTunnel()`. `closing` also shortens the lock wait per attempt.
+    for (let attempt = 0; attempt < CLOSE_FLUSH_ATTEMPTS; attempt += 1) {
+      if (!this.enabled || this.revision === this.flushedRevision) return;
       if (this.flushPromise) await this.flushPromise;
       else await this.flush();
+    }
+    if (this.enabled && this.revision !== this.flushedRevision) {
+      console.error(
+        `[catalog] gave up persisting the last updates to ${this.options.filePath} after ${CLOSE_FLUSH_ATTEMPTS} attempts`,
+      );
     }
   }
 }
