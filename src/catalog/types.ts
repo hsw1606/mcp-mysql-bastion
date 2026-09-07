@@ -83,6 +83,7 @@ export interface CatalogDocs {
   repo: string | null;
   ref: string | null;
   refCommit: string | null;
+  refUpdatedAt: string | null;
   paths: string[];
   unlinked: string[];
 }
@@ -196,6 +197,7 @@ export function emptyCatalog(options: CatalogOptions): CatalogFile {
       repo: options.docsRepo,
       ref: options.docsRef,
       refCommit: null,
+      refUpdatedAt: null,
       paths: [],
       unlinked: [],
     },

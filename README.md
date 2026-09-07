@@ -278,12 +278,28 @@ resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 �
 primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 비동기로
 수집합니다. 이 작업은 `mysql_query`의 실행 시간에 포함되지 않습니다.
 
-모델은 `mysql_catalog`의 세 action으로 DB를 다시 탐색하지 않고 구조를 읽습니다:
+모델은 `mysql_catalog` action으로 DB를 다시 탐색하지 않고 구조를 읽습니다:
 
 - `map`: application, schema, 자주 쓰는 table의 개요를 봅니다.
 - `search`: table·수집된 column·memo·alias를 keyword로 찾습니다.
 - `describe`: 한 table의 column, key, index, foreign key를 봅니다. 상세 정보가
   아직 없거나 TTL이 지났다면 이 호출이 갱신을 기다립니다.
+- `docs_list`: schema를 소유한 application 아래의 `model.md` 후보만 봅니다.
+- `docs_read`: shell을 쓸 수 없는 클라이언트에서도 선택한 문서의 최신 내용을
+  읽습니다.
+- `link`: 모델이 판단한 table↔문서 연결을 배열로 한꺼번에 저장합니다.
+- `unlink`: 연결을 지우거나 해당 table에 연결할 문서가 없음을 기록합니다.
+
+문서 catalog는 서버 시작 시 git을 실행하지 않습니다. 첫 `docs_list`, `docs_read`,
+`describe`, `map` 호출이나 문서 미확인 table의 query가 있을 때 한 번 깨어납니다.
+항상 local working tree가 아니라 `origin/<MYSQL_CODE_BRANCH>`를 읽으며, 서버가
+`fetch`, `checkout`, `pull`을 실행하는 일은 없습니다.
+
+Catalog에는 문서 내용이 아니라 경로와 ref commit만 저장됩니다. Ref가 바뀌면 추가와
+삭제를 반영하고, git이 보고한 rename은 기존 table 연결에도 그대로 적용합니다.
+내용 수정은 경로를 낡게 만들지 않으므로 별도 작업을 하지 않습니다. 연결된 문서는
+`describe` 응답에서 경로, ref, 바로 실행할 수 있는 `git show` 명령을 함께 제공합니다.
+마지막 ref commit이 30일보다 오래됐으면 동작은 계속하되 응답에 경고를 붙입니다.
 
 Catalog는 기본적으로
 `~/.cache/mcp-mysql-bastion/catalog/<profile>-<host-hash>.json`에 저장됩니다.

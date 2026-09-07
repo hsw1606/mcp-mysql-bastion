@@ -27,7 +27,9 @@ function mergeEditedSet(
   for (const previous of base) {
     if (!local.includes(previous)) merged.delete(previous);
   }
-  for (const current of local) merged.add(current);
+  for (const current of local) {
+    if (!base.includes(current)) merged.add(current);
+  }
   return [...merged];
 }
 
@@ -222,24 +224,39 @@ function mergeCatalog(
       ),
     });
   }
-  return {
+  const localDocsChanged = local.docs.refCommit !== base.docs.refCommit;
+  const externalDocsChanged = external.docs.refCommit !== base.docs.refCommit;
+  const chosenDocs =
+    localDocsChanged && externalDocsChanged
+      ? timestamp(local.docs.refUpdatedAt) >= timestamp(external.docs.refUpdatedAt)
+        ? local.docs
+        : external.docs
+      : localDocsChanged
+        ? local.docs
+        : external.docs;
+  const merged: CatalogFile = {
     ...local,
     docs: {
-      ...external.docs,
-      ...local.docs,
-      paths: [
-        ...new Set([...(external.docs.paths ?? []), ...(local.docs.paths ?? [])]),
-      ],
-      unlinked: [
-        ...new Set([
-          ...(external.docs.unlinked ?? []),
-          ...(local.docs.unlinked ?? []),
-        ]),
-      ],
+      ...chosenDocs,
+      repo: local.docs.repo,
+      ref: local.docs.ref,
+      paths: chosenDocs.paths ?? [],
+      unlinked: [],
     },
     schemas,
     joins: [...joins.values()],
   };
+  const linked = new Set<string>();
+  for (const schema of Object.values(merged.schemas)) {
+    for (const table of Object.values(schema.tables)) {
+      if (table.curated.doc && !merged.docs.paths.includes(table.curated.doc.path)) {
+        delete table.curated.doc;
+      }
+      if (table.curated.doc) linked.add(table.curated.doc.path);
+    }
+  }
+  merged.docs.unlinked = merged.docs.paths.filter((path) => !linked.has(path));
+  return merged;
 }
 
 export class CatalogStore {
@@ -300,6 +317,9 @@ export class CatalogStore {
 
   private sanitizeLoaded(loaded: CatalogFile): CatalogFile {
     const fresh = emptyCatalog(this.options);
+    const docsCompatible =
+      loaded.docs?.repo === this.options.docsRepo &&
+      loaded.docs?.ref === this.options.docsRef;
     for (const [schemaName, schema] of Object.entries(fresh.schemas)) {
       const cached = loaded.schemas?.[schemaName];
       if (!cached) continue;
@@ -354,7 +374,8 @@ export class CatalogStore {
           curated: {
             notes: raw.curated?.notes ?? [],
             aliases: raw.curated?.aliases ?? [],
-            ...(Object.prototype.hasOwnProperty.call(raw.curated ?? {}, "doc")
+            ...(docsCompatible &&
+            Object.prototype.hasOwnProperty.call(raw.curated ?? {}, "doc")
               ? { doc: raw.curated.doc }
               : {}),
           },
@@ -362,7 +383,15 @@ export class CatalogStore {
         schema.tables[tableName] = table;
       }
     }
-    fresh.docs = { ...fresh.docs, ...(loaded.docs ?? {}) };
+    if (docsCompatible) {
+      fresh.docs = {
+        ...fresh.docs,
+        refCommit: loaded.docs.refCommit ?? null,
+        refUpdatedAt: loaded.docs.refUpdatedAt ?? null,
+        paths: loaded.docs.paths ?? [],
+        unlinked: loaded.docs.unlinked ?? [],
+      };
+    }
     fresh.joins = (loaded.joins ?? []).filter((edge) => {
       const aColumn = edge.a.slice(edge.a.lastIndexOf(".") + 1);
       const bColumn = edge.b.slice(edge.b.lastIndexOf(".") + 1);

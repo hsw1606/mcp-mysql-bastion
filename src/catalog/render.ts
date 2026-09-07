@@ -9,7 +9,7 @@ export interface SearchResult {
   notes: string[];
 }
 
-export function renderMap(catalog: CatalogFile): string {
+export function renderMap(catalog: CatalogFile, warning: string | null = null): string {
   const schemas = Object.entries(catalog.schemas).map(([name, schema]) => ({
     app: schema.app,
     schema: name,
@@ -43,6 +43,7 @@ export function renderMap(catalog: CatalogFile): string {
       schemas,
       unlinkedTables,
       unlinkedDocuments: catalog.docs.unlinked,
+      ...(warning ? { warning } : {}),
     },
     null,
     2,
@@ -137,9 +138,47 @@ export function renderDescribe(
   qualifiedName: string,
   table: CatalogTable,
   isPIIColumn: (column: string) => boolean,
+  documents: {
+    configured: boolean;
+    available: boolean;
+    ref: string | null;
+    command: string | null;
+    warning: string | null;
+    schema: string;
+  },
 ): string {
+  let docs: unknown;
+  const hasDocumentDecision = Object.prototype.hasOwnProperty.call(
+    table.curated,
+    "doc",
+  );
+  const documentLink = table.curated.doc;
+  if (!documents.configured) {
+    docs = "문서 축 비활성 (MYSQL_DOCS_REPO 미설정)";
+  } else if (!documents.available) {
+    docs = "문서 축 비활성";
+  } else if (!hasDocumentDecision) {
+    docs =
+      "연결 안 됨\n" +
+      `후보를 보려면 mysql_catalog {action:"docs_list", schema:"${documents.schema}"}\n` +
+      "status 같은 코드 컬럼의 의미는 도메인 문서에만 있습니다.";
+  } else if (documentLink == null) {
+    docs = "문서 없음 확인됨";
+  } else {
+    docs = {
+      path: documentLink.path,
+      ref: documents.ref,
+      command: documents.command,
+      guidance: "상태 코드·도메인 규칙은 이 문서를 먼저 읽어라.",
+    };
+  }
   return JSON.stringify(
-    { table: qualifiedName, ...safeTable(table, isPIIColumn) },
+    {
+      table: qualifiedName,
+      ...safeTable(table, isPIIColumn),
+      docs,
+      ...(documents.warning ? { warning: documents.warning } : {}),
+    },
     null,
     2,
   );
