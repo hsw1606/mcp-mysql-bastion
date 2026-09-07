@@ -201,7 +201,10 @@ const mysqlCatalogTool = {
       },
       schema: {
         type: "string",
-        description: "Declared schema name for docs_list",
+        description:
+          "Declared schema name for docs_list. Results are narrowed to the " +
+          "documents under the app directory declared for that schema; the " +
+          "response says so and reports how many were left out.",
       },
       path: {
         type: "string",
@@ -904,6 +907,15 @@ if (isMainModule()) {
       await mcpServer.connect(transport);
       log("info", "Server started and listening on stdio");
     } catch (error) {
+      // Building the server resolves the SSH tunnel target and the catalog
+      // identity, so a misconfigured environment fails here rather than in the
+      // startup block inside `createMcpServer`. Print the reason regardless of
+      // ENABLE_LOGGING for the same reason that block does: to an MCP client a
+      // silent exit looks like an unexplained handshake failure.
+      console.error(
+        `[startup] fatal error for profile ${PROFILE_LABEL}: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
       log("error", "Server error:", error);
       safeExit(1);
     }

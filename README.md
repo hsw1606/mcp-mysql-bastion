@@ -285,6 +285,11 @@ primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 �
 - `describe`: 한 table의 column, key, index, foreign key를 봅니다. 상세 정보가
   아직 없거나 TTL이 지났다면 이 호출이 갱신을 기다립니다.
 - `docs_list`: schema를 소유한 application 아래의 `model.md` 후보만 봅니다.
+  범위는 `MYSQL_APP_SCHEMAS`의 application 이름을 저장소의 `apps/<application>/`
+  directory로 보고 좁힙니다. 응답의 `scopedToApp`이 이 규약이 적용됐는지 알려주고,
+  범위 밖 문서 수를 함께 보고합니다. 규약에 맞는 문서가 없으면 전체 목록을
+  반환하고 그 이유를 `notice`에 적습니다. 범위 밖 경로도 `docs_read`로는 읽히며
+  `map`의 `unlinkedDocuments`에 나타납니다.
 - `docs_read`: shell을 쓸 수 없는 클라이언트에서도 선택한 문서의 최신 내용을
   읽습니다.
 - `link`: 모델이 판단한 table↔문서 연결을 배열로 한꺼번에 저장합니다.
@@ -306,8 +311,10 @@ Catalog는 기본적으로
 저장됩니다. SSH를 쓰면 `LocalForward`의 원격 host·port를, 직접 연결하면 MySQL
 host·port 또는 socket 경로를 hash에 사용합니다. 파일 mode는 `0600`입니다.
 Profile과 실제 DB 대상이 파일명에 들어가므로 서로 다른 환경이 같은 catalog를
-읽지 않습니다. 저장 실패 시 서버는 catalog만 끄고 기존 query 기능을 계속
-제공합니다.
+읽지 않습니다. 디스크에 쓸 수 없으면 서버는 catalog만 끄고 기존 query 기능을
+계속 제공합니다. 다른 서버가 파일 lock을 오래 쥐고 있거나 파일 내용이 깨진 경우는
+복구 가능한 상황으로 보고 catalog를 끄지 않습니다. 앞의 경우는 다음 저장에서 다시
+시도하고, 뒤의 경우는 읽을 수 없는 파일을 새로 쓴 내용으로 교체합니다.
 
 Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지문만
 들어갑니다. SQL 원문과 row data는 저장하지 않습니다. PII redaction이 켜지면 PII

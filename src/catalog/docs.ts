@@ -5,6 +5,10 @@ import type { AppSchemaEntry } from "../types/index.js";
 
 const execFileAsync = promisify(execFile);
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1_000;
+// Every git call here is a local read that takes about 150ms. A call that has
+// not returned in ten seconds is wedged, and shutdown waits on these tasks
+// before tearing down the tunnel, so it must not wait forever.
+const GIT_TIMEOUT_MS = 10_000;
 
 interface DocumentManagerOptions {
   repo: string | null;
@@ -97,6 +101,7 @@ export class CatalogDocuments {
     const { stdout } = await execFileAsync("git", ["-C", this.options.repo, ...args], {
       encoding: "utf8",
       maxBuffer: 5 * 1024 * 1024,
+      timeout: GIT_TIMEOUT_MS,
     });
     return stdout;
   }
@@ -128,7 +133,7 @@ export class CatalogDocuments {
   private async wake(): Promise<void> {
     const ref = this.options.ref as string;
     const commit = (await this.git(["rev-parse", "--verify", `${ref}^{commit}`])).trim();
-    const cached = this.store.snapshot().docs;
+    const cached = this.store.docsView();
     if (cached.refCommit === commit) return;
 
     let entries: DiffEntry[] | null = null;
@@ -231,7 +236,7 @@ export class CatalogDocuments {
       catalog.docs.refUpdatedAt = refUpdatedAt;
     });
     console.error(
-      `[catalog] document paths refreshed: ${this.store.snapshot().docs.paths.length} files at ${ref}`,
+      `[catalog] document paths refreshed: ${this.store.docsView().paths.length} files at ${ref}`,
     );
   }
 
@@ -244,25 +249,43 @@ export class CatalogDocuments {
       throw new Error(`Schema "${schemaName}" is not declared in MYSQL_APP_SCHEMAS.`);
     }
     const catalog = this.store.snapshot();
+    // The app name from MYSQL_APP_SCHEMAS is assumed to be the monorepo
+    // directory, which is what narrows 91 documents down to the ~24 that can
+    // belong to this schema. It is a convention, not a fact the server can
+    // verify, so a prefix that matches nothing falls back to the full list
+    // rather than reporting "no documents".
     const prefix = `apps/${mapping.app}/`;
-    const paths = catalog.docs.paths
-      .filter((path) => path.startsWith(prefix))
-      .map((path) => ({
-        path,
-        linkedTables: Object.entries(catalog.schemas).flatMap(
-          ([knownSchema, schema]) =>
-            Object.entries(schema.tables)
-              .filter(([, table]) => table.curated.doc?.path === path)
-              .map(([table]) => `${knownSchema}.${table}`),
-        ),
-      }));
+    const inPrefix = catalog.docs.paths.filter((path) => path.startsWith(prefix));
+    const scoped = inPrefix.length > 0;
+    const selected = scoped ? inPrefix : catalog.docs.paths;
+    const linkedTablesFor = (path: string): string[] =>
+      Object.entries(catalog.schemas).flatMap(([knownSchema, schema]) =>
+        Object.entries(schema.tables)
+          .filter(([, table]) => table.curated.doc?.path === path)
+          .map(([table]) => `${knownSchema}.${table}`),
+      );
+    const paths = selected.map((path) => ({
+      path,
+      linkedTables: linkedTablesFor(path),
+    }));
+    const outsidePrefix = catalog.docs.paths.length - inPrefix.length;
+    const notice = scoped
+      ? outsidePrefix > 0
+        ? `${outsidePrefix}개 문서는 "${prefix}" 밖에 있어 제외했습니다. ` +
+          "map의 unlinkedDocuments에 전체 목록이 있고, docs_read는 카탈로그에 " +
+          "있는 어떤 경로든 읽습니다."
+        : null
+      : `"${prefix}" 로 시작하는 문서가 없어 카탈로그의 모든 문서를 반환했습니다. ` +
+        `MYSQL_APP_SCHEMAS의 앱 이름("${mapping.app}")이 저장소 디렉토리와 다를 수 있습니다.`;
     const warning = this.staleWarning();
     return JSON.stringify(
       {
         schema: schemaName,
         app: mapping.app,
         ref: catalog.docs.ref,
+        scopedToApp: scoped,
         paths,
+        ...(notice ? { notice } : {}),
         ...(warning ? { warning } : {}),
       },
       null,
@@ -343,7 +366,9 @@ export class CatalogDocuments {
   }
 
   staleWarning(): string | null {
-    const updatedAt = this.store.snapshot().docs.refUpdatedAt;
+    // On the query response path. Reads the document axis alone: a full
+    // snapshot would clone every table's metadata to check one timestamp.
+    const updatedAt = this.store.docsView().refUpdatedAt;
     if (!updatedAt) return null;
     const age = Date.now() - Date.parse(updatedAt);
     if (!Number.isFinite(age) || age <= THIRTY_DAYS_MS) return null;
