@@ -1,9 +1,11 @@
-import type { CatalogFile, CatalogTable } from "./types.js";
+import type { CatalogFile, CatalogJoin, CatalogTable } from "./types.js";
 
 // `map` is an overview. Both unlinked lists grow with the schema — 164 tables
 // and 91 documents on a cold catalog — so they are sampled and counted rather
 // than emitted whole. describe and docs_list give the per-table detail.
 const UNLINKED_SAMPLE_LIMIT = 30;
+const HOT_TABLE_LIMIT = 10;
+const TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES = 2 * 1024;
 
 function sampled(values: string[]): {
   total: number;
@@ -27,6 +29,77 @@ export interface SearchResult {
   notes: string[];
 }
 
+interface RankedTable {
+  app: string;
+  schema: string;
+  table: string;
+  entry: CatalogTable;
+}
+
+function usedAt(table: CatalogTable): number {
+  const parsed = Date.parse(table.usage.lastUsedAt ?? "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Frequency is the primary signal and recency breaks ties. Tables with no
+ * observations fall back to their row estimate, so a brand-new catalog still
+ * offers a useful starting point after its first inventory scan.
+ */
+function rankTables(tables: RankedTable[]): RankedTable[] {
+  return tables.sort((a, b) => {
+    const used = b.entry.usage.count - a.entry.usage.count;
+    if (used) return used;
+    const recent = usedAt(b.entry) - usedAt(a.entry);
+    if (recent) return recent;
+    const rows = (b.entry.rowsEstimate ?? 0) - (a.entry.rowsEstimate ?? 0);
+    if (rows) return rows;
+    return `${a.schema}.${a.table}`.localeCompare(`${b.schema}.${b.table}`);
+  });
+}
+
+function allTables(catalog: CatalogFile): RankedTable[] {
+  return Object.entries(catalog.schemas).flatMap(([schema, entry]) =>
+    Object.entries(entry.tables).map(([table, tableEntry]) => ({
+      app: entry.app,
+      schema,
+      table,
+      entry: tableEntry,
+    })),
+  );
+}
+
+export function renderToolDescriptionSuffix(catalog: CatalogFile): string {
+  const staticGuidance =
+    "\n\n테이블의 도메인 규칙·상태 코드 문서가 있을 수 있다. " +
+    "SQL을 쓰기 전에 mysql_catalog describe로 확인하라.";
+  const hot = rankTables(allTables(catalog))
+    .slice(0, HOT_TABLE_LIMIT)
+    .map(({ app, schema, table, entry }) => {
+      const signal =
+        entry.usage.count > 0
+          ? `${entry.usage.count} uses${entry.usage.lastUsedAt ? `, last ${entry.usage.lastUsedAt.slice(0, 10)}` : ""}`
+          : `about ${entry.rowsEstimate ?? 0} rows; no usage recorded yet`;
+      return `\n  - ${app} -> ${schema}.${table} (${signal})`;
+    });
+  if (hot.length === 0) return staticGuidance;
+
+  const heading =
+    "\n\nCATALOG HOT TABLES (frequency first, recency breaks ties; " +
+    "row estimates seed a new catalog):";
+  let suffix = heading;
+  for (const line of hot) {
+    if (
+      Buffer.byteLength(suffix + line + staticGuidance, "utf8") >
+      TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES
+    ) {
+      break;
+    }
+    suffix += line;
+  }
+  return suffix + staticGuidance;
+}
+
 export function renderMap(catalog: CatalogFile, warning: string | null = null): string {
   const schemas = Object.entries(catalog.schemas).map(([name, schema]) => ({
     app: schema.app,
@@ -34,16 +107,20 @@ export function renderMap(catalog: CatalogFile, warning: string | null = null): 
     description: schema.description ?? "",
     scannedAt: schema.scannedAt,
     tableCount: Object.keys(schema.tables).length,
-    tables: Object.entries(schema.tables)
-      .sort(([, a], [, b]) => {
-        const usage = b.usage.count - a.usage.count;
-        return usage || (b.rowsEstimate ?? 0) - (a.rowsEstimate ?? 0);
-      })
+    tables: rankTables(
+      Object.entries(schema.tables).map(([table, entry]) => ({
+        app: schema.app,
+        schema: name,
+        table,
+        entry,
+      })),
+    )
       .slice(0, 10)
-      .map(([table, entry]) => ({
+      .map(({ table, entry }) => ({
         table,
         rowsEstimate: entry.rowsEstimate,
         usageCount: entry.usage.count,
+        lastUsedAt: entry.usage.lastUsedAt,
       })),
   }));
   const unlinkedTables = catalog.docs.repo
@@ -164,6 +241,7 @@ export function renderDescribe(
     warning: string | null;
     schema: string;
   },
+  observedJoins: CatalogJoin[],
 ): string {
   let docs: unknown;
   const hasDocumentDecision = Object.prototype.hasOwnProperty.call(
@@ -194,6 +272,7 @@ export function renderDescribe(
     {
       table: qualifiedName,
       ...safeTable(table, isPIIColumn),
+      observedJoins,
       docs,
       ...(documents.warning ? { warning: documents.warning } : {}),
     },

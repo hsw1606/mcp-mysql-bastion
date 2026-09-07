@@ -294,6 +294,10 @@ primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 �
   읽습니다.
 - `link`: 모델이 판단한 table↔문서 연결을 배열로 한꺼번에 저장합니다.
 - `unlink`: 연결을 지우거나 해당 table에 연결할 문서가 없음을 기록합니다.
+- `note`: `target` table에 memo 또는 alias 하나를 저장합니다. 둘 중 하나만 보냅니다.
+- `forget`: `target` table의 `notes`, `aliases`, `usage`, `joins`, `metadata` 중 한
+  범위를 지웁니다. `metadata`는 다음 `describe` 또는 정상 query 뒤에 다시 수집됩니다.
+  문서 판단은 지우지 않으며, 그 작업에는 `unlink`를 사용합니다.
 - `refresh`: 지정한 범위를 강제로 다시 수집합니다. `target`이 `schema.table`이면
   그 table의 column·index·foreign key, 선언된 schema 이름이면 table inventory,
   `docs`면 문서 ref입니다. `target`을 생략하면 inventory와 문서를 함께 갱신합니다.
@@ -331,6 +335,18 @@ Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지�
 들어갑니다. SQL 원문과 row data는 저장하지 않습니다. PII redaction이 켜지면 PII
 column은 저장과 응답에서 모두 제외합니다. `MYSQL_CATALOG_ENABLED=false`로 끄면
 도구와 resource 동작은 변경 전과 같아집니다.
+
+정상 query 뒤에는 참조한 table의 사용 횟수와 최근 시각을 기록합니다. `map`은
+사용 횟수를 우선하고 최근 시각으로 동률을 정한 hot table을 schema마다 보여줍니다.
+사용 이력이 없는 새 catalog는 예상 row 수로 임시 순서를 정합니다. 전체 상위 10개는
+`mysql_query` 도구 설명에도 들어가므로 다음 세션은 첫 호출 전부터 자주 쓰는 table을
+압니다. 첫 inventory가 빈 catalog를 채운 경우 서버는 `tools/list_changed` 알림을
+세션당 한 번만 보냅니다.
+
+Query에서 `tableA.column = tableB.column` 형태로 관측한 join은 양 끝과 횟수만
+저장합니다. 성공한 query의 join만 누적하며, `describe`의 `observedJoins`에서 해당
+table과 연결된 경로를 자주 관측한 순서로 확인할 수 있습니다. 이는 DB의 foreign key와
+별개인 관측 사실입니다.
 
 ### `MYSQL_CODE_BRANCH` — 데이터가 어느 branch에 대응하는가
 

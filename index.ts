@@ -38,7 +38,11 @@ import {
   MYSQL_DOCS_REPO,
 } from "./src/config/index.js";
 import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
-import { catalogIdentity, SchemaCatalog } from "./src/catalog/index.js";
+import {
+  catalogIdentity,
+  SchemaCatalog,
+  type CatalogForgetScope,
+} from "./src/catalog/index.js";
 import {
   safeExit,
   getPool,
@@ -65,19 +69,19 @@ log("info", `Starting MySQL MCP server v${version}...`);
 // npm_package_version is only set when launched through an npm script; the MCP
 // clients exec dist/index.js directly, so fall back to the compiled version.
 const toolVersion = `MySQL MCP Server [v${process.env.npm_package_version ?? version}]`;
-let toolDescription = `[${toolVersion}] Run SQL queries against the ${PROFILE_LABEL} MySQL database`;
+let baseToolDescription = `[${toolVersion}] Run SQL queries against the ${PROFILE_LABEL} MySQL database`;
 
 // Name the environment first, before any capability text. A tool description is
 // the only thing the model reliably reads before choosing a tool, so this is
 // where "you are talking to production" has to appear.
 if (MYSQL_PROFILE) {
-  toolDescription += IS_WRITE_FORBIDDEN_PROFILE
+  baseToolDescription += IS_WRITE_FORBIDDEN_PROFILE
     ? ` — ENVIRONMENT: ${PROFILE_LABEL}, STRICTLY READ-ONLY (writes are refused by policy)`
     : ` — ENVIRONMENT: ${PROFILE_LABEL}`;
 }
 
 if (isMultiDbMode) {
-  toolDescription += " (Multi-DB mode enabled)";
+  baseToolDescription += " (Multi-DB mode enabled)";
 }
 
 if (
@@ -87,26 +91,27 @@ if (
   ALLOW_DDL_OPERATION
 ) {
   // At least one write operation is enabled
-  toolDescription += " with support for:";
+  baseToolDescription += " with support for:";
 
   if (ALLOW_INSERT_OPERATION) {
-    toolDescription += " INSERT,";
+    baseToolDescription += " INSERT,";
   }
 
   if (ALLOW_UPDATE_OPERATION) {
-    toolDescription += " UPDATE,";
+    baseToolDescription += " UPDATE,";
   }
 
   if (ALLOW_DELETE_OPERATION) {
-    toolDescription += " DELETE,";
+    baseToolDescription += " DELETE,";
   }
 
   if (ALLOW_DDL_OPERATION) {
-    toolDescription += " DDL,";
+    baseToolDescription += " DDL,";
   }
 
   // Remove trailing comma and add READ operations
-  toolDescription = toolDescription.replace(/,$/, "") + " and READ operations";
+  baseToolDescription =
+    baseToolDescription.replace(/,$/, "") + " and READ operations";
 
   if (
     Object.keys(SCHEMA_INSERT_PERMISSIONS).length > 0 ||
@@ -114,11 +119,11 @@ if (
     Object.keys(SCHEMA_DELETE_PERMISSIONS).length > 0 ||
     Object.keys(SCHEMA_DDL_PERMISSIONS).length > 0
   ) {
-    toolDescription += " (Schema-specific permissions enabled)";
+    baseToolDescription += " (Schema-specific permissions enabled)";
   }
 } else {
   // Only read operations are allowed
-  toolDescription += " (READ-ONLY)";
+  baseToolDescription += " (READ-ONLY)";
 }
 
 // Everything below is here to spare the model a discovery round-trip. A tool
@@ -127,28 +132,28 @@ if (
 // and easy to get wrong.
 
 if (CODE_BRANCH) {
-  toolDescription +=
+  baseToolDescription +=
     `\n\nCODE REVISION: this database matches the \`${CODE_BRANCH}\` branch. ` +
     `Read entities, migrations, and queries from that branch when correlating code with data.`;
 }
 
 if (APP_SCHEMAS.length > 0) {
-  toolDescription +=
+  baseToolDescription +=
     "\n\nAPP -> SCHEMA (authoritative — use these directly; do not run SHOW DATABASES " +
     "or search information_schema to find a schema):";
   for (const entry of APP_SCHEMAS) {
-    toolDescription +=
+    baseToolDescription +=
       `\n  - ${entry.app} -> ${entry.schema}` +
       (entry.description ? ` — ${entry.description}` : "");
   }
-  toolDescription +=
+  baseToolDescription +=
     "\nQualify every table with its schema (schema.table). Any schema not listed here is " +
     "either absent from this environment or not owned by an application.";
   const needsQuoting = APP_SCHEMAS.find(
     (entry) => !/^[A-Za-z0-9_$]+$/.test(entry.schema),
   );
   if (needsQuoting) {
-    toolDescription +=
+    baseToolDescription +=
       `\nA schema name that is not a bare identifier must be backtick-quoted, ` +
       `e.g. SELECT ... FROM \`${needsQuoting.schema}\`.some_table.`;
   }
@@ -169,6 +174,7 @@ const mysqlCatalogTool = {
     "Use map for the app/schema overview, search to find tables or known columns, " +
     "describe before writing SQL, and docs_list/docs_read to inspect domain documents. " +
     "Use link or unlink to record the model's document decision. " +
+    "Use note to save a table memo or alias, and forget to clear one catalog scope. " +
     "Use refresh when cached metadata contradicts what a query actually returned, " +
     "or right after a migration: added columns and indexes raise no error, so " +
     "nothing else invalidates them.",
@@ -185,6 +191,8 @@ const mysqlCatalogTool = {
           "docs_read",
           "link",
           "unlink",
+          "note",
+          "forget",
           "refresh",
         ],
         description: "Catalog operation to perform",
@@ -217,10 +225,27 @@ const mysqlCatalogTool = {
       target: {
         type: "string",
         description:
-          'What to re-collect for refresh: "schema.table" for one table\'s ' +
+          'Qualified schema.table for note or forget. For refresh: "schema.table" for one table\'s ' +
           'columns, indexes and foreign keys; a declared schema name for the ' +
           'table inventory; "docs" to re-read the document ref after a git ' +
           "fetch. Omit it to refresh the inventory and the documents together.",
+      },
+      text: {
+        type: "string",
+        maxLength: 1000,
+        description: "Table memo to add with note; use either text or alias",
+      },
+      alias: {
+        type: "string",
+        maxLength: 200,
+        description: "Alternative table name to add with note; use either alias or text",
+      },
+      scope: {
+        type: "string",
+        enum: ["notes", "aliases", "usage", "joins", "metadata"],
+        description:
+          "What forget clears for one table. metadata is lazily recollected; " +
+          "document decisions use unlink instead.",
       },
       links: {
         type: "array",
@@ -349,6 +374,8 @@ export default function createMcpServer() {
       ENABLE_PII_REDACTION &&
       isPIIColumn(column, piiColumnList, PII_EXTRA_COLUMN_PATTERNS),
   });
+  const mysqlQueryDescription = (): string =>
+    baseToolDescription + catalog.toolDescriptionSuffix();
   const loadResourceTables = async (): Promise<TableRow[]> => {
     if (catalog.isEnabled()) {
       try {
@@ -391,8 +418,9 @@ export default function createMcpServer() {
       capabilities: {
         resources: {},
         tools: {
+          ...(catalog.isEnabled() ? { listChanged: true } : {}),
           mysql_query: {
-            description: toolDescription,
+            description: mysqlQueryDescription(),
             inputSchema: {
               type: "object",
               properties: {
@@ -679,6 +707,46 @@ export default function createMcpServer() {
             throw new Error('mysql_catalog unlink requires "table" as schema.table.');
           }
           text = await catalog.unlink(args.table);
+        } else if (action === "note") {
+          if (typeof args.target !== "string" || !args.target.trim()) {
+            throw new Error('mysql_catalog note requires "target" as schema.table.');
+          }
+          const hasText =
+            typeof args.text === "string" && args.text.trim().length > 0;
+          const hasAlias =
+            typeof args.alias === "string" && args.alias.trim().length > 0;
+          if (hasText === hasAlias) {
+            throw new Error(
+              'mysql_catalog note requires exactly one non-empty "text" or "alias".',
+            );
+          }
+          text = await catalog.note(args.target, {
+            ...(hasText ? { text: args.text as string } : {}),
+            ...(hasAlias ? { alias: args.alias as string } : {}),
+          });
+        } else if (action === "forget") {
+          if (typeof args.target !== "string" || !args.target.trim()) {
+            throw new Error('mysql_catalog forget requires "target" as schema.table.');
+          }
+          const scopes = new Set<CatalogForgetScope>([
+            "notes",
+            "aliases",
+            "usage",
+            "joins",
+            "metadata",
+          ]);
+          if (
+            typeof args.scope !== "string" ||
+            !scopes.has(args.scope as CatalogForgetScope)
+          ) {
+            throw new Error(
+              'mysql_catalog forget requires "scope" as notes, aliases, usage, joins, or metadata.',
+            );
+          }
+          text = await catalog.forget(
+            args.target,
+            args.scope as CatalogForgetScope,
+          );
         } else if (action === "refresh") {
           if (args.target !== undefined && typeof args.target !== "string") {
             throw new Error('mysql_catalog refresh takes "target" as a string.');
@@ -750,7 +818,7 @@ export default function createMcpServer() {
       tools: [
         {
           name: "mysql_query",
-          description: toolDescription,
+          description: mysqlQueryDescription(),
           inputSchema: {
             type: "object",
             properties: {
@@ -801,7 +869,15 @@ export default function createMcpServer() {
       connection.release();
       // Inventory collection is intentionally detached. The MCP client can
       // receive query responses while this single metadata query runs.
-      catalog.startInventory();
+      let toolListChangedSent = false;
+      catalog.startInventory(async () => {
+        if (toolListChangedSent) return;
+        toolListChangedSent = true;
+        // Some clients do not listen for this optional notification. The first
+        // tools/list response still contains the fresh description, so failure
+        // here needs no retry or warning.
+        await server.sendToolListChanged().catch(() => undefined);
+      });
     } catch (error) {
       // Startup failure is the one place where the operator needs the reason
       // regardless of ENABLE_LOGGING — a silent exit here looks to the MCP

@@ -4,6 +4,7 @@ import type {
   CatalogCurated,
   CatalogDocs,
   CatalogFile,
+  CatalogJoin,
   CatalogOptions,
   CatalogSchema,
   CatalogTable,
@@ -205,7 +206,28 @@ function mergeCurated(
 }
 
 function mergedCounter(external: number, local: number, base: number): number {
+  // A lower local value is an intentional reset from `forget`, not a lost
+  // increment. Preserve only increments another process made after our base.
+  if (local < base) return local + Math.max(0, external - base);
   return external + Math.max(0, local - base);
+}
+
+function newerUsageTimestamp(
+  externalValue: string | null | undefined,
+  localValue: string | null | undefined,
+  externalCount: number,
+  localCount: number,
+  baseCount: number,
+): string | null {
+  if (localCount < baseCount && externalCount <= baseCount) {
+    return localValue ?? null;
+  }
+  if (externalCount < baseCount && localCount <= baseCount) {
+    return externalValue ?? null;
+  }
+  return timestamp(localValue) >= timestamp(externalValue)
+    ? localValue ?? null
+    : externalValue ?? null;
 }
 
 function mergeTable(
@@ -213,18 +235,82 @@ function mergeTable(
   local: CatalogTable,
   base?: CatalogTable,
 ): CatalogTable {
+  const baseDetailAt = timestamp(base?.detailScannedAt);
+  const localInvalidated =
+    local.detailStale === true &&
+    (base?.detailStale !== true || local.detailScannedAt === null);
+  const externalInvalidated =
+    external.detailStale === true &&
+    (base?.detailStale !== true || external.detailScannedAt === null);
+  const externalRefreshed = timestamp(external.detailScannedAt) > baseDetailAt;
+  const localRefreshed = timestamp(local.detailScannedAt) > baseDetailAt;
   const newerDetail =
-    timestamp(local.detailScannedAt) >= timestamp(external.detailScannedAt)
+    localInvalidated && !externalRefreshed
       ? local
-      : external;
+      : externalInvalidated && !localRefreshed
+        ? external
+        : timestamp(local.detailScannedAt) >= timestamp(external.detailScannedAt)
+          ? local
+          : external;
+  const externalUsageCount = external.usage?.count ?? 0;
+  const localUsageCount = local.usage?.count ?? 0;
+  const baseUsageCount = base?.usage?.count ?? 0;
+  const columns = [...new Set([
+    ...Object.keys(external.usage?.columns ?? {}),
+    ...Object.keys(local.usage?.columns ?? {}),
+  ])]
+    .map((column) => [
+      column,
+      mergedCounter(
+        external.usage?.columns?.[column] ?? 0,
+        local.usage?.columns?.[column] ?? 0,
+        base?.usage?.columns?.[column] ?? 0,
+      ),
+    ] as const)
+    .filter(([, count]) => count > 0);
+  const fingerprints = [...new Set([
+    ...Object.keys(external.usage?.fingerprints ?? {}),
+    ...Object.keys(local.usage?.fingerprints ?? {}),
+  ])]
+    .map((fingerprint) => {
+      const left = external.usage?.fingerprints?.[fingerprint];
+      const right = local.usage?.fingerprints?.[fingerprint];
+      const ancestor = base?.usage?.fingerprints?.[fingerprint];
+      const count = mergedCounter(
+        left?.count ?? 0,
+        right?.count ?? 0,
+        ancestor?.count ?? 0,
+      );
+      return [
+        fingerprint,
+        {
+          count,
+          successCount: mergedCounter(
+            left?.successCount ?? 0,
+            right?.successCount ?? 0,
+            ancestor?.successCount ?? 0,
+          ),
+          failureCount: mergedCounter(
+            left?.failureCount ?? 0,
+            right?.failureCount ?? 0,
+            ancestor?.failureCount ?? 0,
+          ),
+          lastUsedAt:
+            newerUsageTimestamp(
+              left?.lastUsedAt,
+              right?.lastUsedAt,
+              left?.count ?? 0,
+              right?.count ?? 0,
+              ancestor?.count ?? 0,
+            ) ?? new Date(0).toISOString(),
+        },
+      ] as const;
+    })
+    .filter(([, usage]) => usage.count > 0);
   return {
     ...newerDetail,
     usage: {
-      count: mergedCounter(
-        external.usage?.count ?? 0,
-        local.usage?.count ?? 0,
-        base?.usage?.count ?? 0,
-      ),
+      count: mergedCounter(externalUsageCount, localUsageCount, baseUsageCount),
       successCount: mergedCounter(
         external.usage?.successCount ?? 0,
         local.usage?.successCount ?? 0,
@@ -235,59 +321,15 @@ function mergeTable(
         local.usage?.failureCount ?? 0,
         base?.usage?.failureCount ?? 0,
       ),
-      lastUsedAt:
-        timestamp(local.usage?.lastUsedAt) >=
-        timestamp(external.usage?.lastUsedAt)
-          ? local.usage?.lastUsedAt ?? null
-          : external.usage?.lastUsedAt ?? null,
-      columns: Object.fromEntries(
-        [...new Set([
-          ...Object.keys(external.usage?.columns ?? {}),
-          ...Object.keys(local.usage?.columns ?? {}),
-        ])].map((column) => [
-          column,
-          mergedCounter(
-            external.usage?.columns?.[column] ?? 0,
-            local.usage?.columns?.[column] ?? 0,
-            base?.usage?.columns?.[column] ?? 0,
-          ),
-        ]),
+      lastUsedAt: newerUsageTimestamp(
+        external.usage?.lastUsedAt,
+        local.usage?.lastUsedAt,
+        externalUsageCount,
+        localUsageCount,
+        baseUsageCount,
       ),
-      fingerprints: Object.fromEntries(
-        [...new Set([
-          ...Object.keys(external.usage?.fingerprints ?? {}),
-          ...Object.keys(local.usage?.fingerprints ?? {}),
-        ])].map((fingerprint) => {
-          const left = external.usage?.fingerprints?.[fingerprint];
-          const right = local.usage?.fingerprints?.[fingerprint];
-          const ancestor = base?.usage?.fingerprints?.[fingerprint];
-          const newer =
-            timestamp(right?.lastUsedAt) >= timestamp(left?.lastUsedAt)
-              ? right
-              : left;
-          return [
-            fingerprint,
-            {
-              count: mergedCounter(
-                left?.count ?? 0,
-                right?.count ?? 0,
-                ancestor?.count ?? 0,
-              ),
-              successCount: mergedCounter(
-                left?.successCount ?? 0,
-                right?.successCount ?? 0,
-                ancestor?.successCount ?? 0,
-              ),
-              failureCount: mergedCounter(
-                left?.failureCount ?? 0,
-                right?.failureCount ?? 0,
-                ancestor?.failureCount ?? 0,
-              ),
-              lastUsedAt: newer?.lastUsedAt ?? new Date(0).toISOString(),
-            },
-          ];
-        }),
-      ),
+      columns: Object.fromEntries(columns),
+      fingerprints: Object.fromEntries(fingerprints),
     },
     curated: mergeCurated(
       external.curated ?? { notes: [], aliases: [] },
@@ -340,7 +382,7 @@ function mergeCatalog(
       schemas[name] = external.schemas[name] ?? local.schemas[name];
     }
   }
-  const joins = new Map<string, { a: string; b: string; count: number }>();
+  const joins = new Map<string, CatalogJoin>();
   const externalJoins = new Map(
     external.joins.map((edge) => [`${edge.a}\u0000${edge.b}`, edge]),
   );
@@ -356,14 +398,16 @@ function mergeCatalog(
     const ancestor = baseJoins.get(key);
     const edge = outside ?? inside;
     if (!edge) continue;
+    const count = mergedCounter(
+      outside?.count ?? 0,
+      inside?.count ?? 0,
+      ancestor?.count ?? 0,
+    );
+    if (count <= 0) continue;
     joins.set(key, {
       a: edge.a,
       b: edge.b,
-      count: mergedCounter(
-        outside?.count ?? 0,
-        inside?.count ?? 0,
-        ancestor?.count ?? 0,
-      ),
+      count,
     });
   }
   const localDocsChanged = local.docs.refCommit !== base.docs.refCommit;
@@ -656,6 +700,27 @@ export class CatalogStore {
   readTable(schema: string, table: string): CatalogTable | null {
     const entry = this.data.schemas[schema]?.tables[table];
     return entry ? structuredClone(entry) : null;
+  }
+
+  tableCount(): number {
+    return Object.values(this.data.schemas).reduce(
+      (total, schema) => total + Object.keys(schema.tables).length,
+      0,
+    );
+  }
+
+  /** Observed equality joins touching one table, hottest first. */
+  readJoins(schema: string, table: string): CatalogJoin[] {
+    const prefix = `${schema}.${table}.`.toLowerCase();
+    return this.data.joins
+      .filter(
+        (edge) =>
+          edge.a.toLowerCase().startsWith(prefix) ||
+          edge.b.toLowerCase().startsWith(prefix),
+      )
+      .sort((a, b) => b.count - a.count || a.a.localeCompare(b.a))
+      .slice(0, 20)
+      .map((edge) => ({ ...edge }));
   }
 
   update(mutator: (catalog: CatalogFile) => void): void {
