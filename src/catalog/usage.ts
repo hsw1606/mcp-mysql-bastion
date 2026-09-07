@@ -18,7 +18,37 @@ const LITERAL_TYPES = new Set([
   "timestamp",
 ]);
 
-function referencesFromTableList(sql: string): TableReference[] {
+function cteNames(ast: AST | AST[]): Set<string> {
+  const names = new Set<string>();
+  const visit = (node: unknown): void => {
+    if (node == null || typeof node !== "object" || node instanceof Date) return;
+    const obj = node as Record<string, unknown>;
+    if (Array.isArray(obj.with)) {
+      for (const entry of obj.with) {
+        if (!entry || typeof entry !== "object") continue;
+        const name = (entry as Record<string, unknown>).name;
+        if (name && typeof name === "object") {
+          const value = (name as Record<string, unknown>).value;
+          if (typeof value === "string") names.add(value.toLowerCase());
+        }
+      }
+    }
+    for (const value of Object.values(obj)) {
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item);
+      } else {
+        visit(value);
+      }
+    }
+  };
+  visit(ast);
+  return names;
+}
+
+function referencesFromTableList(
+  sql: string,
+  commonTableExpressions: ReadonlySet<string>,
+): TableReference[] {
   const seen = new Set<string>();
   const references: TableReference[] = [];
   for (const encoded of parser.tableList(sql, { database: "mysql" })) {
@@ -26,6 +56,10 @@ function referencesFromTableList(sql: string): TableReference[] {
     const schema = parts[1] && parts[1] !== "null" ? parts[1] : null;
     const table = parts.slice(2).join("::");
     if (!table) continue;
+    // node-sql-parser includes CTE names in tableList. They are query-local
+    // result sets, not database tables, and must not trigger inventory refreshes
+    // or usage records for an unrelated table with the same name.
+    if (!schema && commonTableExpressions.has(table.toLowerCase())) continue;
     const key = `${schema ?? ""}.${table}`.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -160,7 +194,7 @@ function collectColumnNames(node: unknown, names: Set<string>): void {
 export function prepareCatalogQuery(sql: string): PreparedCatalogQuery {
   try {
     const ast = parser.astify(sql, { database: "mysql" });
-    const references = referencesFromTableList(sql);
+    const references = referencesFromTableList(sql, cteNames(ast));
     const aliases = new Map<string, TableReference>();
     collectAliases(ast, aliases);
     const joins: QueryJoin[] = [];

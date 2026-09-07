@@ -14,9 +14,12 @@ import type {
 } from "./types.js";
 import { prepareCatalogQuery, resultColumnNames } from "./usage.js";
 
+const UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS = 60_000;
+
 export interface CatalogIdentity {
   profile: string;
-  host: string;
+  /** Stable identity of the database endpoint, before any local SSH forwarding. */
+  target: string;
   user: string;
   customPath?: string;
 }
@@ -31,13 +34,13 @@ export function catalogIdentity(identity: CatalogIdentity): {
 } {
   const profile = identity.profile || "default";
   const safeProfile = profile.replace(/[^A-Za-z0-9_.-]/g, "_");
-  const hostHash = shortHash(identity.host);
+  const targetHash = shortHash(identity.target);
   const directory =
     identity.customPath ??
     path.join(os.homedir(), ".cache", "mcp-mysql-bastion", "catalog");
   return {
-    filePath: path.join(directory, `${safeProfile}-${hostHash}.json`),
-    fingerprint: shortHash(`${identity.host}\u0000${identity.user}`),
+    filePath: path.join(directory, `${safeProfile}-${targetHash}.json`),
+    fingerprint: shortHash(`${identity.target}\u0000${identity.user}`),
   };
 }
 
@@ -49,6 +52,10 @@ export class SchemaCatalog {
   private readonly store: CatalogStore;
   private readonly collector: CatalogCollector;
   private readonly documents: CatalogDocuments;
+  private readonly backgroundTasks = new Set<Promise<void>>();
+  private readonly unknownReferenceRefreshes = new Map<string, number>();
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
 
   constructor(private readonly options: CatalogOptions) {
     this.store = new CatalogStore(options);
@@ -69,17 +76,27 @@ export class SchemaCatalog {
   }
 
   startInventory(): void {
-    if (!this.isEnabled()) return;
+    if (!this.isEnabled() || this.closing) return;
     // Deliberately not forced. MCP clients start a fresh server per session,
     // so forcing here would rescan on every session and make
     // MYSQL_CATALOG_TTL_HOURS meaningless for the inventory. An empty or
     // expired inventory still refreshes: `inventoryNeedsRefresh` treats a
     // missing `scannedAt` as expired.
-    void this.collector.collectInventory(false).catch((error) => {
-      console.error(
-        `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
+    this.trackBackgroundTask(
+      this.collector.collectInventory(false).catch((error) => {
+        console.error(
+          `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }),
+    );
+  }
+
+  private trackBackgroundTask(task: Promise<void>): void {
+    this.backgroundTasks.add(task);
+    void task.then(
+      () => this.backgroundTasks.delete(task),
+      () => this.backgroundTasks.delete(task),
+    );
   }
 
   private resolveTable(input: string): {
@@ -111,6 +128,33 @@ export class SchemaCatalog {
     return null;
   }
 
+  private catalogKeyForReference(reference: TableReference): string | null {
+    const requestedSchema = reference.schema ?? this.options.defaultSchema;
+    if (!requestedSchema) return null;
+    const declared = this.options.appSchemas.find((entry) =>
+      sameName(entry.schema, requestedSchema),
+    );
+    return declared
+      ? `${declared.schema}.${reference.table}`.toLowerCase()
+      : null;
+  }
+
+  private resolveReferences(references: TableReference[]): Array<{
+    schema: string;
+    table: string;
+    entry: CatalogTable;
+  }> {
+    return references
+      .map((reference) =>
+        this.resolveTable(
+          reference.schema
+            ? `${reference.schema}.${reference.table}`
+            : reference.table,
+        ),
+      )
+      .filter((value): value is NonNullable<typeof value> => value !== null);
+  }
+
   private async ensureKnownTable(input: string): Promise<{
     schema: string;
     table: string;
@@ -131,9 +175,7 @@ export class SchemaCatalog {
 
   async map(): Promise<string> {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
-    if (Object.values(this.store.snapshot().schemas).every(
-      (schema) => schema.scannedAt === null,
-    )) {
+    if (this.collector.inventoryNeedsRefresh()) {
       await this.collector.collectInventory(false);
     }
     let documentWarning: string | null = null;
@@ -156,9 +198,7 @@ export class SchemaCatalog {
     // Same cold-start guard as `map`. Without it the first search of a session
     // reads an empty snapshot and returns no hits, which reads to the model as
     // "no such table" rather than "not scanned yet".
-    if (Object.values(this.store.snapshot().schemas).every(
-      (schema) => schema.scannedAt === null,
-    )) {
+    if (this.collector.inventoryNeedsRefresh()) {
       await this.collector.collectInventory(false);
     }
     const limit = Math.min(100, Math.max(1, requestedLimit ?? 20));
@@ -278,10 +318,7 @@ export class SchemaCatalog {
 
   async listTables(): Promise<TableRow[]> {
     if (!this.isEnabled()) return [];
-    const initial = this.store.snapshot();
-    if (Object.values(initial.schemas).every(
-      (schema) => schema.scannedAt === null,
-    )) {
+    if (this.collector.inventoryNeedsRefresh()) {
       await this.collector.collectInventory(false);
     }
     return Object.entries(this.store.snapshot().schemas).flatMap(
@@ -312,19 +349,31 @@ export class SchemaCatalog {
     result: { content?: Array<{ type: string; text: string }>; isError?: boolean },
     error?: unknown,
   ): void {
-    if (!this.isEnabled() || prepared.references.length === 0) return;
-    setImmediate(() => {
-      if (this.referencesNeedDocuments(prepared.references)) {
-        void this.documents.ensureAwake().catch(() => {
-          // CatalogDocuments logs and remembers the document-only failure.
-        });
-      }
-      void this.processQuery(prepared, result, error).catch((cause) => {
-        console.error(
-          `[catalog] post-query update failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    if (
+      !this.isEnabled() ||
+      this.closing ||
+      prepared.references.length === 0
+    ) {
+      return;
+    }
+    const task = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        const documentWake = this.referencesNeedDocuments(prepared.references)
+          ? this.documents.ensureAwake().catch(() => {
+              // CatalogDocuments logs and remembers the document-only failure.
+            })
+          : Promise.resolve();
+        const queryUpdate = this.processQuery(prepared, result, error).catch(
+          (cause) => {
+            console.error(
+              `[catalog] post-query update failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+            );
+          },
         );
+        void Promise.all([documentWake, queryUpdate]).then(() => resolve());
       });
     });
+    this.trackBackgroundTask(task);
   }
 
   private referencesNeedDocuments(references: TableReference[]): boolean {
@@ -354,20 +403,43 @@ export class SchemaCatalog {
         : "";
     const succeeded = !error && !result.isError;
 
-    if (succeeded && Object.values(this.store.snapshot().schemas).every(
-      (schema) => schema.scannedAt === null,
-    )) {
+    const inventoryWasStale =
+      succeeded && this.collector.inventoryNeedsRefresh();
+    if (inventoryWasStale) {
       await this.collector.collectInventory(false);
     }
-    const resolved = references
-      .map((reference) =>
-        this.resolveTable(
-          reference.schema
-            ? `${reference.schema}.${reference.table}`
-            : reference.table,
+    let resolved = this.resolveReferences(references);
+    if (succeeded) {
+      const resolvedKeys = new Set(
+        resolved.map((value) => `${value.schema}.${value.table}`.toLowerCase()),
+      );
+      const unresolvedKeys = [
+        ...new Set(
+          references
+            .map((reference) => this.catalogKeyForReference(reference))
+            .filter(
+              (key): key is string => key !== null && !resolvedKeys.has(key),
+            ),
         ),
-      )
-      .filter((value): value is NonNullable<typeof value> => value !== null);
+      ];
+      const now = Date.now();
+      const needsUnknownRefresh = unresolvedKeys.some(
+        (key) =>
+          now - (this.unknownReferenceRefreshes.get(key) ?? 0) >=
+          UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS,
+      );
+      if (inventoryWasStale) {
+        for (const key of unresolvedKeys) {
+          this.unknownReferenceRefreshes.set(key, now);
+        }
+      } else if (needsUnknownRefresh) {
+        await this.collector.collectInventory(true);
+        for (const key of unresolvedKeys) {
+          this.unknownReferenceRefreshes.set(key, now);
+        }
+        resolved = this.resolveReferences(references);
+      }
+    }
     const unique = new Map(
       resolved.map((value) => [`${value.schema}.${value.table}`, value]),
     );
@@ -377,7 +449,7 @@ export class SchemaCatalog {
         !Object.prototype.hasOwnProperty.call(value.entry.curated, "doc"),
       )
     ) {
-      void this.documents.ensureAwake().catch(() => {
+      await this.documents.ensureAwake().catch(() => {
         // The database usage path remains healthy when the document axis fails.
       });
     }
@@ -500,7 +572,19 @@ export class SchemaCatalog {
   }
 
   async close(): Promise<void> {
-    await this.store.close();
+    if (!this.closePromise) {
+      this.closing = true;
+      this.closePromise = (async () => {
+        // A stdio client commonly closes stdin immediately after receiving its
+        // final tool result. Inventory, detail, and document work deliberately
+        // runs after that result, so drain it before the last durable flush.
+        while (this.backgroundTasks.size > 0) {
+          await Promise.allSettled([...this.backgroundTasks]);
+        }
+        await this.store.close();
+      })();
+    }
+    await this.closePromise;
   }
 }
 

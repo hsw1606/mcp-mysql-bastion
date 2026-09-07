@@ -302,10 +302,12 @@ Catalog에는 문서 내용이 아니라 경로와 ref commit만 저장됩니다
 마지막 ref commit이 30일보다 오래됐으면 동작은 계속하되 응답에 경고를 붙입니다.
 
 Catalog는 기본적으로
-`~/.cache/mcp-mysql-bastion/catalog/<profile>-<host-hash>.json`에 저장됩니다.
-파일 mode는 `0600`입니다. Profile과 host가 파일명에 들어가므로 stage와 prod가
-같은 catalog를 읽지 않습니다. 저장 실패 시 서버는 catalog만 끄고 기존 query
-기능을 계속 제공합니다.
+`~/.cache/mcp-mysql-bastion/catalog/<profile>-<database-target-hash>.json`에
+저장됩니다. SSH를 쓰면 `LocalForward`의 원격 host·port를, 직접 연결하면 MySQL
+host·port 또는 socket 경로를 hash에 사용합니다. 파일 mode는 `0600`입니다.
+Profile과 실제 DB 대상이 파일명에 들어가므로 서로 다른 환경이 같은 catalog를
+읽지 않습니다. 저장 실패 시 서버는 catalog만 끄고 기존 query 기능을 계속
+제공합니다.
 
 Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지문만
 들어갑니다. SQL 원문과 row data는 저장하지 않습니다. PII redaction이 켜지면 PII

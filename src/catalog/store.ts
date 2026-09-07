@@ -11,6 +11,122 @@ import { CATALOG_VERSION, emptyCatalog, emptyTable } from "./types.js";
 import { fingerprintColumnNames } from "./usage.js";
 
 const FLUSH_DELAY_MS = 2_000;
+const LOCK_RETRY_MS = 25;
+const LOCK_WAIT_MS = 15_000;
+const LOCK_STALE_MS = 30_000;
+
+interface CatalogLockRecord {
+  pid: number;
+  token: string;
+  createdAt: number;
+}
+
+function errorCode(error: unknown): string | null {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code: unknown }).code)
+    : null;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ESRCH";
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireCatalogLock(
+  filePath: string,
+): Promise<() => Promise<void>> {
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  const record: CatalogLockRecord = {
+    pid: process.pid,
+    token: `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    createdAt: Date.now(),
+  };
+
+  while (true) {
+    try {
+      const handle = await fs.promises.open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify(record), "utf8");
+        await handle.sync();
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await fs.promises.unlink(lockPath).catch(() => undefined);
+        throw error;
+      }
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        await handle.close();
+        try {
+          const current = JSON.parse(
+            await fs.promises.readFile(lockPath, "utf8"),
+          ) as Partial<CatalogLockRecord>;
+          if (current.token === record.token) {
+            await fs.promises.unlink(lockPath);
+          }
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+
+      let lockText: string | null = null;
+      let stale = false;
+      try {
+        const [text, stat] = await Promise.all([
+          fs.promises.readFile(lockPath, "utf8"),
+          fs.promises.stat(lockPath),
+        ]);
+        lockText = text;
+        let owner: Partial<CatalogLockRecord> = {};
+        try {
+          owner = JSON.parse(text) as Partial<CatalogLockRecord>;
+        } catch {
+          // A new owner can be between open and write. Only age can make an
+          // unreadable lock stale, so another writer never removes it early.
+        }
+        stale =
+          typeof owner.pid === "number"
+            ? !processIsAlive(owner.pid)
+            : Date.now() - stat.mtimeMs >= LOCK_STALE_MS;
+      } catch (readError) {
+        if (errorCode(readError) === "ENOENT") continue;
+        throw readError;
+      }
+
+      if (stale && lockText !== null) {
+        try {
+          // Re-read before deletion so a recently acquired lock is not removed
+          // after replacing the stale one that we inspected above.
+          if ((await fs.promises.readFile(lockPath, "utf8")) === lockText) {
+            await fs.promises.unlink(lockPath);
+            console.error(`[catalog] removed stale lock ${lockPath}`);
+            continue;
+          }
+        } catch (cleanupError) {
+          if (errorCode(cleanupError) === "ENOENT") continue;
+          throw cleanupError;
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for catalog lock ${lockPath}`);
+      }
+      await delay(LOCK_RETRY_MS + Math.floor(Math.random() * LOCK_RETRY_MS));
+    }
+  }
+}
 
 function timestamp(value: string | null | undefined): number {
   if (!value) return 0;
@@ -263,7 +379,6 @@ export class CatalogStore {
   private enabled: boolean;
   private data: CatalogFile;
   private baseData: CatalogFile;
-  private loadedMtimeMs: number | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private flushPromise: Promise<void> | null = null;
   private revision = 0;
@@ -307,7 +422,6 @@ export class CatalogStore {
     }
     this.data = this.sanitizeLoaded(parsed as CatalogFile);
     this.baseData = structuredClone(this.data);
-    this.loadedMtimeMs = fs.statSync(this.options.filePath).mtimeMs;
     // Rewriting also removes PII columns left by a cache that was created
     // before redaction was enabled for this profile.
     this.revision += 1;
@@ -445,30 +559,32 @@ export class CatalogStore {
   }
 
   private async writeAtomically(): Promise<void> {
-    const tempPath = `${this.options.filePath}.${process.pid}.${Date.now()}.tmp`;
-    const writingRevision = this.revision;
+    let tempPath: string | null = null;
+    let releaseLock: (() => Promise<void>) | null = null;
     try {
+      releaseLock = await acquireCatalogLock(this.options.filePath);
+      tempPath = `${this.options.filePath}.${process.pid}.${Date.now()}.tmp`;
+      const writingRevision = this.revision;
       // Keep persistence as a second PII boundary. Collectors filter on input,
       // but future catalog writers must not be able to bypass that policy.
       let toWrite = this.sanitizeLoaded(structuredClone(this.data));
       if (fs.existsSync(this.options.filePath)) {
-        const currentMtime = fs.statSync(this.options.filePath).mtimeMs;
-        if (this.loadedMtimeMs === null || currentMtime !== this.loadedMtimeMs) {
-          const external = JSON.parse(
-            fs.readFileSync(this.options.filePath, "utf8"),
-          ) as CatalogFile;
-          if (
-            external.version === CATALOG_VERSION &&
-            external.profile === this.options.profile &&
-            external.fingerprint === this.options.fingerprint
-          ) {
-            toWrite = mergeCatalog(
-              this.sanitizeLoaded(external),
-              toWrite,
-              this.baseData,
-            );
-            this.data = toWrite;
-          }
+        // The lock serializes writers. Always merge the latest file instead of
+        // relying on mtime resolution to prove that no other process wrote it.
+        const external = JSON.parse(
+          fs.readFileSync(this.options.filePath, "utf8"),
+        ) as CatalogFile;
+        if (
+          external.version === CATALOG_VERSION &&
+          external.profile === this.options.profile &&
+          external.fingerprint === this.options.fingerprint
+        ) {
+          toWrite = mergeCatalog(
+            this.sanitizeLoaded(external),
+            toWrite,
+            this.baseData,
+          );
+          this.data = toWrite;
         }
       }
       await fs.promises.writeFile(tempPath, `${JSON.stringify(toWrite, null, 2)}\n`, {
@@ -478,19 +594,30 @@ export class CatalogStore {
       });
       await fs.promises.rename(tempPath, this.options.filePath);
       await fs.promises.chmod(this.options.filePath, 0o600);
-      this.loadedMtimeMs = (await fs.promises.stat(this.options.filePath)).mtimeMs;
       this.baseData = structuredClone(toWrite);
       this.flushedRevision = writingRevision;
       if (this.revision !== this.flushedRevision) this.scheduleFlush();
     } catch (error) {
-      try {
-        await fs.promises.unlink(tempPath);
-      } catch {
-        // A failed write often means the temporary file was never created.
+      if (tempPath) {
+        try {
+          await fs.promises.unlink(tempPath);
+        } catch {
+          // A failed write often means the temporary file was never created.
+        }
       }
       this.disable(
         `cannot write ${this.options.filePath}: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      if (releaseLock) {
+        try {
+          await releaseLock();
+        } catch (error) {
+          this.disable(
+            `cannot release catalog lock: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
     }
   }
 
