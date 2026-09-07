@@ -325,10 +325,12 @@ Query가 없는 column이나 table을 참조해 실패하면 서버는 해당 �
 
 Catalog는 기본적으로
 `~/.cache/mcp-mysql-bastion/catalog/<profile>-<database-target-hash>.json`에
-저장됩니다. SSH를 쓰면 `LocalForward`의 원격 host·port를, 직접 연결하면 MySQL
-host·port 또는 socket 경로를 hash에 사용합니다. 파일 mode는 `0600`입니다.
-Profile과 실제 DB 대상이 파일명에 들어가므로 서로 다른 환경이 같은 catalog를
-읽지 않습니다. 디스크에 쓸 수 없으면 서버는 catalog만 끄고 기존 query 기능을
+저장됩니다. Hash에는 DB 대상과 MySQL user가 함께 들어갑니다. SSH를 쓰면
+`LocalForward`의 원격 host·port를, 직접 연결하면 MySQL host·port 또는 socket
+경로를 대상으로 씁니다. User까지 넣는 이유는 같은 host라도 계정마다 권한이 달라
+보이는 table이 다르기 때문입니다. 파일 mode는 `0600`입니다. Profile과 대상과
+user가 모두 파일명에 들어가므로 서로 다른 환경이 같은 catalog를 읽지 않습니다.
+디스크에 쓸 수 없으면 서버는 catalog만 끄고 기존 query 기능을
 계속 제공합니다. 다른 서버가 파일 lock을 오래 쥐고 있거나 파일 내용이 깨진 경우는
 복구 가능한 상황으로 보고 catalog를 끄지 않습니다. 앞의 경우는 다음 저장에서 다시
 시도하고, 뒤의 경우는 읽을 수 없는 파일을 새로 쓴 내용으로 교체합니다.
@@ -338,6 +340,8 @@ Catalog에는 schema metadata와 사용 횟수만 들어갑니다. SQL은 어떤
 column 짝뿐이고, literal은 catalog에 닿기 전에 버려집니다. Row data도 저장하지
 않습니다. PII redaction이 켜지면 PII column은 저장과 응답에서 모두 제외합니다.
 `MYSQL_CATALOG_ENABLED=false`로 끄면 도구와 resource 동작은 변경 전과 같아집니다.
+`MYSQL_APP_SCHEMAS`가 비어 있을 때도 같습니다. Catalog는 선언된 schema만
+훑으므로, 선언이 없으면 훑을 것이 없어 스스로 꺼지고 stderr에 이유를 남깁니다.
 
 Query 뒤에는 참조한 table의 호출 횟수와 최근 시각을 기록합니다. 실패한 query도
 횟수에 들어가며, 성공과 실패를 따로 셉니다.
@@ -387,8 +391,8 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | `MYSQL_ENV_FILE` | *(미설정)* | `.env.<profile>` 대신 정확히 이 env 파일을 로드합니다. |
 | `MYSQL_APP_SCHEMAS` | *(미설정)* | `;`로 구분된 `app:schema[:설명]` 항목. 툴 설명과 `mysql://schemas`에 노출됩니다. |
 | `MYSQL_CODE_BRANCH` | profile별 | 이 환경의 데이터가 대응하는 git branch. `stage`→`develop`, `prod`→`main`. |
-| `MYSQL_CATALOG_ENABLED` | `true` | 로컬 schema catalog를 켭니다. `false`이면 기존 동작을 유지합니다. |
-| `MYSQL_CATALOG_PATH` | `~/.cache/mcp-mysql-bastion/catalog` | profile·host별 JSON 파일을 둘 directory입니다. |
+| `MYSQL_CATALOG_ENABLED` | `true` | 로컬 schema catalog를 켭니다. `false`이거나 `MYSQL_APP_SCHEMAS`가 비어 있으면 기존 동작을 유지합니다. |
+| `MYSQL_CATALOG_PATH` | `~/.cache/mcp-mysql-bastion/catalog` | profile·대상·user별 JSON 파일을 둘 directory입니다. |
 | `MYSQL_CATALOG_TTL_HOURS` | `24` | DB metadata를 stale로 보는 시간입니다. |
 | `MYSQL_DOCS_REPO` | *(미설정)* | `model.md`가 있는 git 저장소. 미설정이면 문서 catalog만 비활성입니다. |
 
