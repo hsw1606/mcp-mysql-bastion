@@ -15,6 +15,25 @@ export interface CatalogCollectorOptions {
   isPIIColumn: (column: string) => boolean;
 }
 
+/**
+ * Start `run` once `pending` settles, or immediately when nothing is in flight.
+ *
+ * A forced collection exists to escape a snapshot the caller knows is stale, so
+ * joining an unforced scan already in flight defeats it: that scan read the
+ * database before the migration the caller is trying to see, and stamping its
+ * answer as freshly collected pins the lie. Queueing rather than racing keeps a
+ * single writer per table, so the forced result is always the one that lands
+ * last. The earlier failure is swallowed because it is the previous caller's to
+ * report, not this one's.
+ */
+function chainAfter(
+  pending: Promise<void> | null | undefined,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (!pending) return run();
+  return pending.catch(() => undefined).then(run);
+}
+
 function isExpired(value: string | null, ttlHours: number): boolean {
   if (!value) return true;
   const parsed = Date.parse(value);
@@ -44,11 +63,13 @@ export class CatalogCollector {
   async collectInventory(force = false): Promise<void> {
     if (!this.store.isEnabled() || this.options.schemas.length === 0) return;
     if (!force && !this.inventoryNeedsRefresh()) return;
-    if (this.inventoryPromise) return this.inventoryPromise;
-    this.inventoryPromise = this.runInventory().finally(() => {
-      this.inventoryPromise = null;
+    const pending = this.inventoryPromise;
+    if (pending && !force) return pending;
+    const promise = chainAfter(pending, () => this.runInventory()).finally(() => {
+      if (this.inventoryPromise === promise) this.inventoryPromise = null;
     });
-    return this.inventoryPromise;
+    this.inventoryPromise = promise;
+    return promise;
   }
 
   private async runInventory(): Promise<void> {
@@ -136,9 +157,13 @@ export class CatalogCollector {
     if (!force && !this.detailNeedsRefresh(schemaName, tableName)) return;
     const key = `${schemaName}.${tableName}`;
     const pending = this.detailPromises.get(key);
-    if (pending) return pending;
-    const promise = this.runTableDetail(schemaName, tableName).finally(() => {
-      this.detailPromises.delete(key);
+    if (pending && !force) return pending;
+    const promise = chainAfter(pending, () =>
+      this.runTableDetail(schemaName, tableName),
+    ).finally(() => {
+      if (this.detailPromises.get(key) === promise) {
+        this.detailPromises.delete(key);
+      }
     });
     this.detailPromises.set(key, promise);
     return promise;
