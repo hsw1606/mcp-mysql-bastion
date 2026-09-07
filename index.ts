@@ -28,10 +28,17 @@ import {
   ENABLE_PII_REDACTION,
   PII_EXTRA_COLUMNS,
   PII_EXTRA_COLUMN_PATTERNS,
+  PII_ALLOW_INTROSPECTION,
+  PII_BLOCK_INTROSPECTION,
   APP_SCHEMAS,
   CODE_BRANCH,
+  MYSQL_CATALOG_ENABLED,
+  MYSQL_CATALOG_PATH,
+  MYSQL_CATALOG_TTL_HOURS,
+  MYSQL_DOCS_REPO,
 } from "./src/config/index.js";
 import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
+import { catalogIdentity, SchemaCatalog } from "./src/catalog/index.js";
 import {
   safeExit,
   getPool,
@@ -154,6 +161,46 @@ const isReadOnly = !(
   ALLOW_DDL_OPERATION
 );
 
+const mysqlCatalogTool = {
+  name: "mysql_catalog",
+  description:
+    "Read the local schema catalog without rediscovering database metadata. " +
+    "Use map for the app/schema overview, search to find tables or known columns, " +
+    "and describe before writing SQL against a table.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["map", "search", "describe"],
+        description: "Catalog operation to perform",
+      },
+      q: {
+        type: "string",
+        description: "Keyword for search",
+      },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+        description: "Maximum search results (default 20)",
+      },
+      table: {
+        type: "string",
+        description: "Qualified schema.table name for describe",
+      },
+    },
+    required: ["action"],
+  },
+  annotations: {
+    readOnlyHint: true,
+    idempotentHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+    title: "MySQL Schema Catalog",
+  },
+};
+
 // @INFO: Add debug logging for configuration
 log(
   "info",
@@ -199,6 +246,78 @@ log(
  * before the process starts.
  */
 export default function createMcpServer() {
+  const mysqlSettings = config.mysql as Record<string, unknown>;
+  const identity = catalogIdentity({
+    profile: MYSQL_PROFILE,
+    host: String(mysqlSettings.host ?? mysqlSettings.socketPath ?? "local"),
+    user: String(mysqlSettings.user ?? ""),
+    customPath: MYSQL_CATALOG_PATH,
+  });
+  const piiColumnList = [...DEFAULT_PII_COLUMNS, ...PII_EXTRA_COLUMNS];
+  // The catalog reads information_schema directly, so it bypasses the
+  // introspection guard inside executeReadOnlyQuery. PII_BLOCK_INTROSPECTION is
+  // documented as a hard block on every schema-introspection statement — the
+  // filterable ones included — so honouring it means switching the catalog off
+  // entirely rather than filtering what it stores. Otherwise the catalog would
+  // be a way to read back exactly what that flag refuses.
+  const introspectionHardBlocked =
+    ENABLE_PII_REDACTION && PII_BLOCK_INTROSPECTION && !PII_ALLOW_INTROSPECTION;
+  if (introspectionHardBlocked && MYSQL_CATALOG_ENABLED) {
+    console.error(
+      "[catalog] disabled: PII_BLOCK_INTROSPECTION forbids reading schema metadata. " +
+        "Set PII_ALLOW_INTROSPECTION=true to allow the catalog to collect it.",
+    );
+  }
+  const catalog = new SchemaCatalog({
+    enabled: MYSQL_CATALOG_ENABLED && !introspectionHardBlocked,
+    profile: MYSQL_PROFILE || "default",
+    fingerprint: identity.fingerprint,
+    filePath: identity.filePath,
+    ttlHours: MYSQL_CATALOG_TTL_HOURS,
+    appSchemas: APP_SCHEMAS,
+    docsRepo: MYSQL_DOCS_REPO ?? null,
+    docsRef: CODE_BRANCH ? `origin/${CODE_BRANCH}` : null,
+    defaultSchema:
+      typeof mysqlSettings.database === "string"
+        ? mysqlSettings.database
+        : null,
+    piiRedactionEnabled: ENABLE_PII_REDACTION,
+    isPIIColumn: (column) =>
+      ENABLE_PII_REDACTION &&
+      isPIIColumn(column, piiColumnList, PII_EXTRA_COLUMN_PATTERNS),
+  });
+  const loadResourceTables = async (): Promise<TableRow[]> => {
+    if (catalog.isEnabled()) {
+      try {
+        const cached = await catalog.listTables();
+        if (cached.length > 0) return cached;
+      } catch (error) {
+        console.error(
+          `[catalog] table resource fallback: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    // This is the compatibility path for a disabled or still-empty catalog.
+    const queryResult = await executeReadOnlyQuery<any>(`
+      SELECT
+        table_name as name,
+        table_schema as \`database\`,
+        table_comment as description,
+        table_rows as rowCount,
+        data_length as dataSize,
+        index_length as indexSize,
+        create_time as createTime,
+        update_time as updateTime
+      FROM
+        information_schema.tables
+      WHERE
+        table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+      ORDER BY
+        table_schema, table_name
+    `);
+    return JSON.parse(queryResult.content[0].text) as TableRow[];
+  };
+
   // Create the server instance
   const server = new Server(
     {
@@ -229,6 +348,15 @@ export default function createMcpServer() {
               title: "MySQL Query",
             },
           },
+          ...(catalog.isEnabled()
+            ? {
+                mysql_catalog: {
+                  description: mysqlCatalogTool.description,
+                  inputSchema: mysqlCatalogTool.inputSchema,
+                  annotations: mysqlCatalogTool.annotations,
+                },
+              }
+            : {}),
         },
       },
     },
@@ -245,32 +373,16 @@ export default function createMcpServer() {
           }`;
       log("info", `Connection info: ${connectionInfo}`);
 
-      // Query to get all tables
-      const tablesQuery = `
-      SELECT
-        table_name as name,
-        table_schema as \`database\`,
-        table_comment as description,
-        table_rows as rowCount,
-        data_length as dataSize,
-        index_length as indexSize,
-        create_time as createTime,
-        update_time as updateTime
-      FROM
-        information_schema.tables
-      WHERE
-        table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-      ORDER BY
-        table_schema, table_name
-    `;
-
-      const queryResult = (await executeReadOnlyQuery<any>(tablesQuery));
-      const tables = JSON.parse(queryResult.content[0].text) as TableRow[];
+      // The startup inventory normally answers this without a database read.
+      // A disabled or empty catalog keeps the original resource behaviour.
+      const tables = await loadResourceTables();
       log("info", `Found ${tables.length} tables`);
 
       // Create resources for each table
       const resources = tables.map((table) => ({
-        uri: `mysql://tables/${table.name}`,
+        uri: catalog.isEnabled()
+          ? `mysql://tables/${encodeURIComponent(table.database)}/${encodeURIComponent(table.name)}`
+          : `mysql://tables/${table.name}`,
         name: table.name,
         title: `${table.database}.${table.name}`,
         description:
@@ -335,10 +447,65 @@ export default function createMcpServer() {
         };
       }
 
-      // Parse the URI to extract table name and optional database name
-      const uriParts = request.params.uri.split("/");
-      const tableName = uriParts.pop();
-      const dbName = uriParts.length > 0 ? uriParts.pop() : null;
+      if (catalog.isEnabled() && request.params.uri === "mysql://tables") {
+        return {
+          contents: [
+            {
+              uri: request.params.uri,
+              mimeType: "application/json",
+              text: JSON.stringify(await loadResourceTables(), null, 2),
+            },
+          ],
+        };
+      }
+
+      // Two URI shapes are in circulation: `mysql://tables/<table>` from the
+      // pre-catalog server and `mysql://tables/<schema>/<table>` from the
+      // catalog. Parse from the prefix rather than popping segments blindly, so
+      // the single-segment form cannot mistake the literal "tables" segment for
+      // a schema name.
+      let dbName: string | null = null;
+      let tableName: string | undefined;
+
+      if (request.params.uri.startsWith("mysql://tables/")) {
+        const parts = request.params.uri
+          .slice("mysql://tables/".length)
+          .split("/")
+          .map(decodeURIComponent);
+        dbName = parts.length >= 2 ? parts[0] : null;
+        tableName = parts.length >= 2 ? parts[1] : parts[0];
+
+        if (catalog.isEnabled()) {
+          try {
+            return {
+              contents: [
+                {
+                  uri: request.params.uri,
+                  mimeType: "application/json",
+                  text: await catalog.describe(
+                    dbName ? `${dbName}.${tableName}` : tableName,
+                  ),
+                },
+              ],
+            };
+          } catch (error) {
+            // The catalog has not learned this table yet — an inventory scan
+            // still in flight, or a schema that MYSQL_APP_SCHEMAS does not
+            // declare. The resource was listed, so it has to stay readable:
+            // fall through to information_schema as the older server did.
+            log(
+              "info",
+              `[catalog] describe fallback for ${request.params.uri}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
+      } else {
+        const uriParts = request.params.uri.split("/");
+        tableName = uriParts.pop();
+        dbName = uriParts.length > 0 ? uriParts.pop() ?? null : null;
+      }
 
       if (!tableName) {
         throw new Error(`Invalid resource URI: ${request.params.uri}`);
@@ -398,15 +565,55 @@ export default function createMcpServer() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       log("info", "Handling CallToolRequest:", request.params.name);
+      if (request.params.name === "mysql_catalog") {
+        if (!catalog.isEnabled()) throw new Error("The schema catalog is disabled.");
+        const args = request.params.arguments ?? {};
+        const action = args.action;
+        let text: string;
+        if (action === "map") {
+          text = await catalog.map();
+        } else if (action === "search") {
+          if (typeof args.q !== "string" || !args.q.trim()) {
+            throw new Error('mysql_catalog search requires a non-empty "q".');
+          }
+          text = await catalog.search(
+            args.q,
+            typeof args.limit === "number" ? args.limit : undefined,
+          );
+        } else if (action === "describe") {
+          if (typeof args.table !== "string" || !args.table.trim()) {
+            throw new Error('mysql_catalog describe requires "table" as schema.table.');
+          }
+          text = await catalog.describe(args.table);
+        } else {
+          throw new Error(`Unknown mysql_catalog action: ${String(action)}`);
+        }
+        return {
+          content: [
+            { type: "text", text: profileBanner() },
+            { type: "text", text },
+          ],
+          isError: false,
+        };
+      }
+
       if (request.params.name !== "mysql_query") {
         throw new Error(`Unknown tool: ${request.params.name}`);
       }
 
       const sql = request.params.arguments?.sql as string;
-      const result = (await executeReadOnlyQuery(sql)) as {
+      const references = catalog.prepareQuery(sql);
+      let result: {
         content: Array<{ type: string; text: string }>;
         isError?: boolean;
       };
+      try {
+        result = await executeReadOnlyQuery(sql);
+      } catch (error) {
+        catalog.afterQuery(references, { content: [], isError: true }, error);
+        throw error;
+      }
+      catalog.afterQuery(references, result);
 
       // Prepend the environment banner to every result — success or refusal —
       // so a stage answer can never be mistaken for a prod one.
@@ -457,6 +664,7 @@ export default function createMcpServer() {
             title: "MySQL Query",
           },
         },
+        ...(catalog.isEnabled() ? [mysqlCatalogTool] : []),
       ],
     };
 
@@ -486,6 +694,9 @@ export default function createMcpServer() {
       const connection = await pool.getConnection();
       log("info", "Database connection test successful");
       connection.release();
+      // Inventory collection is intentionally detached. The MCP client can
+      // receive query responses while this single metadata query runs.
+      catalog.startInventory();
     } catch (error) {
       // Startup failure is the one place where the operator needs the reason
       // regardless of ENABLE_LOGGING — a silent exit here looks to the MCP
@@ -505,6 +716,7 @@ export default function createMcpServer() {
   const shutdown = async (signal: string): Promise<void> => {
     log("error", `Received ${signal}. Shutting down...`);
     try {
+      await catalog.close();
       // Only attempt to close the pool if it was created
       if (poolPromise) {
         const pool = await poolPromise;

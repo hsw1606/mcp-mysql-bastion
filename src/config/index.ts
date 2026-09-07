@@ -204,6 +204,31 @@ export const APP_SCHEMAS: readonly AppSchemaEntry[] = parseAppSchemas(
   process.env.MYSQL_APP_SCHEMAS,
 );
 
+/** Local schema catalog. Only the catalog is disabled when its setup fails. */
+export const MYSQL_CATALOG_ENABLED =
+  process.env.MYSQL_CATALOG_ENABLED !== "false";
+export const MYSQL_CATALOG_PATH =
+  process.env.MYSQL_CATALOG_PATH?.trim() || undefined;
+
+function parseCatalogTtl(raw: string | undefined): number {
+  if (!raw) return 24;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error(
+      `[config] ignoring MYSQL_CATALOG_TTL_HOURS="${raw}": expected a positive number; using 24.`,
+    );
+    return 24;
+  }
+  return value;
+}
+
+export const MYSQL_CATALOG_TTL_HOURS = parseCatalogTtl(
+  process.env.MYSQL_CATALOG_TTL_HOURS,
+);
+
+/** Git access is added by the catalog's document phase; an empty path is valid. */
+export const MYSQL_DOCS_REPO = process.env.MYSQL_DOCS_REPO?.trim() || undefined;
+
 // @INFO: Parse connection string if provided
 // Connection string takes precedence over individual environment variables
 const connectionStringConfig = process.env.MYSQL_CONNECTION_STRING

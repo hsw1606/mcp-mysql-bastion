@@ -1,0 +1,235 @@
+import { executeQuery } from "../db/index.js";
+import type { CatalogStore } from "./store.js";
+import type {
+  CatalogColumn,
+  CatalogForeignKey,
+  CatalogIndex,
+  DetailRow,
+  InventoryRow,
+} from "./types.js";
+import { emptyTable } from "./types.js";
+
+export interface CatalogCollectorOptions {
+  schemas: readonly string[];
+  ttlHours: number;
+  isPIIColumn: (column: string) => boolean;
+}
+
+function isExpired(value: string | null, ttlHours: number): boolean {
+  if (!value) return true;
+  const parsed = Date.parse(value);
+  // A timestamp we cannot parse counts as expired, never as fresh. Every
+  // comparison against NaN is false, so returning that result would pin the
+  // entry as valid forever and the table would never be rescanned.
+  if (!Number.isFinite(parsed)) return true;
+  return Date.now() - parsed >= ttlHours * 60 * 60 * 1_000;
+}
+
+export class CatalogCollector {
+  private inventoryPromise: Promise<void> | null = null;
+  private readonly detailPromises = new Map<string, Promise<void>>();
+
+  constructor(
+    private readonly store: CatalogStore,
+    private readonly options: CatalogCollectorOptions,
+  ) {}
+
+  inventoryNeedsRefresh(): boolean {
+    const catalog = this.store.snapshot();
+    return this.options.schemas.some((name) => {
+      const schema = catalog.schemas[name];
+      return !schema || isExpired(schema.scannedAt, this.options.ttlHours);
+    });
+  }
+
+  async collectInventory(force = false): Promise<void> {
+    if (!this.store.isEnabled() || this.options.schemas.length === 0) return;
+    if (!force && !this.inventoryNeedsRefresh()) return;
+    if (this.inventoryPromise) return this.inventoryPromise;
+    this.inventoryPromise = this.runInventory().finally(() => {
+      this.inventoryPromise = null;
+    });
+    return this.inventoryPromise;
+  }
+
+  private async runInventory(): Promise<void> {
+    const placeholders = this.options.schemas.map(() => "?").join(", ");
+    const rows = await executeQuery<InventoryRow[]>(
+      `SELECT
+         table_schema AS \`table_schema\`,
+         table_name AS \`table_name\`,
+         table_comment AS \`table_comment\`,
+         table_rows AS \`table_rows\`
+       FROM information_schema.tables
+       WHERE table_schema IN (${placeholders})
+       ORDER BY table_schema, table_name`,
+      [...this.options.schemas],
+    );
+    const now = new Date().toISOString();
+    this.store.update((catalog) => {
+      for (const schemaName of this.options.schemas) {
+        const schema = catalog.schemas[schemaName];
+        if (!schema) continue;
+        const nextTables = Object.fromEntries(
+          rows
+            .filter((row) => row.table_schema === schemaName)
+            .map((row) => {
+              const existing = schema.tables[row.table_name] ?? emptyTable();
+              const numericRows = Number(row.table_rows);
+              return [
+                row.table_name,
+                {
+                  ...existing,
+                  comment: row.table_comment ?? "",
+                  rowsEstimate: Number.isFinite(numericRows) ? numericRows : null,
+                },
+              ];
+            }),
+        );
+        schema.tables = nextTables;
+        schema.scannedAt = now;
+      }
+    });
+    console.error(
+      `[catalog] inventory scan complete: ${this.options.schemas.length} schemas, ${rows.length} tables`,
+    );
+  }
+
+  detailNeedsRefresh(schemaName: string, tableName: string): boolean {
+    const table = this.store.snapshot().schemas[schemaName]?.tables[tableName];
+    return Boolean(
+      table &&
+        (table.detailStale ||
+          isExpired(table.detailScannedAt, this.options.ttlHours)),
+    );
+  }
+
+  async collectTableDetail(
+    schemaName: string,
+    tableName: string,
+    force = false,
+  ): Promise<void> {
+    if (!this.store.isEnabled()) return;
+    if (!force && !this.detailNeedsRefresh(schemaName, tableName)) return;
+    const key = `${schemaName}.${tableName}`;
+    const pending = this.detailPromises.get(key);
+    if (pending) return pending;
+    const promise = this.runTableDetail(schemaName, tableName).finally(() => {
+      this.detailPromises.delete(key);
+    });
+    this.detailPromises.set(key, promise);
+    return promise;
+  }
+
+  private async runTableDetail(
+    schemaName: string,
+    tableName: string,
+  ): Promise<void> {
+    const rows = await executeQuery<DetailRow[]>(
+      `SELECT
+         'column' AS kind,
+         c.column_name AS name,
+         c.data_type AS \`data_type\`,
+         c.column_type AS \`column_type\`,
+         c.is_nullable AS \`is_nullable\`,
+         CAST(c.column_default AS CHAR) AS default_value,
+         c.extra AS \`extra\`,
+         c.column_comment AS comment,
+         c.ordinal_position AS position,
+         NULL AS index_column,
+         NULL AS non_unique,
+         NULL AS index_type,
+         NULL AS fk_column,
+         NULL AS ref_schema,
+         NULL AS ref_table,
+         NULL AS ref_column
+       FROM information_schema.columns c
+       WHERE c.table_schema = ? AND c.table_name = ?
+       UNION ALL
+       SELECT
+         'index', s.index_name, NULL, NULL, NULL, NULL, NULL, NULL,
+         s.seq_in_index, s.column_name, s.non_unique, s.index_type,
+         NULL, NULL, NULL, NULL
+       FROM information_schema.statistics s
+       WHERE s.table_schema = ? AND s.table_name = ?
+       UNION ALL
+       SELECT
+         'fk', k.constraint_name, NULL, NULL, NULL, NULL, NULL, NULL,
+         k.ordinal_position, NULL, NULL, NULL,
+         k.column_name, k.referenced_table_schema,
+         k.referenced_table_name, k.referenced_column_name
+       FROM information_schema.key_column_usage k
+       WHERE k.table_schema = ? AND k.table_name = ?
+         AND k.referenced_table_name IS NOT NULL
+       ORDER BY kind, position`,
+      [schemaName, tableName, schemaName, tableName, schemaName, tableName],
+    );
+
+    const columns: CatalogColumn[] = rows
+      .filter(
+        (row) =>
+          row.kind === "column" && !this.options.isPIIColumn(row.name),
+      )
+      .map((row) => ({
+        name: row.name,
+        dataType: row.data_type ?? "",
+        columnType: row.column_type ?? "",
+        nullable: row.is_nullable === "YES",
+        defaultValue: row.default_value,
+        extra: row.extra ?? "",
+        comment: row.comment ?? "",
+        ordinal: Number(row.position),
+      }));
+
+    const indexesByName = new Map<string, CatalogIndex>();
+    for (const row of rows) {
+      if (
+        row.kind !== "index" ||
+        !row.index_column ||
+        this.options.isPIIColumn(row.index_column)
+      ) {
+        continue;
+      }
+      const index = indexesByName.get(row.name) ?? {
+        name: row.name,
+        unique: Number(row.non_unique) === 0,
+        type: row.index_type ?? "",
+        columns: [],
+      };
+      index.columns.push(row.index_column);
+      indexesByName.set(row.name, index);
+    }
+    const indexes = [...indexesByName.values()];
+    const pk = indexes.find((index) => index.name === "PRIMARY")?.columns ?? [];
+
+    const fks: CatalogForeignKey[] = rows
+      .filter(
+        (row) =>
+          row.kind === "fk" &&
+          Boolean(row.fk_column && row.ref_schema && row.ref_table && row.ref_column) &&
+          !this.options.isPIIColumn(row.fk_column as string) &&
+          !this.options.isPIIColumn(row.ref_column as string),
+      )
+      .map((row) => ({
+        name: row.name,
+        column: row.fk_column as string,
+        referencedSchema: row.ref_schema as string,
+        referencedTable: row.ref_table as string,
+        referencedColumn: row.ref_column as string,
+      }));
+
+    this.store.update((catalog) => {
+      const table = catalog.schemas[schemaName]?.tables[tableName];
+      if (!table) return;
+      table.columns = columns;
+      table.pk = pk;
+      table.indexes = indexes;
+      table.fks = fks;
+      table.detailScannedAt = new Date().toISOString();
+      delete table.detailStale;
+    });
+    console.error(
+      `[catalog] detail scan complete: ${schemaName}.${tableName} (${columns.length} columns)`,
+    );
+  }
+}
