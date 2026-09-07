@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import type { TableRow } from "../types/index.js";
 import { CatalogCollector } from "./collect.js";
+import { CatalogDocuments } from "./docs.js";
 import { renderDescribe, renderMap, searchCatalog } from "./render.js";
 import { CatalogStore } from "./store.js";
 import type {
@@ -47,6 +48,7 @@ function sameName(a: string, b: string): boolean {
 export class SchemaCatalog {
   private readonly store: CatalogStore;
   private readonly collector: CatalogCollector;
+  private readonly documents: CatalogDocuments;
 
   constructor(private readonly options: CatalogOptions) {
     this.store = new CatalogStore(options);
@@ -54,6 +56,11 @@ export class SchemaCatalog {
       schemas: options.appSchemas.map((entry) => entry.schema),
       ttlHours: options.ttlHours,
       isPIIColumn: options.isPIIColumn,
+    });
+    this.documents = new CatalogDocuments(this.store, {
+      repo: options.docsRepo,
+      ref: options.docsRef,
+      appSchemas: options.appSchemas,
     });
   }
 
@@ -129,7 +136,19 @@ export class SchemaCatalog {
     )) {
       await this.collector.collectInventory(false);
     }
-    return renderMap(this.store.snapshot());
+    let documentWarning: string | null = null;
+    if (this.documents.isConfigured()) {
+      try {
+        await this.documents.ensureAwake();
+      } catch (error) {
+        // A broken document repository must not hide the database catalog.
+        documentWarning = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return renderMap(
+      this.store.snapshot(),
+      documentWarning ?? this.documents.staleWarning(),
+    );
   }
 
   async search(query: string, requestedLimit?: number): Promise<string> {
@@ -159,13 +178,102 @@ export class SchemaCatalog {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
     const resolved = await this.ensureKnownTable(input);
     await this.collector.collectTableDetail(resolved.schema, resolved.table);
-    const current = this.resolveTable(`${resolved.schema}.${resolved.table}`);
+    let current = this.resolveTable(`${resolved.schema}.${resolved.table}`);
     if (!current) throw new Error(`Table disappeared during refresh: ${input}`);
+    let documentError: string | null = null;
+    if (this.documents.isConfigured()) {
+      try {
+        await this.documents.ensureAwake();
+      } catch (error) {
+        documentError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    current = this.resolveTable(`${resolved.schema}.${resolved.table}`);
+    if (!current) throw new Error(`Table disappeared during document refresh: ${input}`);
     return renderDescribe(
       `${current.schema}.${current.table}`,
       current.entry,
       this.options.isPIIColumn,
+      {
+        configured: this.documents.isConfigured(),
+        available: this.documents.isAvailable(),
+        ref: this.options.docsRef,
+        command: current.entry.curated.doc
+          ? this.documents.documentCommand(current.entry.curated.doc.path)
+          : null,
+        warning: documentError ?? this.documents.staleWarning(),
+        schema: current.schema,
+      },
     );
+  }
+
+  async docsList(schemaName: string): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    return this.documents.list(schemaName);
+  }
+
+  async docsRead(documentPath: string): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    return this.documents.read(documentPath);
+  }
+
+  async link(
+    links: Array<{ table: string; doc: string }>,
+  ): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    if (links.length === 0) throw new Error('mysql_catalog link requires a non-empty "links" array.');
+    const resolvedLinks = [];
+    for (const link of links) {
+      const table = await this.ensureKnownTable(link.table);
+      resolvedLinks.push({
+        schema: table.schema,
+        table: table.table,
+        doc: link.doc,
+      });
+    }
+    return this.documents.link(resolvedLinks);
+  }
+
+  async unlink(input: string): Promise<string> {
+    if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
+    const resolved = await this.ensureKnownTable(input);
+    return this.documents.unlink(resolved.schema, resolved.table);
+  }
+
+  queryDocumentGuidance(prepared: PreparedCatalogQuery): string | null {
+    if (!this.isEnabled() || !this.documents.isConfigured()) return null;
+    const notices: string[] = [];
+    const documentError = this.documents.error();
+    if (documentError) notices.push(`[카탈로그 경고] ${documentError}`);
+    else {
+      const stale = this.documents.staleWarning();
+      if (stale) notices.push(stale);
+    }
+    if (!this.documents.isAvailable()) return notices.join("\n") || null;
+    const unresolved = new Map<string, string>();
+    for (const reference of prepared.references) {
+      const resolved = this.resolveTable(
+        reference.schema
+          ? `${reference.schema}.${reference.table}`
+          : reference.table,
+      );
+      if (
+        resolved &&
+        !Object.prototype.hasOwnProperty.call(resolved.entry.curated, "doc")
+      ) {
+        unresolved.set(`${resolved.schema}.${resolved.table}`, resolved.schema);
+      }
+    }
+    notices.push(
+      ...[...unresolved.entries()].map(
+        ([table, schema]) =>
+          `[카탈로그] ${table} 에 연결된 문서가 없습니다.\n` +
+          `mysql_catalog {action:"docs_list", schema:"${schema}"} 로 후보를 보고\n` +
+          'mysql_catalog {action:"link", links:[{table:"' +
+          `${table}", doc:"..."}]} 로 연결하세요.`,
+      ),
+    );
+    return notices.join("\n\n") || null;
   }
 
   async listTables(): Promise<TableRow[]> {
@@ -206,11 +314,31 @@ export class SchemaCatalog {
   ): void {
     if (!this.isEnabled() || prepared.references.length === 0) return;
     setImmediate(() => {
+      if (this.referencesNeedDocuments(prepared.references)) {
+        void this.documents.ensureAwake().catch(() => {
+          // CatalogDocuments logs and remembers the document-only failure.
+        });
+      }
       void this.processQuery(prepared, result, error).catch((cause) => {
         console.error(
           `[catalog] post-query update failed: ${cause instanceof Error ? cause.message : String(cause)}`,
         );
       });
+    });
+  }
+
+  private referencesNeedDocuments(references: TableReference[]): boolean {
+    if (!this.documents.isAvailable()) return false;
+    return references.some((reference) => {
+      const resolved = this.resolveTable(
+        reference.schema
+          ? `${reference.schema}.${reference.table}`
+          : reference.table,
+      );
+      return Boolean(
+        resolved &&
+          !Object.prototype.hasOwnProperty.call(resolved.entry.curated, "doc"),
+      );
     });
   }
 
@@ -243,6 +371,16 @@ export class SchemaCatalog {
     const unique = new Map(
       resolved.map((value) => [`${value.schema}.${value.table}`, value]),
     );
+    if (
+      this.documents.isAvailable() &&
+      [...unique.values()].some((value) =>
+        !Object.prototype.hasOwnProperty.call(value.entry.curated, "doc"),
+      )
+    ) {
+      void this.documents.ensureAwake().catch(() => {
+        // The database usage path remains healthy when the document axis fails.
+      });
+    }
     const columns = resultColumnNames(result.content?.[0]?.text ?? "").filter(
       (column) => !this.options.isPIIColumn(column),
     );

@@ -1,0 +1,360 @@
+import { execFile } from "child_process";
+import { promisify } from "util";
+import type { CatalogStore } from "./store.js";
+import type { AppSchemaEntry } from "../types/index.js";
+
+const execFileAsync = promisify(execFile);
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1_000;
+
+interface DocumentManagerOptions {
+  repo: string | null;
+  ref: string | null;
+  appSchemas: readonly AppSchemaEntry[];
+}
+
+export interface ResolvedDocumentLink {
+  schema: string;
+  table: string;
+  doc: string;
+}
+
+interface DiffEntry {
+  status: "A" | "D" | "M" | "R";
+  oldPath?: string;
+  path: string;
+}
+
+function modelPaths(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.endsWith("model.md"));
+}
+
+function parseDiff(output: string): DiffEntry[] {
+  const entries: DiffEntry[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const fields = line.split("\t");
+    const kind = fields[0]?.[0] as DiffEntry["status"] | undefined;
+    if (kind === "R" && fields[1] && fields[2]) {
+      entries.push({ status: "R", oldPath: fields[1], path: fields[2] });
+    } else if (
+      (kind === "A" || kind === "D" || kind === "M") &&
+      fields[1]
+    ) {
+      entries.push({ status: kind, path: fields[1] });
+    }
+  }
+  return entries;
+}
+
+function linkedDocumentPaths(catalog: ReturnType<CatalogStore["snapshot"]>): Set<string> {
+  const linked = new Set<string>();
+  for (const schema of Object.values(catalog.schemas)) {
+    for (const table of Object.values(schema.tables)) {
+      if (table.curated.doc) linked.add(table.curated.doc.path);
+    }
+  }
+  return linked;
+}
+
+function refreshUnlinked(catalog: ReturnType<CatalogStore["snapshot"]>): void {
+  const linked = linkedDocumentPaths(catalog);
+  catalog.docs.unlinked = catalog.docs.paths.filter((path) => !linked.has(path));
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_./:@+-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export class CatalogDocuments {
+  private attempted = false;
+  private wakePromise: Promise<void> | null = null;
+  private disabledReason: string | null = null;
+
+  constructor(
+    private readonly store: CatalogStore,
+    private readonly options: DocumentManagerOptions,
+  ) {}
+
+  isConfigured(): boolean {
+    return Boolean(this.options.repo && this.options.ref);
+  }
+
+  isAvailable(): boolean {
+    return this.isConfigured() && this.disabledReason === null;
+  }
+
+  error(): string | null {
+    return this.disabledReason;
+  }
+
+  private async git(args: string[]): Promise<string> {
+    if (!this.options.repo) throw new Error("MYSQL_DOCS_REPO is not configured.");
+    console.error(`[catalog] git -C ${this.options.repo} ${args.join(" ")}`);
+    const { stdout } = await execFileAsync("git", ["-C", this.options.repo, ...args], {
+      encoding: "utf8",
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    return stdout;
+  }
+
+  async ensureAwake(): Promise<void> {
+    if (!this.isConfigured()) {
+      throw new Error(
+        "The document catalog is disabled because MYSQL_DOCS_REPO or MYSQL_CODE_BRANCH is not configured.",
+      );
+    }
+    if (this.disabledReason) throw new Error(this.disabledReason);
+    if (this.attempted && !this.wakePromise) return;
+    if (!this.wakePromise) {
+      this.attempted = true;
+      this.wakePromise = this.wake().catch((error) => {
+        this.disabledReason =
+          `The document catalog is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[catalog] document axis disabled: ${this.disabledReason}`);
+        throw new Error(this.disabledReason);
+      });
+    }
+    try {
+      await this.wakePromise;
+    } finally {
+      this.wakePromise = null;
+    }
+  }
+
+  private async wake(): Promise<void> {
+    const ref = this.options.ref as string;
+    const commit = (await this.git(["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    const cached = this.store.snapshot().docs;
+    if (cached.refCommit === commit) return;
+
+    let entries: DiffEntry[] | null = null;
+    if (cached.refCommit) {
+      try {
+        entries = parseDiff(
+          await this.git([
+            "diff",
+            "--name-status",
+            cached.refCommit,
+            commit,
+            "--",
+            "*model.md",
+          ]),
+        );
+      } catch (error) {
+        console.error(
+          `[catalog] cached document commit is unavailable; rebuilding path list: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    if (entries === null) {
+      const paths = modelPaths(
+        await this.git(["ls-tree", "-r", "--name-only", commit]),
+      );
+      this.store.update((catalog) => {
+        catalog.docs.paths = paths;
+        for (const schema of Object.values(catalog.schemas)) {
+          for (const table of Object.values(schema.tables)) {
+            if (table.curated.doc && !paths.includes(table.curated.doc.path)) {
+              delete table.curated.doc;
+            }
+          }
+        }
+        refreshUnlinked(catalog);
+      });
+    } else {
+      this.store.update((catalog) => {
+        for (const entry of entries as DiffEntry[]) {
+          if (entry.status === "M") continue;
+          if (entry.status === "A") {
+            if (!catalog.docs.paths.includes(entry.path)) {
+              catalog.docs.paths.push(entry.path);
+            }
+            continue;
+          }
+          if (entry.status === "D") {
+            catalog.docs.paths = catalog.docs.paths.filter(
+              (path) => path !== entry.path,
+            );
+            for (const schema of Object.values(catalog.schemas)) {
+              for (const table of Object.values(schema.tables)) {
+                if (table.curated.doc?.path === entry.path) {
+                  delete table.curated.doc;
+                }
+              }
+            }
+            continue;
+          }
+          const oldPath = entry.oldPath as string;
+          catalog.docs.paths = catalog.docs.paths.map((path) =>
+            path === oldPath ? entry.path : path,
+          );
+          if (!catalog.docs.paths.includes(entry.path)) {
+            catalog.docs.paths.push(entry.path);
+          }
+          for (const schema of Object.values(catalog.schemas)) {
+            for (const table of Object.values(schema.tables)) {
+              if (table.curated.doc?.path === oldPath) {
+                table.curated.doc.path = entry.path;
+              }
+            }
+          }
+        }
+        catalog.docs.paths = [...new Set(catalog.docs.paths)].sort();
+        refreshUnlinked(catalog);
+      });
+    }
+
+    let refUpdatedAt: string | null = null;
+    try {
+      const seconds = Number(
+        (await this.git(["show", "-s", "--format=%ct", commit])).trim(),
+      );
+      if (Number.isFinite(seconds)) {
+        refUpdatedAt = new Date(seconds * 1_000).toISOString();
+      }
+    } catch (error) {
+      console.error(
+        `[catalog] could not read document ref timestamp: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.store.update((catalog) => {
+      catalog.docs.repo = this.options.repo;
+      catalog.docs.ref = this.options.ref;
+      catalog.docs.refCommit = commit;
+      catalog.docs.refUpdatedAt = refUpdatedAt;
+    });
+    console.error(
+      `[catalog] document paths refreshed: ${this.store.snapshot().docs.paths.length} files at ${ref}`,
+    );
+  }
+
+  async list(schemaName: string): Promise<string> {
+    await this.ensureAwake();
+    const mapping = this.options.appSchemas.find(
+      (entry) => entry.schema.toLowerCase() === schemaName.toLowerCase(),
+    );
+    if (!mapping) {
+      throw new Error(`Schema "${schemaName}" is not declared in MYSQL_APP_SCHEMAS.`);
+    }
+    const catalog = this.store.snapshot();
+    const prefix = `apps/${mapping.app}/`;
+    const paths = catalog.docs.paths
+      .filter((path) => path.startsWith(prefix))
+      .map((path) => ({
+        path,
+        linkedTables: Object.entries(catalog.schemas).flatMap(
+          ([knownSchema, schema]) =>
+            Object.entries(schema.tables)
+              .filter(([, table]) => table.curated.doc?.path === path)
+              .map(([table]) => `${knownSchema}.${table}`),
+        ),
+      }));
+    const warning = this.staleWarning();
+    return JSON.stringify(
+      {
+        schema: schemaName,
+        app: mapping.app,
+        ref: catalog.docs.ref,
+        paths,
+        ...(warning ? { warning } : {}),
+      },
+      null,
+      2,
+    );
+  }
+
+  async read(documentPath: string): Promise<string> {
+    await this.ensureAwake();
+    const catalog = this.store.snapshot();
+    if (!catalog.docs.paths.includes(documentPath)) {
+      throw new Error(
+        `Document "${documentPath}" is not present at ${catalog.docs.ref}. Use docs_list or map to choose a cataloged path.`,
+      );
+    }
+    const content = await this.git(["show", `${catalog.docs.ref}:${documentPath}`]);
+    const warning = this.staleWarning();
+    return warning ? `${warning}\n\n${content}` : content;
+  }
+
+  async link(links: ResolvedDocumentLink[]): Promise<string> {
+    await this.ensureAwake();
+    const snapshot = this.store.snapshot();
+    for (const link of links) {
+      if (!snapshot.docs.paths.includes(link.doc)) {
+        throw new Error(
+          `Document "${link.doc}" is not present at ${snapshot.docs.ref}.`,
+        );
+      }
+      if (!snapshot.schemas[link.schema]?.tables[link.table]) {
+        throw new Error(`Unknown table "${link.schema}.${link.table}".`);
+      }
+    }
+    const now = new Date().toISOString();
+    this.store.update((catalog) => {
+      for (const link of links) {
+        catalog.schemas[link.schema].tables[link.table].curated.doc = {
+          path: link.doc,
+          linkedBy: "model",
+          linkedAt: now,
+          linkedAtCommit: catalog.docs.refCommit,
+        };
+      }
+      refreshUnlinked(catalog);
+    });
+    return JSON.stringify(
+      {
+        linked: links.map((link) => ({
+          table: `${link.schema}.${link.table}`,
+          doc: link.doc,
+        })),
+        ...(this.staleWarning() ? { warning: this.staleWarning() } : {}),
+      },
+      null,
+      2,
+    );
+  }
+
+  unlink(schemaName: string, tableName: string): string {
+    const snapshot = this.store.snapshot();
+    if (!snapshot.schemas[schemaName]?.tables[tableName]) {
+      throw new Error(`Unknown table "${schemaName}.${tableName}".`);
+    }
+    this.store.update((catalog) => {
+      catalog.schemas[schemaName].tables[tableName].curated.doc = null;
+      refreshUnlinked(catalog);
+    });
+    return JSON.stringify(
+      {
+        table: `${schemaName}.${tableName}`,
+        doc: null,
+        status: "문서 없음 또는 연결 해제를 확인했습니다.",
+        ...(this.staleWarning() ? { warning: this.staleWarning() } : {}),
+      },
+      null,
+      2,
+    );
+  }
+
+  staleWarning(): string | null {
+    const updatedAt = this.store.snapshot().docs.refUpdatedAt;
+    if (!updatedAt) return null;
+    const age = Date.now() - Date.parse(updatedAt);
+    if (!Number.isFinite(age) || age <= THIRTY_DAYS_MS) return null;
+    return (
+      `[카탈로그 경고] ${this.options.ref}의 마지막 커밋이 30일 이상 지났습니다. ` +
+      "필요하면 사용자가 문서 저장소에서 git fetch를 실행해야 합니다."
+    );
+  }
+
+  documentCommand(documentPath: string): string | null {
+    if (!this.options.repo || !this.options.ref) return null;
+    return `git -C ${shellQuote(this.options.repo)} show ${shellQuote(`${this.options.ref}:${documentPath}`)}`;
+  }
+}

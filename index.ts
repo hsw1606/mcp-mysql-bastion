@@ -166,13 +166,22 @@ const mysqlCatalogTool = {
   description:
     "Read the local schema catalog without rediscovering database metadata. " +
     "Use map for the app/schema overview, search to find tables or known columns, " +
-    "and describe before writing SQL against a table.",
+    "describe before writing SQL, and docs_list/docs_read to inspect domain documents. " +
+    "Use link or unlink to record the model's document decision.",
   inputSchema: {
     type: "object" as const,
     properties: {
       action: {
         type: "string",
-        enum: ["map", "search", "describe"],
+        enum: [
+          "map",
+          "search",
+          "describe",
+          "docs_list",
+          "docs_read",
+          "link",
+          "unlink",
+        ],
         description: "Catalog operation to perform",
       },
       q: {
@@ -189,12 +198,38 @@ const mysqlCatalogTool = {
         type: "string",
         description: "Qualified schema.table name for describe",
       },
+      schema: {
+        type: "string",
+        description: "Declared schema name for docs_list",
+      },
+      path: {
+        type: "string",
+        description: "Cataloged model.md path for docs_read",
+      },
+      links: {
+        type: "array",
+        description: "Table/document decisions to record in one call",
+        items: {
+          type: "object",
+          properties: {
+            table: {
+              type: "string",
+              description: "Qualified schema.table name",
+            },
+            doc: {
+              type: "string",
+              description: "Cataloged model.md path",
+            },
+          },
+          required: ["table", "doc"],
+        },
+      },
     },
     required: ["action"],
   },
   annotations: {
-    readOnlyHint: true,
-    idempotentHint: true,
+    readOnlyHint: false,
+    idempotentHint: false,
     destructiveHint: false,
     openWorldHint: false,
     title: "MySQL Schema Catalog",
@@ -585,6 +620,37 @@ export default function createMcpServer() {
             throw new Error('mysql_catalog describe requires "table" as schema.table.');
           }
           text = await catalog.describe(args.table);
+        } else if (action === "docs_list") {
+          if (typeof args.schema !== "string" || !args.schema.trim()) {
+            throw new Error('mysql_catalog docs_list requires "schema".');
+          }
+          text = await catalog.docsList(args.schema);
+        } else if (action === "docs_read") {
+          if (typeof args.path !== "string" || !args.path.trim()) {
+            throw new Error('mysql_catalog docs_read requires "path".');
+          }
+          text = await catalog.docsRead(args.path);
+        } else if (action === "link") {
+          if (
+            !Array.isArray(args.links) ||
+            !args.links.every(
+              (link) =>
+                link &&
+                typeof link === "object" &&
+                typeof link.table === "string" &&
+                typeof link.doc === "string",
+            )
+          ) {
+            throw new Error(
+              'mysql_catalog link requires "links" as [{table, doc}, ...].',
+            );
+          }
+          text = await catalog.link(args.links);
+        } else if (action === "unlink") {
+          if (typeof args.table !== "string" || !args.table.trim()) {
+            throw new Error('mysql_catalog unlink requires "table" as schema.table.');
+          }
+          text = await catalog.unlink(args.table);
         } else {
           throw new Error(`Unknown mysql_catalog action: ${String(action)}`);
         }
@@ -613,6 +679,9 @@ export default function createMcpServer() {
         catalog.afterQuery(references, { content: [], isError: true }, error);
         throw error;
       }
+      const documentGuidance = result.isError
+        ? null
+        : catalog.queryDocumentGuidance(references);
       catalog.afterQuery(references, result);
 
       // Prepend the environment banner to every result — success or refusal —
@@ -622,6 +691,9 @@ export default function createMcpServer() {
         content: [
           { type: "text", text: profileBanner() },
           ...(result.content ?? []),
+          ...(documentGuidance
+            ? [{ type: "text" as const, text: documentGuidance }]
+            : []),
         ],
       };
     } catch (err) {
