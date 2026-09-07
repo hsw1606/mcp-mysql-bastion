@@ -17,7 +17,6 @@ import {
   normalizeName,
   pruneJoins,
 } from "./types.js";
-import { fingerprintColumnNames } from "./usage.js";
 
 const FLUSH_DELAY_MS = 2_000;
 const LOCK_RETRY_MS = 25;
@@ -28,10 +27,6 @@ const LOCK_WAIT_MS = 15_000;
 const LOCK_CLOSE_WAIT_MS = 2_000;
 const LOCK_STALE_MS = 30_000;
 const CLOSE_FLUSH_ATTEMPTS = 2;
-// A fingerprint's PII verdict cannot change within a process, so the SQL parse
-// behind it is cached. The bound only guards against an unexpectedly large
-// cache: the catalog itself keeps at most 100 fingerprints per table.
-const FINGERPRINT_VERDICT_LIMIT = 20_000;
 
 /**
  * Raised when another writer held the lock for the whole wait. Recoverable on
@@ -271,45 +266,6 @@ function mergeTable(
       ),
     ] as const)
     .filter(([, count]) => count > 0);
-  const fingerprints = [...new Set([
-    ...Object.keys(external.usage?.fingerprints ?? {}),
-    ...Object.keys(local.usage?.fingerprints ?? {}),
-  ])]
-    .map((fingerprint) => {
-      const left = external.usage?.fingerprints?.[fingerprint];
-      const right = local.usage?.fingerprints?.[fingerprint];
-      const ancestor = base?.usage?.fingerprints?.[fingerprint];
-      const count = mergedCounter(
-        left?.count ?? 0,
-        right?.count ?? 0,
-        ancestor?.count ?? 0,
-      );
-      return [
-        fingerprint,
-        {
-          count,
-          successCount: mergedCounter(
-            left?.successCount ?? 0,
-            right?.successCount ?? 0,
-            ancestor?.successCount ?? 0,
-          ),
-          failureCount: mergedCounter(
-            left?.failureCount ?? 0,
-            right?.failureCount ?? 0,
-            ancestor?.failureCount ?? 0,
-          ),
-          lastUsedAt:
-            newerUsageTimestamp(
-              left?.lastUsedAt,
-              right?.lastUsedAt,
-              left?.count ?? 0,
-              right?.count ?? 0,
-              ancestor?.count ?? 0,
-            ) ?? EPOCH,
-        },
-      ] as const;
-    })
-    .filter(([, usage]) => usage.count > 0);
   return {
     ...newerDetail,
     usage: {
@@ -332,7 +288,6 @@ function mergeTable(
         baseUsageCount,
       ),
       columns: Object.fromEntries(columns),
-      fingerprints: Object.fromEntries(fingerprints),
     },
     curated: mergeCurated(
       external.curated ?? { notes: [], aliases: [] },
@@ -471,7 +426,6 @@ export class CatalogStore {
     string,
     { schema: string; tables: Map<string, string> }
   > | null = null;
-  private readonly fingerprintVerdicts = new Map<string, boolean>();
 
   constructor(private readonly options: CatalogOptions) {
     this.enabled = options.enabled;
@@ -562,11 +516,6 @@ export class CatalogStore {
                 ([column]) => !this.options.isPIIColumn(column),
               ),
             ),
-            fingerprints: Object.fromEntries(
-              Object.entries(raw.usage?.fingerprints ?? {}).filter(
-                ([fingerprint]) => this.fingerprintIsAllowed(fingerprint),
-              ),
-            ),
           },
           curated: {
             notes: raw.curated?.notes ?? [],
@@ -616,25 +565,6 @@ export class CatalogStore {
 
   isEnabled(): boolean {
     return this.enabled;
-  }
-
-  /**
-   * Deciding whether a stored fingerprint may be persisted requires parsing it.
-   * The verdict is fixed for the life of the process, so it is cached: without
-   * this, every flush re-parsed every fingerprint of every table twice while
-   * holding the on-disk lock.
-   */
-  private fingerprintIsAllowed(fingerprint: string): boolean {
-    if (!this.options.piiRedactionEnabled) return true;
-    const cached = this.fingerprintVerdicts.get(fingerprint);
-    if (cached !== undefined) return cached;
-    const columns = fingerprintColumnNames(fingerprint);
-    const allowed = columns !== null && !columns.some(this.options.isPIIColumn);
-    if (this.fingerprintVerdicts.size >= FINGERPRINT_VERDICT_LIMIT) {
-      this.fingerprintVerdicts.clear();
-    }
-    this.fingerprintVerdicts.set(fingerprint, allowed);
-    return allowed;
   }
 
   private invalidateNameIndex(): void {

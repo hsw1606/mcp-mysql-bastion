@@ -680,14 +680,8 @@ export class SchemaCatalog {
   }
 
   prepareQuery(sql: string): PreparedCatalogQuery {
-    if (!this.isEnabled()) {
-      return { references: [], normalizedSql: null, joins: [], columns: [] };
-    }
-    const prepared = prepareCatalogQuery(sql);
-    if (prepared.columns.some(this.options.isPIIColumn)) {
-      prepared.normalizedSql = null;
-    }
-    return prepared;
+    if (!this.isEnabled()) return { references: [], joins: [] };
+    return prepareCatalogQuery(sql);
   }
 
   afterQuery(
@@ -810,26 +804,6 @@ export class SchemaCatalog {
         if (succeeded) table.usage.successCount += 1;
         else table.usage.failureCount += 1;
         table.usage.lastUsedAt = now;
-        if (prepared.normalizedSql) {
-          const fingerprint = table.usage.fingerprints[prepared.normalizedSql] ?? {
-            count: 0,
-            successCount: 0,
-            failureCount: 0,
-            lastUsedAt: now,
-          };
-          fingerprint.count += 1;
-          if (succeeded) fingerprint.successCount += 1;
-          else fingerprint.failureCount += 1;
-          fingerprint.lastUsedAt = now;
-          table.usage.fingerprints[prepared.normalizedSql] = fingerprint;
-          const oldest = Object.entries(table.usage.fingerprints).sort(
-            ([, a], [, b]) => a.lastUsedAt.localeCompare(b.lastUsedAt),
-          );
-          while (oldest.length > 100) {
-            const [key] = oldest.shift() as [string, unknown];
-            delete table.usage.fingerprints[key];
-          }
-        }
         if (code === "ER_BAD_FIELD_ERROR" || code === "ER_NO_SUCH_TABLE") {
           table.detailStale = true;
           if (code === "ER_NO_SUCH_TABLE") {

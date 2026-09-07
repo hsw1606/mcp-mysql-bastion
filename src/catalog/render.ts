@@ -221,10 +221,7 @@ function joinEndpointColumn(endpoint: string): string {
 function safeTable(
   table: CatalogTable,
   isPIIColumn: (column: string) => boolean,
-): Omit<CatalogTable, "usage"> & {
-  usage: Omit<CatalogTable["usage"], "fingerprints">;
-} {
-  const { fingerprints: _fingerprints, ...usage } = table.usage;
+): CatalogTable {
   return {
     ...table,
     columns: table.columns.filter((column) => !isPIIColumn(column.name)),
@@ -240,7 +237,7 @@ function safeTable(
         !isPIIColumn(fk.column) && !isPIIColumn(fk.referencedColumn),
     ),
     usage: {
-      ...usage,
+      ...table.usage,
       columns: Object.fromEntries(
         Object.entries(table.usage.columns).filter(
           ([column]) => !isPIIColumn(column),

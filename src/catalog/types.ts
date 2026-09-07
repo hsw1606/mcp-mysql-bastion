@@ -34,15 +34,6 @@ export interface CatalogUsage {
   failureCount: number;
   lastUsedAt: string | null;
   columns: Record<string, number>;
-  fingerprints: Record<
-    string,
-    {
-      count: number;
-      successCount: number;
-      failureCount: number;
-      lastUsedAt: string;
-    }
-  >;
 }
 
 export interface CatalogJoin {
@@ -58,10 +49,9 @@ export interface CatalogJoin {
 export const JOIN_EDGE_LIMIT = 500;
 
 /**
- * Cap the observed joins, dropping the least recently seen first — the policy
- * the per-table fingerprints already use. Recency rather than count on purpose:
- * evicting the rarest edge would turn the cap into a wall that a join path
- * discovered later could never cross.
+ * Cap the observed joins, dropping the least recently seen first. Recency
+ * rather than count on purpose: evicting the rarest edge would turn the cap
+ * into a wall that a join path discovered later could never cross.
  */
 export function pruneJoins(joins: CatalogJoin[]): CatalogJoin[] {
   if (joins.length <= JOIN_EDGE_LIMIT) return joins;
@@ -176,11 +166,14 @@ export interface QueryJoin {
   b: TableReference & { column: string };
 }
 
+/**
+ * What one query teaches the catalog. Nothing derived from the SQL text itself
+ * belongs here: D-6 forbids the cache from holding query literals, and the
+ * safest way to honour that is to never carry the statement past this point.
+ */
 export interface PreparedCatalogQuery {
   references: TableReference[];
-  normalizedSql: string | null;
   joins: QueryJoin[];
-  columns: string[];
 }
 
 export interface CatalogOptions {
@@ -227,7 +220,6 @@ export function emptyUsage(): CatalogUsage {
     failureCount: 0,
     lastUsedAt: null,
     columns: {},
-    fingerprints: {},
   };
 }
 

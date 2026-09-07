@@ -333,10 +333,11 @@ Profile과 실제 DB 대상이 파일명에 들어가므로 서로 다른 환경
 복구 가능한 상황으로 보고 catalog를 끄지 않습니다. 앞의 경우는 다음 저장에서 다시
 시도하고, 뒤의 경우는 읽을 수 없는 파일을 새로 쓴 내용으로 교체합니다.
 
-Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지문만
-들어갑니다. SQL 원문과 row data는 저장하지 않습니다. PII redaction이 켜지면 PII
-column은 저장과 응답에서 모두 제외합니다. `MYSQL_CATALOG_ENABLED=false`로 끄면
-도구와 resource 동작은 변경 전과 같아집니다.
+Catalog에는 schema metadata와 사용 횟수만 들어갑니다. SQL은 어떤 형태로도
+저장하지 않습니다. Query에서 뽑아 쓰는 것은 참조한 table 이름과 join으로 이어진
+column 짝뿐이고, literal은 catalog에 닿기 전에 버려집니다. Row data도 저장하지
+않습니다. PII redaction이 켜지면 PII column은 저장과 응답에서 모두 제외합니다.
+`MYSQL_CATALOG_ENABLED=false`로 끄면 도구와 resource 동작은 변경 전과 같아집니다.
 
 Query 뒤에는 참조한 table의 호출 횟수와 최근 시각을 기록합니다. 실패한 query도
 횟수에 들어가며, 성공과 실패를 따로 셉니다.
