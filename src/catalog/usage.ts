@@ -7,16 +7,6 @@ import type {
 
 const { Parser } = SqlParser;
 const parser = new Parser();
-const LITERAL_TYPES = new Set([
-  "single_quote_string",
-  "double_quote_string",
-  "number",
-  "hex",
-  "bool",
-  "date",
-  "time",
-  "timestamp",
-]);
 
 function cteNames(ast: AST | AST[]): Set<string> {
   const names = new Set<string>();
@@ -66,34 +56,6 @@ function referencesFromTableList(
     references.push({ schema, table });
   }
   return references;
-}
-
-function replaceLiterals(node: unknown): void {
-  if (node == null || typeof node !== "object" || node instanceof Date) return;
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.type === "string" && LITERAL_TYPES.has(obj.type)) {
-    for (const key of Object.keys(obj)) delete obj[key];
-    obj.type = "origin";
-    obj.value = "?";
-    return;
-  }
-  for (const value of Object.values(obj)) {
-    if (Array.isArray(value)) {
-      for (const item of value) replaceLiterals(item);
-    } else {
-      replaceLiterals(value);
-    }
-  }
-}
-
-function normalizeSql(ast: AST | AST[]): string | null {
-  try {
-    const clone = structuredClone(ast);
-    replaceLiterals(clone);
-    return parser.sqlify(clone, { database: "mysql" });
-  } catch {
-    return null;
-  }
 }
 
 function collectAliases(
@@ -171,25 +133,6 @@ function collectJoins(
   }
 }
 
-function collectColumnNames(node: unknown, names: Set<string>): void {
-  if (node == null || typeof node !== "object" || node instanceof Date) return;
-  const obj = node as Record<string, unknown>;
-  if (
-    obj.type === "column_ref" &&
-    typeof obj.column === "string" &&
-    obj.column !== "*"
-  ) {
-    names.add(obj.column);
-  }
-  for (const value of Object.values(obj)) {
-    if (Array.isArray(value)) {
-      for (const item of value) collectColumnNames(item, names);
-    } else {
-      collectColumnNames(value, names);
-    }
-  }
-}
-
 /** Parse once before query execution. This function never touches the database. */
 export function prepareCatalogQuery(sql: string): PreparedCatalogQuery {
   try {
@@ -199,29 +142,11 @@ export function prepareCatalogQuery(sql: string): PreparedCatalogQuery {
     collectAliases(ast, aliases);
     const joins: QueryJoin[] = [];
     collectJoins(ast, aliases, references, new Set<string>(), joins);
-    const columns = new Set<string>();
-    collectColumnNames(ast, columns);
-    return {
-      references,
-      normalizedSql: normalizeSql(ast),
-      joins,
-      columns: [...columns],
-    };
+    return { references, joins };
   } catch {
     // Query validation remains the executor's job. A parser miss only means
     // that this request cannot teach the catalog anything.
-    return { references: [], normalizedSql: null, joins: [], columns: [] };
-  }
-}
-
-export function fingerprintColumnNames(sql: string): string[] | null {
-  try {
-    const ast = parser.astify(sql, { database: "mysql" });
-    const columns = new Set<string>();
-    collectColumnNames(ast, columns);
-    return [...columns];
-  } catch {
-    return null;
+    return { references: [], joins: [] };
   }
 }
 
