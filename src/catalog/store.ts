@@ -15,6 +15,7 @@ import {
   emptyCatalog,
   emptyTable,
   normalizeName,
+  pruneJoins,
 } from "./types.js";
 import { fingerprintColumnNames } from "./usage.js";
 
@@ -154,6 +155,8 @@ async function acquireCatalogLock(
     }
   }
 }
+
+const EPOCH = new Date(0).toISOString();
 
 function timestamp(value: string | null | undefined): number {
   if (!value) return 0;
@@ -302,7 +305,7 @@ function mergeTable(
               left?.count ?? 0,
               right?.count ?? 0,
               ancestor?.count ?? 0,
-            ) ?? new Date(0).toISOString(),
+            ) ?? EPOCH,
         },
       ] as const;
     })
@@ -408,6 +411,14 @@ function mergeCatalog(
       a: edge.a,
       b: edge.b,
       count,
+      lastUsedAt:
+        newerUsageTimestamp(
+          outside?.lastUsedAt,
+          inside?.lastUsedAt,
+          outside?.count ?? 0,
+          inside?.count ?? 0,
+          ancestor?.count ?? 0,
+        ) ?? EPOCH,
     });
   }
   const localDocsChanged = local.docs.refCommit !== base.docs.refCommit;
@@ -430,7 +441,8 @@ function mergeCatalog(
       unlinked: [],
     },
     schemas,
-    joins: [...joins.values()],
+    // Two writers each below the cap can still merge to above it.
+    joins: pruneJoins([...joins.values()]),
   };
   const linked = new Set<string>();
   for (const schema of Object.values(merged.schemas)) {
@@ -577,14 +589,21 @@ export class CatalogStore {
         unlinked: loaded.docs.unlinked ?? [],
       };
     }
-    fresh.joins = (loaded.joins ?? []).filter((edge) => {
-      const aColumn = edge.a.slice(edge.a.lastIndexOf(".") + 1);
-      const bColumn = edge.b.slice(edge.b.lastIndexOf(".") + 1);
-      return (
-        !this.options.isPIIColumn(aColumn) &&
-        !this.options.isPIIColumn(bColumn)
-      );
-    });
+    fresh.joins = pruneJoins(
+      (loaded.joins ?? [])
+        .filter((edge) => {
+          const aColumn = edge.a.slice(edge.a.lastIndexOf(".") + 1);
+          const bColumn = edge.b.slice(edge.b.lastIndexOf(".") + 1);
+          return (
+            !this.options.isPIIColumn(aColumn) &&
+            !this.options.isPIIColumn(bColumn)
+          );
+        })
+        // A cache written before edges were stamped evicts first. It carries no
+        // recency to compare, and the next query that walks the path re-stamps
+        // whichever edges still matter.
+        .map((edge) => ({ ...edge, lastUsedAt: edge.lastUsedAt ?? EPOCH })),
+    );
     return fresh;
   }
 
@@ -702,11 +721,17 @@ export class CatalogStore {
     return entry ? structuredClone(entry) : null;
   }
 
-  tableCount(): number {
-    return Object.values(this.data.schemas).reduce(
-      (total, schema) => total + Object.keys(schema.tables).length,
-      0,
-    );
+  /**
+   * Whether any table has been read successfully at least once. This is the
+   * moment the hot-table list in the tool description stops being empty.
+   */
+  hasSuccessfulUse(): boolean {
+    for (const schema of Object.values(this.data.schemas)) {
+      for (const table of Object.values(schema.tables)) {
+        if (table.usage.successCount > 0) return true;
+      }
+    }
+    return false;
   }
 
   /** Observed equality joins touching one table, hottest first. */

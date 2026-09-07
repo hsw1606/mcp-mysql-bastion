@@ -17,7 +17,7 @@ import type {
   PreparedCatalogQuery,
   TableReference,
 } from "./types.js";
-import { emptyUsage, normalizeName } from "./types.js";
+import { emptyUsage, normalizeName, pruneJoins } from "./types.js";
 import { prepareCatalogQuery, resultColumnNames } from "./usage.js";
 
 const UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS = 60_000;
@@ -30,6 +30,12 @@ const UNKNOWN_REFERENCE_MEMORY_LIMIT = 256;
 const CLOSE_DRAIN_DEADLINE_MS = 3_000;
 const NOTE_MAX_LENGTH = 1_000;
 const ALIAS_MAX_LENGTH = 200;
+// Curated text is the one thing here that no automatic pass may overwrite, so
+// the limit refuses the write instead of evicting an older entry the way the
+// derived axes do. A table that has hit either bound wants `forget`, not a
+// silently dropped memo.
+const NOTE_COUNT_LIMIT = 50;
+const ALIAS_COUNT_LIMIT = 20;
 
 /**
  * A referenced timer, plus the means to cancel it. Referenced on purpose: an
@@ -77,6 +83,15 @@ function sameName(a: string, b: string): boolean {
   return normalizeName(a) === normalizeName(b);
 }
 
+/**
+ * Resolving a name and mutating the entry are separate steps, and a flush merge
+ * or a background inventory scan in between can drop a table the database no
+ * longer has. Saying so beats the `undefined` property read that preceded this.
+ */
+function tableVanished(qualified: string): string {
+  return `${qualified} is no longer in the catalog; it was dropped while the request was in flight. Run mysql_catalog {action:"map"} to see what remains.`;
+}
+
 export class SchemaCatalog {
   private readonly store: CatalogStore;
   private readonly collector: CatalogCollector;
@@ -85,6 +100,8 @@ export class SchemaCatalog {
   private readonly unknownReferenceRefreshes = new Map<string, number>();
   private closing = false;
   private closePromise: Promise<void> | null = null;
+  private toolDescriptionListener: (() => void | Promise<void>) | null = null;
+  private toolDescriptionAnnounced = false;
 
   constructor(private readonly options: CatalogOptions) {
     this.store = new CatalogStore(options);
@@ -104,33 +121,42 @@ export class SchemaCatalog {
     return this.store.isEnabled();
   }
 
-  startInventory(onInitialFill?: () => void | Promise<void>): void {
+  startInventory(): void {
     if (!this.isEnabled() || this.closing) return;
     // Deliberately not forced. MCP clients start a fresh server per session,
     // so forcing here would rescan on every session and make
     // MYSQL_CATALOG_TTL_HOURS meaningless for the inventory. An empty or
     // expired inventory still refreshes: `inventoryNeedsRefresh` treats a
     // missing `scannedAt` as expired.
-    const wasEmpty = this.store.tableCount() === 0;
     this.trackBackgroundTask(
-      this.collector
-        .collectInventory(false)
-        .then(async () => {
-          if (wasEmpty && this.store.tableCount() > 0 && onInitialFill) {
-            await onInitialFill();
-          }
-        })
-        .catch((error) => {
-          console.error(
-            `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }),
+      this.collector.collectInventory(false).catch((error) => {
+        console.error(
+          `[catalog] inventory scan failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }),
     );
   }
 
   toolDescriptionSuffix(): string {
     if (!this.isEnabled()) return "";
     return renderToolDescriptionSuffix(this.store.snapshot());
+  }
+
+  /**
+   * Called once, the first time the hot-table list stops being empty. That list
+   * holds only tables a query has actually read, so the inventory scan is not
+   * the moment the tool description changes — the first successful query is.
+   * One call per process, which is what caps the notification at one a session.
+   */
+  onToolDescriptionFilled(listener: () => void | Promise<void>): void {
+    this.toolDescriptionListener = listener;
+  }
+
+  private async announceToolDescription(): Promise<void> {
+    if (this.toolDescriptionAnnounced || !this.toolDescriptionListener) return;
+    if (!this.store.hasSuccessfulUse()) return;
+    this.toolDescriptionAnnounced = true;
+    await this.toolDescriptionListener();
   }
 
   private trackBackgroundTask(task: Promise<void>): void {
@@ -494,23 +520,50 @@ export class SchemaCatalog {
     if (content.length > limit) {
       throw new Error(`${kind} exceeds the ${limit}-character limit.`);
     }
+    const qualified = `${resolved.schema}.${resolved.table}`;
+    let full = false;
+    let missing = false;
     this.store.update((catalog) => {
       const curated =
-        catalog.schemas[resolved.schema].tables[resolved.table].curated;
+        catalog.schemas[resolved.schema]?.tables[resolved.table]?.curated;
+      if (!curated) {
+        missing = true;
+        return;
+      }
       if (hasText) {
-        if (!curated.notes.includes(content)) curated.notes.push(content);
-      } else if (
-        !curated.aliases.some(
-          (alias) => normalizeName(alias) === normalizeName(content),
-        )
-      ) {
+        if (curated.notes.includes(content)) return;
+        if (curated.notes.length >= NOTE_COUNT_LIMIT) {
+          full = true;
+          return;
+        }
+        curated.notes.push(content);
+      } else {
+        if (
+          curated.aliases.some(
+            (alias) => normalizeName(alias) === normalizeName(content),
+          )
+        ) {
+          return;
+        }
+        if (curated.aliases.length >= ALIAS_COUNT_LIMIT) {
+          full = true;
+          return;
+        }
         curated.aliases.push(content);
       }
     });
+    if (missing) throw new Error(tableVanished(qualified));
+    if (full) {
+      throw new Error(
+        `${qualified} already holds the maximum of ${
+          hasText ? NOTE_COUNT_LIMIT : ALIAS_COUNT_LIMIT
+        } ${kind}s. Clear them with mysql_catalog {action:"forget", target:"${qualified}", scope:"${kind}s"} first.`,
+      );
+    }
     const table = this.store.readTable(resolved.schema, resolved.table);
     return JSON.stringify(
       {
-        target: `${resolved.schema}.${resolved.table}`,
+        target: qualified,
         added: { [kind]: content },
         notes: table?.curated.notes ?? [],
         aliases: table?.curated.aliases ?? [],
@@ -525,8 +578,13 @@ export class SchemaCatalog {
     const resolved = await this.ensureKnownTable(input);
     const qualified = `${resolved.schema}.${resolved.table}`;
     let removed = 0;
+    let missing = false;
     this.store.update((catalog) => {
-      const table = catalog.schemas[resolved.schema].tables[resolved.table];
+      const table = catalog.schemas[resolved.schema]?.tables[resolved.table];
+      if (!table) {
+        missing = true;
+        return;
+      }
       if (scope === "notes") {
         removed = table.curated.notes.length;
         table.curated.notes = [];
@@ -556,6 +614,7 @@ export class SchemaCatalog {
         table.detailStale = true;
       }
     });
+    if (missing) throw new Error(tableVanished(qualified));
     return JSON.stringify(
       {
         target: qualified,
@@ -800,9 +859,19 @@ export class SchemaCatalog {
           const existing = catalog.joins.find(
             (edge) => edge.a === endpoints[0] && edge.b === endpoints[1],
           );
-          if (existing) existing.count += 1;
-          else catalog.joins.push({ a: endpoints[0], b: endpoints[1], count: 1 });
+          if (existing) {
+            existing.count += 1;
+            existing.lastUsedAt = now;
+          } else {
+            catalog.joins.push({
+              a: endpoints[0],
+              b: endpoints[1],
+              count: 1,
+              lastUsedAt: now,
+            });
+          }
         }
+        catalog.joins = pruneJoins(catalog.joins);
       }
     });
     if (!succeeded) {
@@ -846,6 +915,7 @@ export class SchemaCatalog {
         }
       }
     });
+    await this.announceToolDescription();
   }
 
   /**

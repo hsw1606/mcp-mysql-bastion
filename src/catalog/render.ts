@@ -42,13 +42,15 @@ function usedAt(table: CatalogTable): number {
 }
 
 /**
- * Frequency is the primary signal and recency breaks ties. Tables with no
- * observations fall back to their row estimate, so a brand-new catalog still
- * offers a useful starting point after its first inventory scan.
+ * Successful reads are the primary signal and recency breaks ties. A failed
+ * query means the model could not read that table, so counting attempts would
+ * promote exactly the tables that answered nothing. The row estimate is a last
+ * resort for the `map` overview only — the tool description drops unread tables
+ * rather than guessing importance from size.
  */
 function rankTables(tables: RankedTable[]): RankedTable[] {
   return tables.sort((a, b) => {
-    const used = b.entry.usage.count - a.entry.usage.count;
+    const used = b.entry.usage.successCount - a.entry.usage.successCount;
     if (used) return used;
     const recent = usedAt(b.entry) - usedAt(a.entry);
     if (recent) return recent;
@@ -73,20 +75,28 @@ export function renderToolDescriptionSuffix(catalog: CatalogFile): string {
   const staticGuidance =
     "\n\n테이블의 도메인 규칙·상태 코드 문서가 있을 수 있다. " +
     "SQL을 쓰기 전에 mysql_catalog describe로 확인하라.";
-  const hot = rankTables(allTables(catalog))
+  // Only tables a query has actually read. Seeding this from row estimates
+  // filled all ten slots with the largest event and log tables — the opposite
+  // of where a model should start — and that went into the tool description of
+  // every session. No list is better guidance than a wrong one.
+  const hot = rankTables(
+    allTables(catalog).filter(({ entry }) => entry.usage.successCount > 0),
+  )
     .slice(0, HOT_TABLE_LIMIT)
     .map(({ app, schema, table, entry }) => {
+      const reads = entry.usage.successCount;
       const signal =
-        entry.usage.count > 0
-          ? `${entry.usage.count} uses${entry.usage.lastUsedAt ? `, last ${entry.usage.lastUsedAt.slice(0, 10)}` : ""}`
-          : `about ${entry.rowsEstimate ?? 0} rows; no usage recorded yet`;
+        `${reads} successful ${reads === 1 ? "query" : "queries"}` +
+        (entry.usage.lastUsedAt
+          ? `, last ${entry.usage.lastUsedAt.slice(0, 10)}`
+          : "");
       return `\n  - ${app} -> ${schema}.${table} (${signal})`;
     });
   if (hot.length === 0) return staticGuidance;
 
   const heading =
-    "\n\nCATALOG HOT TABLES (frequency first, recency breaks ties; " +
-    "row estimates seed a new catalog):";
+    "\n\nCATALOG HOT TABLES (most successful queries first, " +
+    "recency breaks ties):";
   let suffix = heading;
   for (const line of hot) {
     if (
@@ -120,6 +130,7 @@ export function renderMap(catalog: CatalogFile, warning: string | null = null): 
         table,
         rowsEstimate: entry.rowsEstimate,
         usageCount: entry.usage.count,
+        successCount: entry.usage.successCount,
         lastUsedAt: entry.usage.lastUsedAt,
       })),
   }));
@@ -181,7 +192,7 @@ export function searchCatalog(
         ...matchedColumns.map((column) => matchScore(column, q, 40)),
       );
       if (score === 0) continue;
-      score += Math.min(9, Math.floor(Math.log2(table.usage.count + 1)));
+      score += Math.min(9, Math.floor(Math.log2(table.usage.successCount + 1)));
       results.push({
         table: qualified,
         score,
@@ -195,6 +206,16 @@ export function searchCatalog(
   return results
     .sort((a, b) => b.score - a.score || a.table.localeCompare(b.table))
     .slice(0, limit);
+}
+
+/**
+ * The column of a `schema.table.column` join endpoint. Joins reach the catalog
+ * already filtered, but every other field of `describe` is filtered again here:
+ * persistence and response are meant to be two independent PII boundaries, so
+ * a future writer that skips the first one cannot leak through this path.
+ */
+function joinEndpointColumn(endpoint: string): string {
+  return endpoint.slice(endpoint.lastIndexOf(".") + 1);
 }
 
 function safeTable(
@@ -268,11 +289,16 @@ export function renderDescribe(
       guidance: "상태 코드·도메인 규칙은 이 문서를 먼저 읽어라.",
     };
   }
+  const joins = observedJoins.filter(
+    (edge) =>
+      !isPIIColumn(joinEndpointColumn(edge.a)) &&
+      !isPIIColumn(joinEndpointColumn(edge.b)),
+  );
   return JSON.stringify(
     {
       table: qualifiedName,
       ...safeTable(table, isPIIColumn),
-      observedJoins,
+      ...(joins.length > 0 ? { observedJoins: joins } : {}),
       docs,
       ...(documents.warning ? { warning: documents.warning } : {}),
     },

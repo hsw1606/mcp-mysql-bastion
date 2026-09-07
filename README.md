@@ -295,6 +295,8 @@ primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 �
 - `link`: 모델이 판단한 table↔문서 연결을 배열로 한꺼번에 저장합니다.
 - `unlink`: 연결을 지우거나 해당 table에 연결할 문서가 없음을 기록합니다.
 - `note`: `target` table에 memo 또는 alias 하나를 저장합니다. 둘 중 하나만 보냅니다.
+  Table당 memo 50개, alias 20개까지이며 한도에 닿으면 저장을 거절합니다. 사람과
+  모델이 쓴 내용을 서버가 조용히 버리지 않기 위한 것이고, 정리는 `forget`으로 합니다.
 - `forget`: `target` table의 `notes`, `aliases`, `usage`, `joins`, `metadata` 중 한
   범위를 지웁니다. `metadata`는 다음 `describe` 또는 정상 query 뒤에 다시 수집됩니다.
   문서 판단은 지우지 않으며, 그 작업에는 `unlink`를 사용합니다.
@@ -336,17 +338,27 @@ Catalog에는 schema metadata, 사용 횟수, literal을 `?`로 바꾼 SQL 지�
 column은 저장과 응답에서 모두 제외합니다. `MYSQL_CATALOG_ENABLED=false`로 끄면
 도구와 resource 동작은 변경 전과 같아집니다.
 
-정상 query 뒤에는 참조한 table의 사용 횟수와 최근 시각을 기록합니다. `map`은
-사용 횟수를 우선하고 최근 시각으로 동률을 정한 hot table을 schema마다 보여줍니다.
-사용 이력이 없는 새 catalog는 예상 row 수로 임시 순서를 정합니다. 전체 상위 10개는
-`mysql_query` 도구 설명에도 들어가므로 다음 세션은 첫 호출 전부터 자주 쓰는 table을
-압니다. 첫 inventory가 빈 catalog를 채운 경우 서버는 `tools/list_changed` 알림을
-세션당 한 번만 보냅니다.
+Query 뒤에는 참조한 table의 호출 횟수와 최근 시각을 기록합니다. 실패한 query도
+횟수에 들어가며, 성공과 실패를 따로 셉니다.
 
-Query에서 `tableA.column = tableB.column` 형태로 관측한 join은 양 끝과 횟수만
-저장합니다. 성공한 query의 join만 누적하며, `describe`의 `observedJoins`에서 해당
-table과 연결된 경로를 자주 관측한 순서로 확인할 수 있습니다. 이는 DB의 foreign key와
-별개인 관측 사실입니다.
+Hot table 순위는 **성공한 query 횟수**를 기준으로 정하고 최근 시각으로 동률을
+정합니다. 실패한 query는 모델이 그 table을 읽지 못했다는 뜻이라 순위에 반영하지
+않습니다. `map`은 schema마다 상위 10개를 보여주며, 여기서는 관측이 없는 table을
+예상 row 수로 이어 붙입니다. `mysql_query` 도구 설명에 들어가는 전체 상위 10개는
+**한 번이라도 읽힌 table만** 담습니다. 읽힌 table이 없으면 목록 자체를 넣지
+않습니다. 예상 row 수로 빈자리를 채우면 가장 큰 event·log table이 열 칸을
+차지해서, 모델을 시작하면 안 되는 곳으로 밀기 때문입니다.
+
+이 목록이 처음 채워지는 시점은 서버 시작이 아니라 table을 읽은 첫 query입니다.
+서버는 그때 `tools/list_changed` 알림을 세션당 한 번만 보냅니다.
+
+Query에서 `tableA.column = tableB.column` 형태로 관측한 join은 양 끝과 횟수,
+마지막 관측 시각만 저장합니다. 성공한 query의 join만 누적하며, `describe`의
+`observedJoins`에서 해당 table과 연결된 경로를 자주 관측한 순서로 확인할 수
+있습니다. 이는 DB의 foreign key와 별개인 관측 사실입니다. 간선은 500개까지
+유지하고 넘으면 가장 오래 관측되지 않은 것부터 버립니다. 횟수가 아니라 시각을
+기준으로 버리는 이유는, 드문 간선을 먼저 버리면 나중에 발견한 join 경로가
+한도를 넘어 들어올 수 없게 되기 때문입니다.
 
 ### `MYSQL_CODE_BRANCH` — 데이터가 어느 branch에 대응하는가
 
