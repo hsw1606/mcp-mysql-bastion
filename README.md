@@ -430,6 +430,7 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | `MYSQL_DATE_STRINGS` | `false` | 날짜를 `Date`가 아닌 문자열로 반환합니다. |
 | `MYSQL_SSL` | `false` | MySQL로의 TLS(SSH tunnel과는 별개). |
 | `MYSQL_MAX_TIMEOUT_SECONDS` | `30` | `timeout_seconds` 인자의 상한. 기본 상한 10초도 이 값 아래로 함께 내려갑니다. |
+| `MYSQL_MAX_RESPONSE_ROWS` | `5000` | 한 응답에 담기는 최대 행 수. 쿼리가 고르는 행이 아니라 **돌려주는** 행입니다. |
 | `MYSQL_CATALOG_TIMEOUT_SECONDS` | `60` | catalog의 `information_schema` 조회에 걸리는 시간 상한. |
 
 ### 쓰기
@@ -525,6 +526,11 @@ flag는 평범한 설정이기 때문입니다.
 
 ### 시간 상한과 행 수 상한
 
+이 절에는 세 종류의 이름이 나옵니다. `max_execution_time`과 `sql_select_limit`은
+**MySQL 자체의 세션 변수**로, 서버가 대신 걸어 줄 뿐 설정 항목이 아닙니다.
+`MYSQL_`로 시작하는 것만 profile에 적는 환경변수이고, `timeout_seconds`는
+`mysql_query` 호출에 넘기는 인자입니다.
+
 모든 읽기는 `max_execution_time` 아래에서 실행되며 기본값은 10초입니다. 대화형
 도구이고 사람이 답을 기다리므로 짧게 잡았습니다. 호출마다 `mysql_query`의
 `timeout_seconds` 인자로 올릴 수 있고, 상한은 `MYSQL_MAX_TIMEOUT_SECONDS`(기본
@@ -535,14 +541,25 @@ flag는 평범한 설정이기 때문입니다.
 상한 30초는 MCP 클라이언트의 기본 tool timeout보다 낮게 유지하세요. 클라이언트가
 먼저 포기하면 모델에게는 보고서가 아니라 아무것도 남지 않습니다.
 
-결과는 5000행에서 잘리며 이 값은 설정할 수 없습니다. 보호 대상이 데이터베이스가
-아니라 호출하는 쪽의 context window이기 때문입니다. 세션은
+결과는 5000행에서 잘립니다(`MYSQL_MAX_RESPONSE_ROWS`). 이름이 `RESULT`가 아니라
+`RESPONSE`인 이유는 쿼리가 고르는 행이 아니라 **돌려주는** 행을 세기 때문입니다 —
+`LIMIT n`과는 다른 층위입니다. 보호 대상이 데이터베이스가 아니라 호출하는 쪽의
+context window라서, 프로필이 컨텍스트 큰 클라이언트와 짝지어져 있다면 올릴 수
+있습니다. 다만 **운영자만 조정합니다** — 호출자가 자기 상한을 푸는 인자는 없습니다.
+세션은
 `sql_select_limit = 5001`로 돌아가고, 5001번째 행이 오면 마지막 하나를 버린 뒤
 경고를 붙입니다. 자기 `LIMIT`을 더 크게 들고 온 쿼리는 `sql_select_limit`을
 무시하므로, 잘라내기는 응답 조립 시점에도 한 번 더 적용됩니다. 경고 없이 조용히
 자르면 모델이 부분 결과를 전체로 착각하므로, 경고는 별도 블록으로 나갑니다.
 
-Catalog의 `information_schema` 조회에는 행 수 상한이 걸리지 않습니다. `pool`을
+**행 수 상한은 조회 대상이 아니라 결과가 어디로 가는지로 갈립니다.** 모델에게
+돌아가는 결과는 무엇을 조회했든 5000행에서 잘립니다 — `information_schema`도
+예외가 아니어서, 모델이 직접 보낸 `SELECT ... FROM information_schema.columns`는
+다른 쿼리와 똑같이 잘리고 경고가 붙습니다.
+
+예외는 **서버가 스스로 보내는 쿼리** 하나뿐입니다. catalog가 table 목록과
+column·index를 모을 때 쓰는 조회는 결과가 모델에게 가지 않고 서버가 삼켜
+catalog 파일에 구조 정보로 들어갑니다. 그래서 상한을 걷었다가 되돌립니다. `pool`을
 읽기 경로와 공유하므로 남아 있는 상한이 inventory 수집을 조용히 잘라낼 수 있고,
 그렇게 만들어진 catalog는 고장 난 것이 아니라 조용히 틀린 것이 됩니다. 시간
 상한은 catalog에도 걸되 별도 값(`MYSQL_CATALOG_TIMEOUT_SECONDS`, 기본 60)을

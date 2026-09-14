@@ -340,7 +340,7 @@ export const MYSQL_DEFAULT_TIMEOUT_SECONDS = Math.min(
  * Separate from the user-facing limit because the two have different shapes: a
  * user query is interactive and should fail fast, while an inventory scan runs
  * in the background, touches every declared schema at once, and is worth
- * waiting longer for. The row cap is *not* shared — see `MAX_RESULT_ROWS`.
+ * waiting longer for. The row cap is *not* shared — see `MAX_RESPONSE_ROWS`.
  */
 export const MYSQL_CATALOG_TIMEOUT_SECONDS = parsePositiveInt(
   "MYSQL_CATALOG_TIMEOUT_SECONDS",
@@ -349,17 +349,25 @@ export const MYSQL_CATALOG_TIMEOUT_SECONDS = parsePositiveInt(
 );
 
 /**
- * Largest result a read query may return to the model.
+ * Largest number of rows a read may hand back to the caller.
  *
- * Not configurable. The number exists to protect the model's context window,
- * which is a property of the client rather than of this database, so an
- * operator turning it up per environment would be tuning the wrong knob. The
- * session runs with `sql_select_limit = MAX_RESULT_ROWS + 1` so that one extra
- * row proves truncation happened; a query carrying its own larger LIMIT
- * overrides `sql_select_limit` entirely, and is cut to the same size on the
- * way out.
+ * A response cap, not a query cap — which is why the name says `RESPONSE` and
+ * not `RESULT`. It bounds what crosses into the caller's context, so the cut
+ * lands at response assembly rather than in the statement: a query carrying its
+ * own larger LIMIT overrides `sql_select_limit` entirely and is still trimmed
+ * on the way out. The session runs one above this number so that the extra row
+ * is itself the proof that truncation happened.
+ *
+ * Configurable because what it protects is the caller's context window, and a
+ * profile is written for one client: an operator pairing a profile with a
+ * large-context client knows something this default cannot. It is an operator
+ * control on purpose — no tool argument lets a caller raise its own cap.
  */
-export const MAX_RESULT_ROWS = 5000;
+export const MAX_RESPONSE_ROWS = parsePositiveInt(
+  "MYSQL_MAX_RESPONSE_ROWS",
+  process.env.MYSQL_MAX_RESPONSE_ROWS,
+  5000,
+);
 
 // PII redaction: when enabled, read-only query results are walked and
 // sensitive values are partially masked before being returned to the client.
