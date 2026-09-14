@@ -38,7 +38,7 @@ import {
   MYSQL_DOCS_REPO,
   MYSQL_DEFAULT_TIMEOUT_SECONDS,
   MYSQL_MAX_TIMEOUT_SECONDS,
-  MAX_RESULT_ROWS,
+  MAX_RESPONSE_ROWS,
 } from "./src/config/index.js";
 import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
 import {
@@ -143,7 +143,7 @@ if (
 baseToolDescription +=
   `\n\nLIMITS: every read is cancelled after ${MYSQL_DEFAULT_TIMEOUT_SECONDS}s ` +
   `(raise per call with timeout_seconds, up to ${MYSQL_MAX_TIMEOUT_SECONDS}) and returns at most ` +
-  `${MAX_RESULT_ROWS.toLocaleString("en-US")} rows. Aggregate in SQL rather than pulling rows to count them. ` +
+  `${MAX_RESPONSE_ROWS.toLocaleString("en-US")} rows. Aggregate in SQL rather than pulling rows to count them. ` +
   `A cancelled query comes back with its execution plan already attached — read that ` +
   `instead of running EXPLAIN yourself, and do not retry the same statement unchanged.`;
 

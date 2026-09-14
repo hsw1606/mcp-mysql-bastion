@@ -48,7 +48,7 @@ import {
   MYSQL_DEFAULT_TIMEOUT_SECONDS,
   MYSQL_MAX_TIMEOUT_SECONDS,
   MYSQL_CATALOG_TIMEOUT_SECONDS,
-  MAX_RESULT_ROWS,
+  MAX_RESPONSE_ROWS,
 } from "./../config/index.js";
 import {
   redactPII,
@@ -91,7 +91,7 @@ interface SessionLimits {
 /** What a user-facing read runs under unless the call asked for more time. */
 const READ_LIMITS: SessionLimits = {
   maxExecutionTimeMs: MYSQL_DEFAULT_TIMEOUT_SECONDS * 1_000,
-  selectLimit: MAX_RESULT_ROWS + 1,
+  selectLimit: MAX_RESPONSE_ROWS + 1,
 };
 
 /**
@@ -100,7 +100,7 @@ const READ_LIMITS: SessionLimits = {
  * The row cap is deliberately absent. `sql_select_limit` is a session variable
  * on a pool shared with the user path, so a cap left behind by a user query
  * would silently truncate the inventory scan — a schema with more than
- * MAX_RESULT_ROWS tables would be cached as a partial list, with nothing
+ * MAX_RESPONSE_ROWS tables would be cached as a partial list, with nothing
  * anywhere saying so. The time limit is kept, and set higher, because an
  * inventory scan legitimately runs longer than an interactive query.
  */
@@ -770,7 +770,7 @@ async function executeReadOnlyQuery<T>(
     const timeoutSeconds = clampTimeoutSeconds(options.timeoutSeconds);
     let roundTrips = await applySessionLimits(connection, {
       maxExecutionTimeMs: timeoutSeconds * 1_000,
-      selectLimit: MAX_RESULT_ROWS + 1,
+      selectLimit: MAX_RESPONSE_ROWS + 1,
     });
 
     // One statement both opens the transaction and declares its access mode,
@@ -807,9 +807,9 @@ async function executeReadOnlyQuery<T>(
       // LIMIT of its own; one carrying a larger LIMIT overrides the session
       // variable entirely, so the same cut is applied here either way.
       let truncated = false;
-      if (Array.isArray(rows) && rows.length > MAX_RESULT_ROWS) {
+      if (Array.isArray(rows) && rows.length > MAX_RESPONSE_ROWS) {
         truncated = true;
-        rows = rows.slice(0, MAX_RESULT_ROWS);
+        rows = rows.slice(0, MAX_RESPONSE_ROWS);
       }
 
       // For introspection results we drop PII rows BEFORE the value-level
@@ -871,10 +871,11 @@ async function executeReadOnlyQuery<T>(
                 {
                   type: "text",
                   text:
-                    `[TRUNCATED] Only the first ${MAX_RESULT_ROWS.toLocaleString("en-US")} rows are shown; ` +
+                    `[TRUNCATED] Only the first ${MAX_RESPONSE_ROWS.toLocaleString("en-US")} rows are shown; ` +
                     `the query matched more. This is NOT the complete result - do not count, sum, or ` +
                     `conclude anything about totals from it. Add a narrower WHERE, an aggregate ` +
-                    `(COUNT/SUM/GROUP BY), or paginate with ORDER BY + LIMIT/OFFSET.`,
+                    `(COUNT/SUM/GROUP BY), or paginate with ORDER BY + LIMIT/OFFSET. Raising the cap ` +
+                    `is an operator change (MYSQL_MAX_RESPONSE_ROWS), not something to retry around.`,
                 },
               ]
             : []),
