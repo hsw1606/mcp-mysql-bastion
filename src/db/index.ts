@@ -13,7 +13,14 @@ import {
   containsSelectStar,
   findPIIColumnReferences,
   isIntrospectionQuery,
+  extractQualifiers,
 } from "./utils.js";
+import {
+  isQueryTimeoutError,
+  parseExplainPayload,
+  renderTimeoutDiagnostic,
+} from "./diagnose.js";
+import type { CatalogIndexFacts } from "./../catalog/types.js";
 
 import * as mysql2 from "mysql2/promise";
 import { log } from "./../utils/index.js";
@@ -38,6 +45,10 @@ import {
   PII_ALLOW_REFERENCES,
   PII_ALLOW_INTROSPECTION,
   PII_BLOCK_INTROSPECTION,
+  MYSQL_DEFAULT_TIMEOUT_SECONDS,
+  MYSQL_MAX_TIMEOUT_SECONDS,
+  MYSQL_CATALOG_TIMEOUT_SECONDS,
+  MAX_RESULT_ROWS,
 } from "./../config/index.js";
 import {
   redactPII,
@@ -66,6 +77,94 @@ function safeExit(code: number): void {
 
 // @INFO: Lazy load MySQL pool
 let poolPromise: Promise<mysql2.Pool> | undefined;
+
+/**
+ * Session limits a connection is currently running under.
+ *
+ * `selectLimit: null` means `sql_select_limit = DEFAULT`, i.e. no row cap.
+ */
+interface SessionLimits {
+  maxExecutionTimeMs: number;
+  selectLimit: number | null;
+}
+
+/** What a user-facing read runs under unless the call asked for more time. */
+const READ_LIMITS: SessionLimits = {
+  maxExecutionTimeMs: MYSQL_DEFAULT_TIMEOUT_SECONDS * 1_000,
+  selectLimit: MAX_RESULT_ROWS + 1,
+};
+
+/**
+ * What the catalog's own reads run under.
+ *
+ * The row cap is deliberately absent. `sql_select_limit` is a session variable
+ * on a pool shared with the user path, so a cap left behind by a user query
+ * would silently truncate the inventory scan — a schema with more than
+ * MAX_RESULT_ROWS tables would be cached as a partial list, with nothing
+ * anywhere saying so. The time limit is kept, and set higher, because an
+ * inventory scan legitimately runs longer than an interactive query.
+ */
+const CATALOG_LIMITS: SessionLimits = {
+  maxExecutionTimeMs: MYSQL_CATALOG_TIMEOUT_SECONDS * 1_000,
+  selectLimit: null,
+};
+
+// Recorded on the physical connection, which outlives the per-acquisition
+// wrapper `pool.getConnection()` hands back. Keyed by a symbol so it cannot
+// collide with anything mysql2 stores there.
+const SESSION_LIMITS = Symbol.for("mcp-mysql-bastion.sessionLimits");
+
+type LimitCarrier = { [SESSION_LIMITS]?: SessionLimits };
+
+/** The physical connection behind a promise-API wrapper. */
+function limitCarrier(connection: unknown): LimitCarrier {
+  const inner = (connection as { connection?: unknown })?.connection;
+  return (inner ?? connection) as LimitCarrier;
+}
+
+function limitsStatement(limits: SessionLimits): string {
+  const selectLimit =
+    limits.selectLimit === null ? "DEFAULT" : String(limits.selectLimit);
+  return (
+    `SET SESSION max_execution_time = ${limits.maxExecutionTimeMs}, ` +
+    `SESSION sql_select_limit = ${selectLimit}`
+  );
+}
+
+function sameLimits(a: SessionLimits | undefined, b: SessionLimits): boolean {
+  return (
+    a !== undefined &&
+    a.maxExecutionTimeMs === b.maxExecutionTimeMs &&
+    a.selectLimit === b.selectLimit
+  );
+}
+
+/**
+ * Bring a connection to `desired`, and report whether that cost a round trip.
+ *
+ * Nothing happens when the connection already carries those limits, which is
+ * the common case: `getPool` primes every new physical connection with
+ * `READ_LIMITS`, so an ordinary read spends no round trip here at all.
+ *
+ * A failure is logged and swallowed. Both variables have existed since MySQL
+ * 5.7, so this is a branch for a server we do not target, and there refusing
+ * every query would be a far worse outcome than running one unlimited.
+ */
+async function applySessionLimits(
+  connection: mysql2.PoolConnection,
+  desired: SessionLimits,
+): Promise<number> {
+  const carrier = limitCarrier(connection);
+  if (sameLimits(carrier[SESSION_LIMITS], desired)) return 0;
+  try {
+    await connection.query(limitsStatement(desired));
+    carrier[SESSION_LIMITS] = desired;
+  } catch (error) {
+    delete carrier[SESSION_LIMITS];
+    log("error", "Failed to apply session limits; continuing without them:", error);
+  }
+  return 1;
+}
 
 /**
  * Create the connection pool, opening an SSH tunnel first when one is
@@ -98,6 +197,39 @@ const getPool = (): Promise<mysql2.Pool> => {
         : config.mysql;
 
       const pool = mysql2.createPool(mysqlConfig as mysql2.PoolOptions);
+
+      // Prime every new physical connection with the read limits.
+      //
+      // mysql2 emits `connection` before it hands the connection to whoever
+      // asked for it, and commands run in the order they were queued, so this
+      // SET is already done by the time the first query on that connection
+      // runs. Paying for it here rather than per query is what keeps an
+      // ordinary read at three round trips: start the transaction, run the
+      // query, roll back. The cost lands inside connection setup, which is
+      // several round trips of TCP, SSH, and MySQL handshake already.
+      //
+      // The event carries the callback-style connection, not the promise
+      // wrapper the rest of this file uses, so the query is issued in that
+      // style.
+      pool.on("connection", (connection) => {
+        const carrier = limitCarrier(connection);
+        const raw = connection as unknown as {
+          query(sql: string, callback: (error: unknown) => void): void;
+        };
+        // Marked before the response arrives, not in the callback. The pool
+        // hands the connection to its first caller immediately, so a marker
+        // written on completion would still be unset when that caller checks
+        // it — and the caller would queue a second, identical SET. Queued is
+        // the state that matters here: commands run in order, so anything sent
+        // afterwards already sees these limits.
+        carrier[SESSION_LIMITS] = READ_LIMITS;
+        raw.query(limitsStatement(READ_LIMITS), (error: unknown) => {
+          if (!error) return;
+          log("error", "Failed to prime session limits on a new connection:", error);
+          delete carrier[SESSION_LIMITS];
+        });
+      });
+
       log(
         "info",
         `MySQL pool created successfully (profile: ${PROFILE_LABEL}` +
@@ -145,12 +277,26 @@ function profileBanner(): string {
   return `[${parts.join(" | ")}]`;
 }
 
+/**
+ * The catalog's path to the database. Shares the pool with the read path, and
+ * therefore has to correct the session limits at both ends.
+ *
+ * Lifting the row cap before the query is the part that matters: a truncated
+ * `information_schema` scan produces a catalog that is quietly wrong rather
+ * than obviously broken, and nothing downstream can tell the difference.
+ * Restoring the read limits afterwards is what keeps that correction from
+ * costing the *next* user query a round trip. Both calls run off the response
+ * path — the inventory scan is a startup task and detail collection is
+ * scheduled in the background — so the two extra round trips are free where it
+ * counts.
+ */
 async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
   let connection;
   try {
     assertTunnelHealthy();
     const pool = await getPool();
     connection = await pool.getConnection();
+    await applySessionLimits(connection, CATALOG_LIMITS);
     const result = await connection.query(sql, params);
     return (Array.isArray(result) ? result[0] : result) as T;
   } catch (error) {
@@ -158,6 +304,14 @@ async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
     throw error;
   } finally {
     if (connection) {
+      try {
+        await applySessionLimits(connection, READ_LIMITS);
+      } catch (restoreError) {
+        // `applySessionLimits` already swallows query failures; this only
+        // catches something unexpected. The connection is released either way,
+        // and the marker it clears makes the next caller reconcile.
+        log("error", "Error restoring session limits:", restoreError);
+      }
       connection.release();
       log("error", "Connection released");
     }
@@ -294,7 +448,98 @@ async function executeWriteQuery<T>(sql: string): Promise<T> {
   }
 }
 
-async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
+/**
+ * Where the timeout diagnosis gets its index knowledge.
+ *
+ * Injected rather than imported: `src/catalog/collect.ts` already imports
+ * `executeQuery` from this module, and importing the catalog back would close
+ * the cycle. The diagnosis is also optional — with the catalog disabled the
+ * source stays null and every verdict falls through to "undetermined", which is
+ * the honest answer when nothing knows what is indexed.
+ */
+export interface QueryDiagnosticsSource {
+  indexFacts(reference: {
+    schema: string | null;
+    table: string;
+  }): CatalogIndexFacts | null;
+  redactsColumns(): boolean;
+}
+
+let diagnosticsSource: QueryDiagnosticsSource | null = null;
+
+function setQueryDiagnosticsSource(source: QueryDiagnosticsSource | null): void {
+  diagnosticsSource = source;
+}
+
+export interface ReadQueryOptions {
+  /** Server-side execution limit. Clamped to the configured range. */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Bring a requested timeout into the allowed range.
+ *
+ * Clamped rather than rejected. The bound exists to stop a query from running
+ * away, and a caller who asks for 100 seconds wants the longest run available,
+ * not an argument about it.
+ */
+function clampTimeoutSeconds(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested)) {
+    return MYSQL_DEFAULT_TIMEOUT_SECONDS;
+  }
+  return Math.min(Math.max(Math.floor(requested), 1), MYSQL_MAX_TIMEOUT_SECONDS);
+}
+
+/**
+ * Build the text that replaces a cancelled query's rows.
+ *
+ * The one EXPLAIN this server ever runs happens here, on the connection that
+ * just failed, and only after it failed. A plan fetched before every query
+ * would put a round trip on the healthy ones to spare the broken ones a
+ * timeout, which is the wrong way round: the cost belongs to the query that
+ * earned it.
+ *
+ * EXPLAIN does not execute the statement, so it cannot repeat the timeout. It
+ * does bypass the introspection guard, though — it is issued from inside this
+ * executor rather than sent by a caller — and plans carry the literals a query
+ * filtered on. Masking those is `renderTimeoutDiagnostic`'s job, and no plan
+ * reaches the response by any other route.
+ */
+async function diagnoseTimeout(
+  connection: mysql2.PoolConnection,
+  sql: string,
+  timeoutSeconds: number,
+): Promise<string> {
+  let plan: unknown | null = null;
+  try {
+    const explained = await connection.query(`EXPLAIN FORMAT=JSON ${sql}`);
+    plan = parseExplainPayload(Array.isArray(explained) ? explained[0] : explained);
+  } catch (error) {
+    log("error", "Could not EXPLAIN the timed-out query:", error);
+  }
+
+  const qualifiers = extractQualifiers(sql);
+  const source = diagnosticsSource;
+  return renderTimeoutDiagnostic({
+    timeoutSeconds,
+    maxTimeoutSeconds: MYSQL_MAX_TIMEOUT_SECONDS,
+    plan,
+    qualifiers,
+    // EXPLAIN names the alias where the query used one, so a plan table is
+    // resolved through the same qualifier map the conditions were read with.
+    lookupIndexes: (name) => {
+      if (!source) return null;
+      const resolved = qualifiers.get(name.toLowerCase());
+      return source.indexFacts(resolved ?? { schema: null, table: name });
+    },
+    indexListMayOmitColumns: source?.redactsColumns() ?? false,
+  });
+}
+
+async function executeReadOnlyQuery<T>(
+  sql: string,
+  options: ReadQueryOptions = {},
+): Promise<T> {
   let connection;
   try {
     assertTunnelHealthy();
@@ -519,15 +764,26 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
     connection = await pool.getConnection();
     log("error", "Read-only connection acquired");
 
-    // Set read-only mode (unless disabled via environment variable)
+    // Round trips are counted, not estimated, because the budget is the whole
+    // reason this path looks the way it does. Every hop crosses the SSH tunnel
+    // at roughly 160 ms, so the three below are most of what a fast query costs.
+    const timeoutSeconds = clampTimeoutSeconds(options.timeoutSeconds);
+    let roundTrips = await applySessionLimits(connection, {
+      maxExecutionTimeMs: timeoutSeconds * 1_000,
+      selectLimit: MAX_RESULT_ROWS + 1,
+    });
+
+    // One statement both opens the transaction and declares its access mode,
+    // where setting the session default and then beginning a transaction would
+    // take two. Scoping the mode to the transaction also means there is nothing
+    // to put back afterwards: the mode ends when the rollback does.
     if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
-      await connection.query("SET SESSION TRANSACTION READ ONLY");
+      await connection.query("START TRANSACTION READ ONLY");
     } else {
       log("info", "Read-only transactions disabled via MYSQL_DISABLE_READ_ONLY_TRANSACTIONS=true");
+      await connection.beginTransaction();
     }
-
-    // Begin transaction
-    await connection.beginTransaction();
+    roundTrips += 1;
 
     try {
       // Execute query - in multi-DB mode, we may need to handle USE statements specially
@@ -535,14 +791,25 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
       const result = await connection.query(sql);
       const endTime = performance.now();
       const duration = endTime - startTime;
-      const rows = Array.isArray(result) ? result[0] : result;
+      roundTrips += 1;
+      let rows: unknown = Array.isArray(result) ? result[0] : result;
 
       // Rollback transaction (since it's read-only)
       await connection.rollback();
+      roundTrips += 1;
+      log("info", `Read query completed in ${roundTrips} DB round trips`);
 
-      // Reset to read-write mode (only if we set it to read-only)
-      if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
-        await connection.query("SET SESSION TRANSACTION READ WRITE");
+      // Truncation is judged on the rows the server sent, before any filtering
+      // or redaction shortens the list. Counting a redacted result would make
+      // the warning depend on what was masked out of it.
+      //
+      // `sql_select_limit` bounds the transfer for a query that carries no
+      // LIMIT of its own; one carrying a larger LIMIT overrides the session
+      // variable entirely, so the same cut is applied here either way.
+      let truncated = false;
+      if (Array.isArray(rows) && rows.length > MAX_RESULT_ROWS) {
+        truncated = true;
+        rows = rows.slice(0, MAX_RESULT_ROWS);
       }
 
       // For introspection results we drop PII rows BEFORE the value-level
@@ -596,6 +863,21 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
             type: "text",
             text: JSON.stringify(payload, null, 2),
           },
+          // The warning goes in its own block, ahead of the timing line, so a
+          // partial result is never read as a whole one. Cutting quietly would
+          // let the model answer "there are 5000" about a table with more.
+          ...(truncated
+            ? [
+                {
+                  type: "text",
+                  text:
+                    `[TRUNCATED] Only the first ${MAX_RESULT_ROWS.toLocaleString("en-US")} rows are shown; ` +
+                    `the query matched more. This is NOT the complete result - do not count, sum, or ` +
+                    `conclude anything about totals from it. Add a narrower WHERE, an aggregate ` +
+                    `(COUNT/SUM/GROUP BY), or paginate with ORDER BY + LIMIT/OFFSET.`,
+                },
+              ]
+            : []),
           {
             type: "text",
             text: `Query execution time: ${duration.toFixed(2)} ms`,
@@ -607,18 +889,36 @@ async function executeReadOnlyQuery<T>(sql: string): Promise<T> {
       // Rollback transaction on query error
       log("error", "Error executing read-only query:", error);
       await connection.rollback();
+
+      // A statement MySQL cancelled for exceeding its limit is the one error
+      // this path answers instead of raising. The model is about to decide
+      // whether to retry, rewrite, or ask the user, and it can only do that
+      // from a plan — which it would otherwise fetch itself, at the cost of
+      // another round trip and, at worst, another run of the same query.
+      // Rollback above happens first, exactly as it does for any other failure.
+      if (isQueryTimeoutError(error)) {
+        const diagnostic = await diagnoseTimeout(connection, sql, timeoutSeconds);
+        log(
+          "info",
+          // The counter stopped before the statement that threw: add the
+          // cancelled query, the rollback, and the single diagnostic EXPLAIN.
+          `Read query cancelled at ${timeoutSeconds}s after ${roundTrips + 3} DB round trips (including one EXPLAIN)`,
+        );
+        return {
+          content: [{ type: "text", text: diagnostic }],
+          isError: true,
+        } as T;
+      }
       throw error;
     }
   } catch (error) {
-    // Ensure we rollback and reset transaction mode on any error
+    // Ensure we roll back on any error. There is no transaction mode to
+    // restore: `START TRANSACTION READ ONLY` scopes the access mode to the
+    // transaction the rollback just ended.
     log("error", "Error in read-only query transaction:", error);
     try {
       if (connection) {
         await connection.rollback();
-        // Reset to read-write mode (only if we set it to read-only)
-        if (!MYSQL_DISABLE_READ_ONLY_TRANSACTIONS) {
-          await connection.query("SET SESSION TRANSACTION READ WRITE");
-        }
       }
     } catch (cleanupError) {
       // Ignore errors during cleanup
@@ -641,5 +941,7 @@ export {
   getPool,
   executeWriteQuery,
   executeReadOnlyQuery,
+  setQueryDiagnosticsSource,
+  clampTimeoutSeconds,
   poolPromise,
 };

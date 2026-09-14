@@ -350,10 +350,58 @@ function findIntrospectionKind(node: unknown): IntrospectionKind | null {
   return null;
 }
 
+/** Table qualifier -> the table it names, for aliases and bare table names. */
+export type QualifierMap = Map<string, { schema: string | null; table: string }>;
+
+function isRecord(node: unknown): node is Record<string, unknown> {
+  return node != null && typeof node === "object" && !(node instanceof Date);
+}
+
+/**
+ * Map every table qualifier a query can use — alias first, table name as a
+ * fallback — to the table it stands for. Built from the same `from` entries
+ * node-sql-parser produces for `extractQueryConditions`, so the two agree on
+ * what `s.status` refers to.
+ */
+function extractQualifiers(sql: string): QualifierMap {
+  const map: QualifierMap = new Map();
+  let astOrArray: AST | AST[];
+  try {
+    astOrArray = parser.astify(stripExplainModifiers(sql), { database: "mysql" });
+  } catch {
+    return map;
+  }
+  const visit = (node: unknown): void => {
+    if (!isRecord(node)) return;
+    if (
+      node.type !== "column_ref" &&
+      typeof node.table === "string" &&
+      (typeof node.db === "string" || node.db === null)
+    ) {
+      const reference = {
+        schema: typeof node.db === "string" && node.db ? node.db : null,
+        table: node.table,
+      };
+      map.set(node.table.toLowerCase(), reference);
+      if (typeof node.as === "string" && node.as) {
+        map.set(node.as.toLowerCase(), reference);
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) for (const item of value) visit(item);
+      else visit(value);
+    }
+  };
+  visit(astOrArray);
+  return map;
+}
+
 export {
   extractSchemaFromQuery,
   getQueryTypes,
   containsSelectStar,
   findPIIColumnReferences,
   isIntrospectionQuery,
+  extractQualifiers,
+  stripExplainModifiers,
 };

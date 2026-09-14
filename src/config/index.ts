@@ -279,8 +279,87 @@ export const ALLOW_DDL_OPERATION = writeFlag("ALLOW_DDL_OPERATION");
 export const MULTI_DB_WRITE_MODE = writeFlag("MULTI_DB_WRITE_MODE");
 
 // Transaction mode control
-export const MYSQL_DISABLE_READ_ONLY_TRANSACTIONS = 
+export const MYSQL_DISABLE_READ_ONLY_TRANSACTIONS =
   process.env.MYSQL_DISABLE_READ_ONLY_TRANSACTIONS === "true";
+
+/**
+ * Read a positive integer environment variable, falling back to `fallback`
+ * when it is unset or not a usable number. Follows the same shape as
+ * `parseCatalogTtl`: report and continue, never throw. A server that refuses
+ * to start over a mistyped limit is worse than one that runs on the default.
+ */
+function parsePositiveInt(
+  name: string,
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1) {
+    console.error(
+      `[config] ignoring ${name}="${raw}": expected a positive integer; using ${fallback}.`,
+    );
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
+/**
+ * Server-side execution limit for a read query, in seconds.
+ *
+ * Every read runs under `max_execution_time`, so a query that cannot use an
+ * index is cancelled instead of holding the tool call open until the MCP
+ * client gives up. The default is short on purpose: this is an interactive
+ * tool and a person is waiting for the answer.
+ *
+ * `mysql_query` may raise the limit per call via `timeout_seconds`, but only up
+ * to `MYSQL_MAX_TIMEOUT_SECONDS`. The ceiling sits below the default tool
+ * timeout of every MCP client we target, so the server is always the one that
+ * reports the failure — a client giving up first would leave the model with no
+ * diagnosis at all.
+ */
+export const MYSQL_MAX_TIMEOUT_SECONDS = parsePositiveInt(
+  "MYSQL_MAX_TIMEOUT_SECONDS",
+  process.env.MYSQL_MAX_TIMEOUT_SECONDS,
+  30,
+);
+
+/**
+ * Default when the caller passes no `timeout_seconds`. Clamped to the ceiling
+ * so lowering `MYSQL_MAX_TIMEOUT_SECONDS` below 10 lowers the default with it,
+ * rather than leaving a default no call could ever request.
+ */
+export const MYSQL_DEFAULT_TIMEOUT_SECONDS = Math.min(
+  10,
+  MYSQL_MAX_TIMEOUT_SECONDS,
+);
+
+/**
+ * Time limit for the catalog's own `information_schema` reads.
+ *
+ * Separate from the user-facing limit because the two have different shapes: a
+ * user query is interactive and should fail fast, while an inventory scan runs
+ * in the background, touches every declared schema at once, and is worth
+ * waiting longer for. The row cap is *not* shared — see `MAX_RESULT_ROWS`.
+ */
+export const MYSQL_CATALOG_TIMEOUT_SECONDS = parsePositiveInt(
+  "MYSQL_CATALOG_TIMEOUT_SECONDS",
+  process.env.MYSQL_CATALOG_TIMEOUT_SECONDS,
+  60,
+);
+
+/**
+ * Largest result a read query may return to the model.
+ *
+ * Not configurable. The number exists to protect the model's context window,
+ * which is a property of the client rather than of this database, so an
+ * operator turning it up per environment would be tuning the wrong knob. The
+ * session runs with `sql_select_limit = MAX_RESULT_ROWS + 1` so that one extra
+ * row proves truncation happened; a query carrying its own larger LIMIT
+ * overrides `sql_select_limit` entirely, and is cut to the same size on the
+ * way out.
+ */
+export const MAX_RESULT_ROWS = 5000;
 
 // PII redaction: when enabled, read-only query results are walked and
 // sensitive values are partially masked before being returned to the client.

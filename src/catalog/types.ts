@@ -105,6 +105,24 @@ export interface CatalogTableMeta {
   docReviewed: boolean;
 }
 
+/**
+ * What the timeout diagnosis needs to know about one table, and nothing more.
+ *
+ * `detailScannedAt` and `detailStale` are carried because the diagnosis is only
+ * allowed to say "no index covers this column" when the index list is known to
+ * be both present and current. An unscanned or stale table must downgrade the
+ * verdict instead of asserting an absence it cannot see.
+ */
+export interface CatalogIndexFacts {
+  schema: string;
+  table: string;
+  indexes: CatalogIndex[];
+  pk: string[];
+  rowsEstimate: number | null;
+  detailScannedAt: string | null;
+  detailStale: boolean;
+}
+
 export interface CatalogSchema {
   app: string;
   description?: string;
