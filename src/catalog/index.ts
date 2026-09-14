@@ -148,9 +148,10 @@ export class SchemaCatalog {
     );
   }
 
-  toolDescriptionSuffix(): string {
+  /** `budget` is the character room the base description left for this tail. */
+  toolDescriptionSuffix(budget: number): string {
     if (!this.isEnabled()) return "";
-    return renderToolDescriptionSuffix(this.store.snapshot());
+    return renderToolDescriptionSuffix(this.store.snapshot(), budget);
   }
 
   /**
