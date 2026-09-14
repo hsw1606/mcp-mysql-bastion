@@ -5,7 +5,6 @@ import type { CatalogFile, CatalogJoin, CatalogTable } from "./types.js";
 // than emitted whole. describe and docs_list give the per-table detail.
 const UNLINKED_SAMPLE_LIMIT = 30;
 const HOT_TABLE_LIMIT = 10;
-const TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES = 2 * 1024;
 
 function sampled(values: string[]): {
   total: number;
@@ -71,43 +70,56 @@ function allTables(catalog: CatalogFile): RankedTable[] {
   );
 }
 
-export function renderToolDescriptionSuffix(catalog: CatalogFile): string {
+/**
+ * The tail of the `mysql_query` tool description, built to fit `budget`
+ * characters.
+ *
+ * The budget is what the base description left over, because a client that
+ * caps tool descriptions cuts from the end and says nothing — so overflowing
+ * here does not lose the least important text, it loses whatever happens to be
+ * last. Counting characters rather than bytes is what the cap is stated in;
+ * measuring this Korean guidance in UTF-8 bytes would price it at three times
+ * what it costs.
+ *
+ * Guidance outranks the table list: one is an instruction, the other is a
+ * starting hint that `mysql_catalog map` gives in full anyway.
+ */
+export function renderToolDescriptionSuffix(
+  catalog: CatalogFile,
+  budget: number,
+): string {
   const staticGuidance =
     "\n\n테이블의 도메인 규칙·상태 코드 문서가 있을 수 있다. " +
     "SQL을 쓰기 전에 mysql_catalog describe로 확인하라.";
+  if (staticGuidance.length > budget) return "";
+
   // Only tables a query has actually read. Seeding this from row estimates
   // filled all ten slots with the largest event and log tables — the opposite
   // of where a model should start — and that went into the tool description of
   // every session. No list is better guidance than a wrong one.
+  //
+  // Names only. The read count and date that used to follow each name ranked
+  // the list, and the list is already in that order; spelling the ranking out
+  // cost about 55 characters a table for something the order says. `map`
+  // still reports both for anyone who wants to see the ranking itself.
   const hot = rankTables(
     allTables(catalog).filter(({ entry }) => entry.usage.successCount > 0),
   )
     .slice(0, HOT_TABLE_LIMIT)
-    .map(({ app, schema, table, entry }) => {
-      const reads = entry.usage.successCount;
-      const signal =
-        `${reads} successful ${reads === 1 ? "query" : "queries"}` +
-        (entry.usage.lastUsedAt
-          ? `, last ${entry.usage.lastUsedAt.slice(0, 10)}`
-          : "");
-      return `\n  - ${app} -> ${schema}.${table} (${signal})`;
-    });
+    .map(({ schema, table }) => `${schema}.${table}`);
   if (hot.length === 0) return staticGuidance;
 
-  const heading =
-    "\n\nCATALOG HOT TABLES (most successful queries first, " +
-    "recency breaks ties):";
-  let suffix = heading;
-  for (const line of hot) {
-    if (
-      Buffer.byteLength(suffix + line + staticGuidance, "utf8") >
-      TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES
-    ) {
-      break;
-    }
-    suffix += line;
+  const heading = "\n\nCATALOG HOT TABLES (most read first): ";
+  let listed = "";
+  for (const name of hot) {
+    const next = listed ? `${listed}, ${name}` : name;
+    if ((heading + next + staticGuidance).length > budget) break;
+    listed = next;
   }
-  return suffix + staticGuidance;
+  // A heading with nothing under it is noise, and it is the case where even
+  // the first name did not fit.
+  if (!listed) return staticGuidance;
+  return heading + listed + staticGuidance;
 }
 
 export function renderMap(catalog: CatalogFile, warning: string | null = null): string {

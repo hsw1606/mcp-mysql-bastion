@@ -74,6 +74,11 @@ log("info", `Starting MySQL MCP server v${version}...`);
 // npm_package_version is only set when launched through an npm script; the MCP
 // clients exec dist/index.js directly, so fall back to the compiled version.
 const toolVersion = `MySQL MCP Server [v${process.env.npm_package_version ?? version}]`;
+
+// Characters a client keeps of a tool description. Claude Code's number; it is
+// not negotiated over the protocol and nothing reports it back, so the smallest
+// cap we know of is the one to build against.
+const TOOL_DESCRIPTION_LIMIT = 2048;
 let baseToolDescription = `[${toolVersion}] Run SQL queries against the ${PROFILE_LABEL} MySQL database`;
 
 // Name the environment first, before any capability text. A tool description is
@@ -140,12 +145,14 @@ if (
 // written, and the model only gets to read this before it writes one. Learning
 // about the row cap from a truncation warning means the query has already been
 // asked the wrong way.
+//
+// What a cancelled query should do next is not here, though: the abort report
+// says it, the `timeout_seconds` argument says it, and neither costs this
+// budget. Only what changes how the query is *written* earns a place.
 baseToolDescription +=
   `\n\nLIMITS: every read is cancelled after ${MYSQL_DEFAULT_TIMEOUT_SECONDS}s ` +
   `(raise per call with timeout_seconds, up to ${MYSQL_MAX_TIMEOUT_SECONDS}) and returns at most ` +
-  `${MAX_RESPONSE_ROWS.toLocaleString("en-US")} rows. Aggregate in SQL rather than pulling rows to count them. ` +
-  `A cancelled query comes back with its execution plan already attached — read that ` +
-  `instead of running EXPLAIN yourself, and do not retry the same statement unchanged.`;
+  `${MAX_RESPONSE_ROWS.toLocaleString("en-US")} rows. Aggregate in SQL rather than pulling rows to count them.`;
 
 if (CODE_BRANCH) {
   baseToolDescription +=
@@ -442,8 +449,27 @@ export default function createMcpServer() {
     redactsColumns: () => catalog.redactsColumns(),
   });
 
+  // Clients cap tool descriptions and cut from the end without telling anyone:
+  // Claude Code keeps 2048 characters. Nothing here can read that number back,
+  // so the two halves of the description have to be budgeted against it on our
+  // side — otherwise the hot-table list, which grows as queries succeed, walks
+  // a profile over the cap weeks after the text was written. The base is
+  // authoritative and fixed at startup; the catalog tail gets what is left.
+  if (baseToolDescription.length > TOOL_DESCRIPTION_LIMIT) {
+    // Not routed through `log`: a description that no longer fits is a
+    // configuration fault, not diagnostics, and the profiles that hit it are
+    // the ones running with ENABLE_LOGGING off.
+    console.error(
+      `[warn] tool description is ${baseToolDescription.length} characters before the ` +
+        `catalog tail; clients keep ${TOOL_DESCRIPTION_LIMIT} and silently drop the rest. ` +
+        `Shorten MYSQL_APP_SCHEMAS descriptions, or the text in index.ts.`,
+    );
+  }
   const mysqlQueryDescription = (): string =>
-    baseToolDescription + catalog.toolDescriptionSuffix();
+    baseToolDescription +
+    catalog.toolDescriptionSuffix(
+      TOOL_DESCRIPTION_LIMIT - baseToolDescription.length,
+    );
   const loadResourceTables = async (): Promise<TableRow[]> => {
     if (catalog.isEnabled()) {
       try {
