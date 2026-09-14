@@ -12,6 +12,7 @@ import {
 } from "./render.js";
 import { CatalogStore } from "./store.js";
 import type {
+  CatalogIndexFacts,
   CatalogOptions,
   CatalogForgetScope,
   PreparedCatalogQuery,
@@ -672,6 +673,36 @@ export class SchemaCatalog {
     return notices.join("\n\n") || null;
   }
 
+  /**
+   * Index facts for one table, or null when the catalog cannot vouch for them.
+   *
+   * Synchronous and side-effect free by design. The only caller is the timeout
+   * diagnosis, which runs after a query has already been cancelled: collecting
+   * metadata there would add the round trip the whole feature exists to avoid,
+   * and would make a failing query slower still. A table the catalog has not
+   * scanned simply yields null, and the diagnosis says so rather than guessing.
+   */
+  indexFacts(reference: TableReference): CatalogIndexFacts | null {
+    if (!this.isEnabled()) return null;
+    const resolved = this.resolveTable(
+      reference.schema ? `${reference.schema}.${reference.table}` : reference.table,
+    );
+    if (!resolved) return null;
+    return this.store.tableIndexes(resolved.schema, resolved.table);
+  }
+
+  /**
+   * Whether PII redaction is filtering what the catalog records.
+   *
+   * When it is, an index on a redacted column is dropped at collection time, so
+   * a column missing from a stored index list may still be indexed in the
+   * database. Anything presenting those lists has to say so, or absence reads
+   * as fact.
+   */
+  redactsColumns(): boolean {
+    return this.options.piiRedactionEnabled;
+  }
+
   async listTables(): Promise<TableRow[]> {
     if (!this.isEnabled()) return [];
     if (this.collector.inventoryNeedsRefresh()) {
@@ -956,6 +987,7 @@ export class SchemaCatalog {
 
 export type {
   CatalogForgetScope,
+  CatalogIndexFacts,
   CatalogOptions,
   TableReference,
 } from "./types.js";

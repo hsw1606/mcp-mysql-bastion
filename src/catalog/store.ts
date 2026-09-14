@@ -4,6 +4,7 @@ import type {
   CatalogCurated,
   CatalogDocs,
   CatalogFile,
+  CatalogIndexFacts,
   CatalogJoin,
   CatalogOptions,
   CatalogSchema,
@@ -642,6 +643,28 @@ export class CatalogStore {
       detailScannedAt: entry.detailScannedAt,
       detailStale: entry.detailStale === true,
       docReviewed: Object.prototype.hasOwnProperty.call(entry.curated, "doc"),
+    };
+  }
+
+  /**
+   * Index shape for one table, copied without cloning the catalog. Same reason
+   * `tableMeta` exists: the timeout diagnosis runs on an error path that must
+   * not pay for a full snapshot, and it needs a handful of fields.
+   */
+  tableIndexes(schema: string, table: string): CatalogIndexFacts | null {
+    const entry = this.data.schemas[schema]?.tables[table];
+    if (!entry) return null;
+    return {
+      schema,
+      table,
+      indexes: entry.indexes.map((index) => ({
+        ...index,
+        columns: [...index.columns],
+      })),
+      pk: [...entry.pk],
+      rowsEstimate: entry.rowsEstimate,
+      detailScannedAt: entry.detailScannedAt,
+      detailStale: entry.detailStale === true,
     };
   }
 

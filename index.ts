@@ -36,6 +36,9 @@ import {
   MYSQL_CATALOG_PATH,
   MYSQL_CATALOG_TTL_HOURS,
   MYSQL_DOCS_REPO,
+  MYSQL_DEFAULT_TIMEOUT_SECONDS,
+  MYSQL_MAX_TIMEOUT_SECONDS,
+  MAX_RESULT_ROWS,
 } from "./src/config/index.js";
 import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
 import {
@@ -48,6 +51,8 @@ import {
   getPool,
   executeQuery,
   executeReadOnlyQuery,
+  setQueryDiagnosticsSource,
+  clampTimeoutSeconds,
   poolPromise,
   profileBanner,
 } from "./src/db/index.js";
@@ -130,6 +135,17 @@ if (
 // description is read before the first call; anything it does not say has to be
 // found with a query, and `SHOW DATABASES` followed by guesswork is both slow
 // and easy to get wrong.
+
+// Both limits are stated up front because both change how a query should be
+// written, and the model only gets to read this before it writes one. Learning
+// about the row cap from a truncation warning means the query has already been
+// asked the wrong way.
+baseToolDescription +=
+  `\n\nLIMITS: every read is cancelled after ${MYSQL_DEFAULT_TIMEOUT_SECONDS}s ` +
+  `(raise per call with timeout_seconds, up to ${MYSQL_MAX_TIMEOUT_SECONDS}) and returns at most ` +
+  `${MAX_RESULT_ROWS.toLocaleString("en-US")} rows. Aggregate in SQL rather than pulling rows to count them. ` +
+  `A cancelled query comes back with its execution plan already attached — read that ` +
+  `instead of running EXPLAIN yourself, and do not retry the same statement unchanged.`;
 
 if (CODE_BRANCH) {
   baseToolDescription +=
@@ -279,6 +295,35 @@ const mysqlCatalogTool = {
   },
 };
 
+/**
+ * Declared once and shared by both registrations of `mysql_query`.
+ *
+ * The tool is announced twice — in the server's `capabilities` and again from
+ * the `tools/list` handler — and clients differ in which one they read. Two
+ * copies of the same literal is one edit away from a client that cannot see an
+ * argument the other client can.
+ */
+const mysqlQueryInputSchema = {
+  type: "object" as const,
+  properties: {
+    sql: {
+      type: "string",
+      description: "The SQL query to execute",
+    },
+    timeout_seconds: {
+      type: "integer",
+      minimum: 1,
+      maximum: MYSQL_MAX_TIMEOUT_SECONDS,
+      description:
+        `Server-side execution limit in seconds (default ${MYSQL_DEFAULT_TIMEOUT_SECONDS}, ` +
+        `maximum ${MYSQL_MAX_TIMEOUT_SECONDS}; out-of-range values are clamped). ` +
+        `Raise it only when a cancelled query's plan looked sound and the query was merely slow. ` +
+        `A query the plan shows scanning a whole table does not finish sooner with more time.`,
+    },
+  },
+  required: ["sql"],
+};
+
 // @INFO: Add debug logging for configuration
 log(
   "info",
@@ -389,6 +434,14 @@ export default function createMcpServer() {
       ENABLE_PII_REDACTION &&
       isPIIColumn(column, piiColumnList, PII_EXTRA_COLUMN_PATTERNS),
   });
+  // The read path asks the catalog what is indexed only when a query has
+  // already been cancelled. Handing it the catalog here, rather than importing
+  // one from the other, keeps `src/catalog` -> `src/db` the single direction.
+  setQueryDiagnosticsSource({
+    indexFacts: (reference) => catalog.indexFacts(reference),
+    redactsColumns: () => catalog.redactsColumns(),
+  });
+
   const mysqlQueryDescription = (): string =>
     baseToolDescription + catalog.toolDescriptionSuffix();
   const loadResourceTables = async (): Promise<TableRow[]> => {
@@ -436,16 +489,7 @@ export default function createMcpServer() {
           ...(catalog.isEnabled() ? { listChanged: true } : {}),
           mysql_query: {
             description: mysqlQueryDescription(),
-            inputSchema: {
-              type: "object",
-              properties: {
-                sql: {
-                  type: "string",
-                  description: "The SQL query to execute",
-                },
-              },
-              required: ["sql"],
-            },
+            inputSchema: mysqlQueryInputSchema,
             annotations: {
               readOnlyHint: isReadOnly,
               idempotentHint: isReadOnly,
@@ -784,13 +828,21 @@ export default function createMcpServer() {
       }
 
       const sql = request.params.arguments?.sql as string;
+      // Clamped rather than validated: the argument bounds a runaway query, and
+      // refusing a call over an out-of-range number would cost the user a round
+      // trip to learn a limit the schema already states.
+      const timeoutSeconds = clampTimeoutSeconds(
+        typeof request.params.arguments?.timeout_seconds === "number"
+          ? (request.params.arguments.timeout_seconds as number)
+          : undefined,
+      );
       const references = catalog.prepareQuery(sql);
       let result: {
         content: Array<{ type: string; text: string }>;
         isError?: boolean;
       };
       try {
-        result = await executeReadOnlyQuery(sql);
+        result = await executeReadOnlyQuery(sql, { timeoutSeconds });
       } catch (error) {
         catalog.afterQuery(references, { content: [], isError: true }, error);
         throw error;
@@ -834,16 +886,7 @@ export default function createMcpServer() {
         {
           name: "mysql_query",
           description: mysqlQueryDescription(),
-          inputSchema: {
-            type: "object",
-            properties: {
-              sql: {
-                type: "string",
-                description: "The SQL query to execute",
-              },
-            },
-            required: ["sql"],
-          },
+          inputSchema: mysqlQueryInputSchema,
           annotations: {
             readOnlyHint: isReadOnly,
             idempotentHint: isReadOnly,
