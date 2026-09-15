@@ -42,6 +42,10 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const PROBE_TIMEOUT_MS = 750;
 const SSH_READY_TIMEOUT_MS = 20000;
 
+// FIXME: AGENTS.md는 환경 변수를 src/config/index.ts에서만 읽으라고 못박는데,
+// 이 모듈은 MYSQL_SSH_* 를 직접 읽는다 — SSH_ENABLED, SSH_REUSE_EXISTING,
+// 그리고 아래 optionalEnv()를 거치는 나머지 전부. config로 옮기고 여기서는
+// 상수를 import한다.
 export const SSH_ENABLED = process.env.MYSQL_SSH_ENABLED === "true";
 
 /**
