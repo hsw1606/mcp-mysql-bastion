@@ -482,7 +482,16 @@ export default function createMcpServer() {
       }
     }
     // This is the compatibility path for a disabled or still-empty catalog.
-    const queryResult = await executeReadOnlyQuery<any>(`
+    //
+    // `executeQuery`, because the server is asking on its own behalf. The read
+    // path answers a model: it caps rows, it hands back MCP content blocks
+    // instead of rows, and it resolves rather than throws when a guard trips or
+    // the statement is cancelled — none of which a caller that wants a table
+    // list can use. It also rejects `information_schema` outright under PII
+    // redaction, which would leave this listing permanently broken on exactly
+    // the profiles that enable it. This is the same instance-wide scan the
+    // catalog runs, and it runs under the same limits.
+    return await executeQuery<TableRow[]>(`
       SELECT
         table_name as name,
         table_schema as \`database\`,
@@ -499,7 +508,6 @@ export default function createMcpServer() {
       ORDER BY
         table_schema, table_name
     `);
-    return JSON.parse(queryResult.content[0].text) as TableRow[];
   };
 
   // Create the server instance
@@ -697,6 +705,9 @@ export default function createMcpServer() {
         queryParams.push(dbName);
       }
 
+      // `executeQuery` because the caller here is the server, not a model: it
+      // needs the rows themselves, and it applies the PII column filter just
+      // below rather than inheriting the read path's.
       const results = (await executeQuery(
         columnsQuery,
         queryParams,

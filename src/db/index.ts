@@ -278,17 +278,30 @@ function profileBanner(): string {
 }
 
 /**
- * The catalog's path to the database. Shares the pool with the read path, and
- * therefore has to correct the session limits at both ends.
+ * The server's own path to the database, for statements it issues on its own
+ * behalf: the catalog's inventory and detail scans, and the resource handlers
+ * behind `mysql://tables`.
  *
- * Lifting the row cap before the query is the part that matters: a truncated
- * `information_schema` scan produces a catalog that is quietly wrong rather
- * than obviously broken, and nothing downstream can tell the difference.
- * Restoring the read limits afterwards is what keeps that correction from
- * costing the *next* user query a round trip. Both calls run off the response
- * path — the inventory scan is a startup task and detail collection is
- * scheduled in the background — so the two extra round trips are free where it
- * counts.
+ * Pick this one when the caller is code. It returns the rows themselves and
+ * throws on failure, which is what a caller that has to *use* the result
+ * needs, and it applies none of the policy that shapes an answer to a model —
+ * no redaction, no `SELECT *` refusal, no introspection guard, no read-only
+ * transaction. Those exist to constrain what a model may ask for; the server
+ * asking itself a question it wrote is not that.
+ *
+ * Pick `executeReadOnlyQuery` instead when the caller is a model. The split is
+ * *who is asking*, not what the statement looks like.
+ *
+ * Every caller runs under the catalog's limits, the resource handlers
+ * included: their statements are `information_schema` lookups issued by the
+ * server, which is what that budget is for.
+ *
+ * Both ends of the limit correction matter, because the pool is shared with
+ * the read path. Lifting the row cap before the query is the part that keeps
+ * results whole: a truncated `information_schema` scan produces a catalog that
+ * is quietly wrong rather than obviously broken, and nothing downstream can
+ * tell the difference. Restoring the read limits afterwards is what keeps that
+ * correction from costing the *next* user query a round trip.
  */
 async function executeQuery<T>(sql: string, params: string[] = []): Promise<T> {
   let connection;
@@ -536,6 +549,28 @@ async function diagnoseTimeout(
   });
 }
 
+/**
+ * The model's path to the database: everything reached through the
+ * `mysql_query` tool, and nothing else.
+ *
+ * Pick this one when a model wrote the statement. Almost everything it does
+ * beyond running the query follows from that — the PII chain (redaction, the
+ * `SELECT *` refusal, the redacted-column reference guard, the introspection
+ * guard), the response row cap, the interactive time budget, and the read-only
+ * transaction. None of it would make sense around a statement the server
+ * wrote for itself; use `executeQuery` for those.
+ *
+ * The return type follows from it too, and is the part most likely to surprise
+ * a new caller: this resolves with MCP content blocks, never rows. A refused
+ * query and a cancelled one both come back as `isError: true` content rather
+ * than a rejected promise, so a caller that only reads `content[0]` and parses
+ * it will mistake a diagnostic for data. That is the whole reason this is not
+ * the function the resource handlers call.
+ *
+ * A cancelled statement resolving instead of throwing is deliberate: the model
+ * is about to choose between retrying, rewriting, and asking the user, and it
+ * can only choose from a plan. See the timeout branch below.
+ */
 async function executeReadOnlyQuery<T>(
   sql: string,
   options: ReadQueryOptions = {},

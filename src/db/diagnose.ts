@@ -21,66 +21,8 @@ export interface PlanTable {
   accessType: string;
   rows: number | null;
   key: string | null;
-  /** `attached_condition` with every literal replaced by `?`. */
+  /** The plan's `attached_condition`, verbatim. */
   condition: string | null;
-}
-
-// Literal forms that can appear inside EXPLAIN's condition strings. Ordered so
-// the typed-blob forms are consumed before the plain-quoted rule, which would
-// otherwise leave the `X` / `b` prefix behind and eat only the quotes. That
-// exact miss is what let row identifiers survive an earlier literal stripper in
-// this repository, so the forms are listed explicitly rather than assumed.
-const LITERAL_PATTERNS: readonly RegExp[] = [
-  /[xX]'(?:[^']|'')*'/g,
-  /[bB]'[01]*'/g,
-  /\b0[xX][0-9a-fA-F]+\b/g,
-  /'(?:[^'\\]|\\.|'')*'/g,
-  /"(?:[^"\\]|\\.|"")*"/g,
-  /\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g,
-];
-
-/**
- * Replace every literal in an EXPLAIN condition with `?`.
- *
- * EXPLAIN inlines the values a query filtered on — `` (`haulla`.`account`.`status`
- * = '300') `` — and those values are row identifiers. Identifiers in the plan are
- * backtick-quoted, so masking quotes and bare numbers leaves the column names
- * intact.
- *
- * The masker is not trusted on its own. If any quote survives, the whole string
- * is dropped: a condition we could not fully mask is worth less than the
- * certainty that no value escaped in it.
- */
-export function maskLiterals(value: string): string {
-  let masked = value;
-  for (const pattern of LITERAL_PATTERNS) masked = masked.replace(pattern, "?");
-  if (masked.includes("'") || masked.includes('"')) return "<condition omitted>";
-  return masked;
-}
-
-// Plan keys whose values are built from the statement's literals. Everything
-// else in a plan is structure, cost, or identifiers.
-const CONDITION_KEYS = new Set([
-  "attached_condition",
-  "index_condition",
-  "pushed_index_condition",
-  "having_condition",
-  "message",
-  "recursive_message",
-]);
-
-/** Deep copy of a plan with every condition string masked. */
-function maskPlan(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map((item) => maskPlan(item));
-  if (node == null || typeof node !== "object") return node;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    out[key] =
-      CONDITION_KEYS.has(key) && typeof value === "string"
-        ? maskLiterals(value)
-        : maskPlan(value);
-  }
-  return out;
 }
 
 function readRows(node: Record<string, unknown>): number | null {
@@ -121,7 +63,7 @@ export function collectPlanTables(node: unknown): PlanTable[] {
         key: typeof obj.key === "string" ? obj.key : null,
         condition:
           typeof obj.attached_condition === "string" && obj.attached_condition
-            ? maskLiterals(obj.attached_condition)
+            ? obj.attached_condition
             : null,
       });
     }
@@ -242,7 +184,7 @@ function renderIndexSection(input: DiagnosisInput, tables: PlanTable[]): string[
  *
  * What stays is only what the model cannot get for itself here: that EXPLAIN
  * has already run (so it does not run it again, or retry the statement), the
- * plan with its literals masked, the catalog's index lists, the one non-obvious
+ * plan itself, the catalog's index lists, the one non-obvious
  * rule for reading `access_type`, and the bounds on retrying.
  *
  * Written in English to sit alongside the other refusals this executor returns.
@@ -273,7 +215,7 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
   );
 
   if (tables.length > 0) {
-    lines.push("[PLAN BY TABLE] in join order. Literals are masked.");
+    lines.push("[PLAN BY TABLE] in join order.");
     tables.forEach((table, i) => {
       lines.push(
         `  ${i + 1}. ${table.name} - access: ${table.accessType}, rows: ${formatRows(table.rows)}, key: ${table.key ?? "none"}`,
@@ -302,9 +244,9 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
     );
   }
 
-  const planJson = JSON.stringify(maskPlan(input.plan), null, 2);
+  const planJson = JSON.stringify(input.plan, null, 2);
   if (planJson.length <= MAX_PLAN_JSON_CHARS) {
-    lines.push("[FULL PLAN] literals masked:", planJson, "");
+    lines.push("[FULL PLAN]:", planJson, "");
   } else {
     lines.push(
       `[FULL PLAN] omitted: ${planJson.length.toLocaleString("en-US")} characters, too large to include.`,
