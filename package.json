@@ -12,6 +12,8 @@
   "scripts": {
     "build": "tsc && shx chmod +x dist/index.js",
     "watch": "tsc --watch",
+    "test": "tsc -p tsconfig.test.json && vitest run",
+    "test:watch": "vitest",
     "start:stage": "./bin/mcp-mysql-stage.sh",
     "start:prod": "./bin/mcp-mysql-prod.sh"
   },
@@ -23,9 +25,10 @@
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
-    "@types/node": "^20.17.50",
+    "@types/node": "^22.20.2",
     "@types/ssh2": "^1.15.5",
     "shx": "^0.3.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^5.0.0"
   }
 }
