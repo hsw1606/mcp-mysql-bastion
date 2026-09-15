@@ -114,7 +114,9 @@ npm run start:prod     # bin/mcp-mysql-prod.sh
   `MYSQL_MAX_RESPONSE_ROWS`로 바꿨다. 이름이 오해를 부르면 이름을 고친다
 - MUST 설정 오류 하나로 서버를 죽이지 않는다. `MYSQL_APP_SCHEMAS`의 잘못된 항목,
   깨진 catalog 파일처럼 **한 조각의 실패는 알리고 건너뛴다**. 서버 자체를 못 쓰게
-  만드는 실패(읽을 수 없는 `MYSQL_ENV_FILE`)만 던진다
+  만드는 실패만 던진다 — 읽을 수 없는 `MYSQL_ENV_FILE`, 그리고 `MYSQL_SSL_CA`·
+  `MYSQL_SSL_CERT`·`MYSQL_SSL_KEY`가 가리키는 파일이다. 뒤의 셋은 `readSSLFile`이
+  모듈 스코프에서 던진다. 인증서 없이 붙는 것보다 기동을 멈추는 쪽이 낫기 때문이다
 - MUST `index.ts`는 MCP 배선(tool·resource handler 등록, 종료 처리)에 머무르고,
   판단하는 로직은 `src/` 아래 모듈에 둔다 — 테스트가 부를 수 있는 자리에 두라는 뜻이다
 - MUST 문서·주석·PR 본문의 수치는 **실측값**으로 맞춘다. 한 곳을 고치면 같은 수치가

@@ -324,9 +324,13 @@ const mysqlQueryInputSchema = {
 
 // @INFO: 설정값을 디버그 로그로 남긴다
 // FIXME: 아래 MYSQL_SOCKET_PATH/HOST/PORT/SSL* 는 config가 이미 읽어
-// mcpConfig.mysql로 만들어 둔 값의 두 번째 사본이다. 두 곳이 어긋나면 로그가
-// 실제 접속과 다른 것을 말한다. mcpConfig에서 받아 쓰도록 바꾼다
+// mcpConfig.mysql로 만들어 둔 값의 두 번째 사본이다. 사본은 이미 어긋나 있다 —
+// ListResources 쪽 사본(아래 FIXME)은 MYSQL_HOST 기본값을 "localhost"로 두는데
+// config와 README는 127.0.0.1이다. mcpConfig에서 받아 쓰도록 바꾼다
 // (AGENTS.md의 "환경 변수는 src/config/index.ts에서만 읽는다").
+// 다만 mcpConfig.mysql만 봐서는 부족하다. MYSQL_SSH_ENABLED=true면 src/db/index.ts의
+// getPool이 socketPath를 버리고 터널 loopback 주소로 갈아끼우므로, mcpConfig의
+// host/port는 터널 이전의 bastion 쪽 주소다. 실제 접속 endpoint를 함께 봐야 한다.
 log(
   "info",
   "MySQL Configuration:",
@@ -532,7 +536,8 @@ export default function createMcpServer() {
     try {
       log("info", "Handling ListResourcesRequest");
       // FIXME: 위 설정 로그와 같은 문제 — MYSQL_SOCKET_PATH/HOST/PORT를 직접
-      // 읽는다. mcpConfig.mysql에서 받아 쓴다.
+      // 읽는다. 게다가 MYSQL_HOST 기본값이 "localhost"라 config·README의
+      // 127.0.0.1과 이미 어긋나 있다. 터널을 연 뒤의 실제 접속 endpoint를 받아 쓴다.
       const connectionInfo = process.env.MYSQL_SOCKET_PATH
         ? `socket: ${process.env.MYSQL_SOCKET_PATH}`
         : `host: ${process.env.MYSQL_HOST || "localhost"}, port: ${
