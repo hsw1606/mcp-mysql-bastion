@@ -1,0 +1,63 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "106858.12"
+    },
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "i",
+          "access_type": "ALL",
+          "possible_keys": [
+            "PRIMARY"
+          ],
+          "rows_examined_per_scan": 146632,
+          "rows_produced_per_join": 48872,
+          "filtered": "33.33",
+          "cost_info": {
+            "read_cost": "15388.20",
+            "eval_cost": "4887.24",
+            "prefix_cost": "20275.45",
+            "data_read_per_join": "862M"
+          },
+          "used_columns": [
+            "createdAt",
+            "id"
+          ],
+          "attached_condition": "(`haulla`.`i`.`createdAt` > TIMESTAMP'2024-01-01 00:00:00')"
+        }
+      },
+      {
+        "table": {
+          "table_name": "ii",
+          "access_type": "ref",
+          "possible_keys": [
+            "FK_553d5aac210d22fdca5c8d48ead"
+          ],
+          "key": "FK_553d5aac210d22fdca5c8d48ead",
+          "used_key_parts": [
+            "invoiceId"
+          ],
+          "key_length": "1023",
+          "ref": [
+            "haulla.i.id"
+          ],
+          "rows_examined_per_scan": 3,
+          "rows_produced_per_join": 194752,
+          "filtered": "100.00",
+          "using_index": true,
+          "cost_info": {
+            "read_cost": "67107.44",
+            "eval_cost": "19475.24",
+            "prefix_cost": "106858.12",
+            "data_read_per_join": "765M"
+          },
+          "used_columns": [
+            "invoiceId"
+          ]
+        }
+      }
+    ]
+  }
+}
