@@ -40,6 +40,41 @@ describe("clampTimeoutSeconds", () => {
     expect(clampTimeoutSeconds(Number.POSITIVE_INFINITY)).toBe(10);
   });
 
+  test("정수로 읽히는 문자열은 같은 값의 숫자와 똑같이 다룬다", async () => {
+    // maximum 30을 어기고 100을 보내는 그 클라이언트가 integer를 어기고 "30"을
+    // 보낸다. 문자열을 버리면 timeout을 올려 재시도하라는 안내가 무효가 된다.
+    const clampTimeoutSeconds = await clamp();
+    expect(clampTimeoutSeconds("30")).toBe(30);
+    expect(clampTimeoutSeconds(" 30 ")).toBe(30);
+  });
+
+  test("문자열도 숫자와 같은 규칙으로 버리고 클램프한다", async () => {
+    const clampTimeoutSeconds = await clamp();
+    expect(clampTimeoutSeconds("9.9")).toBe(9);
+    expect(clampTimeoutSeconds("100")).toBe(30);
+    expect(clampTimeoutSeconds("0")).toBe(1);
+    expect(clampTimeoutSeconds("-5")).toBe(1);
+  });
+
+  test("빈 문자열은 1초 요청이 아니라 기본값이다", async () => {
+    // Number("")도 Number("   ")도 0이다. 그대로 클램프하면 1초가 되는데,
+    // 아무것도 적지 않은 것을 가장 짧은 실행을 요청한 것으로 읽는 셈이다.
+    const clampTimeoutSeconds = await clamp();
+    expect(clampTimeoutSeconds("")).toBe(10);
+    expect(clampTimeoutSeconds("   ")).toBe(10);
+  });
+
+  test("읽을 수 없는 값은 거절하지 않고 기본값으로 떨어진다", async () => {
+    // Number(null)은 0, Number(true)는 1, Number([])도 0이다. 타입을 먼저
+    // 가르지 않으면 이 값들이 전부 짧은 timeout 요청으로 둔갑한다.
+    const clampTimeoutSeconds = await clamp();
+    expect(clampTimeoutSeconds("abc")).toBe(10);
+    expect(clampTimeoutSeconds(null)).toBe(10);
+    expect(clampTimeoutSeconds(true)).toBe(10);
+    expect(clampTimeoutSeconds({})).toBe(10);
+    expect(clampTimeoutSeconds([])).toBe(10);
+  });
+
   test("상한을 기본값 아래로 내리면 기본값도 같이 내려간다", async () => {
     // 아니면 어떤 호출도 요청할 수 없는 기본값이 남는다.
     vi.stubEnv("MYSQL_MAX_TIMEOUT_SECONDS", "5");

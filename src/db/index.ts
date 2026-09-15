@@ -459,12 +459,31 @@ export interface ReadQueryOptions {
  *
  * 거부하지 않고 조정한다. 이 한계는 쿼리가 폭주하는 것을 막으려고 있고, 100초를 요구하는
  * 호출자는 쓸 수 있는 가장 긴 실행을 원하는 것이지 그 문제로 다투자는 게 아니다.
+ *
+ * 같은 이유로 타입도 다투지 않는다. 스키마에 integer라고 적혀 있어도 "30"을 그대로 보내는
+ * 클라이언트가 있다. 그 값을 조용히 버리면 timeout을 올려 재시도하라는 안내가 영영 같은
+ * 보고서로 돌아오고, 호출자는 시간을 올렸다고 믿는다.
+ *
+ * 그렇다고 Number()에 바로 먹이지는 않는다. ""·"   "·null·false는 모두 0으로 읽혀서
+ * 1초를 요청한 것처럼 보인다. 먼저 타입을 가르고, 문자열은 trim 후 비어 있지 않을 때만 읽는다.
  */
-function clampTimeoutSeconds(requested: number | undefined): number {
-  if (requested === undefined || !Number.isFinite(requested)) {
+function clampTimeoutSeconds(requested: unknown): number {
+  let value: number;
+  if (typeof requested === "number") {
+    value = requested;
+  } else if (typeof requested === "string") {
+    const trimmed = requested.trim();
+    if (trimmed === "") {
+      return MYSQL_DEFAULT_TIMEOUT_SECONDS;
+    }
+    value = Number(trimmed);
+  } else {
     return MYSQL_DEFAULT_TIMEOUT_SECONDS;
   }
-  return Math.min(Math.max(Math.floor(requested), 1), MYSQL_MAX_TIMEOUT_SECONDS);
+  if (!Number.isFinite(value)) {
+    return MYSQL_DEFAULT_TIMEOUT_SECONDS;
+  }
+  return Math.min(Math.max(Math.floor(value), 1), MYSQL_MAX_TIMEOUT_SECONDS);
 }
 
 /**
