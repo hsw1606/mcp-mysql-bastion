@@ -467,8 +467,6 @@ export class CatalogStore {
     this.data = this.sanitizeLoaded(parsed as CatalogFile);
     this.invalidateNameIndex();
     this.baseData = structuredClone(this.data);
-    // Rewriting also removes PII columns left by a cache that was created
-    // before redaction was enabled for this profile.
     this.revision += 1;
     this.scheduleFlush();
     console.error(`[catalog] loaded ${this.options.filePath}`);
@@ -488,35 +486,19 @@ export class CatalogStore {
         const table: CatalogTable = {
           ...base,
           ...raw,
-          columns: (raw.columns ?? []).filter(
-            (column) => !this.options.isPIIColumn(column.name),
-          ),
-          pk: (raw.pk ?? []).filter(
-            (column) => !this.options.isPIIColumn(column),
-          ),
-          indexes: (raw.indexes ?? [])
-            .map((index) => ({
-              ...index,
-              columns: index.columns.filter(
-                (column) => !this.options.isPIIColumn(column),
-              ),
-            }))
-            .filter((index) => index.columns.length > 0),
-          fks: (raw.fks ?? []).filter(
-            (fk) =>
-              !this.options.isPIIColumn(fk.column) &&
-              !this.options.isPIIColumn(fk.referencedColumn),
-          ),
+          // `?? []` is load-bearing beyond defaulting: a catalog file written
+          // by an older build can be missing these keys entirely, and readers
+          // like `tableIndexes` iterate them unguarded.
+          columns: raw.columns ?? [],
+          pk: raw.pk ?? [],
+          indexes: raw.indexes ?? [],
+          fks: raw.fks ?? [],
           usage: {
             count: raw.usage?.count ?? 0,
             successCount: raw.usage?.successCount ?? raw.usage?.count ?? 0,
             failureCount: raw.usage?.failureCount ?? 0,
             lastUsedAt: raw.usage?.lastUsedAt ?? null,
-            columns: Object.fromEntries(
-              Object.entries(raw.usage?.columns ?? {}).filter(
-                ([column]) => !this.options.isPIIColumn(column),
-              ),
-            ),
+            columns: raw.usage?.columns ?? {},
           },
           curated: {
             notes: raw.curated?.notes ?? [],
@@ -541,14 +523,6 @@ export class CatalogStore {
     }
     fresh.joins = pruneJoins(
       (loaded.joins ?? [])
-        .filter((edge) => {
-          const aColumn = edge.a.slice(edge.a.lastIndexOf(".") + 1);
-          const bColumn = edge.b.slice(edge.b.lastIndexOf(".") + 1);
-          return (
-            !this.options.isPIIColumn(aColumn) &&
-            !this.options.isPIIColumn(bColumn)
-          );
-        })
         // A cache written before edges were stamped evicts first. It carries no
         // recency to compare, and the next query that walks the path re-stamps
         // whichever edges still matter.
@@ -738,8 +712,8 @@ export class CatalogStore {
       );
       tempPath = `${this.options.filePath}.${process.pid}.${Date.now()}.tmp`;
       const writingRevision = this.revision;
-      // Keep persistence as a second PII boundary. Collectors filter on input,
-      // but future catalog writers must not be able to bypass that policy.
+      // `sanitizeLoaded` also normalizes: it is what fills in keys a writer
+      // from an older build may have omitted.
       let toWrite = this.sanitizeLoaded(structuredClone(this.data));
       // The lock serializes writers. Always merge the latest file instead of
       // relying on mtime resolution to prove that no other process wrote it.

@@ -25,11 +25,6 @@ import {
   MYSQL_PROFILE,
   PROFILE_LABEL,
   IS_WRITE_FORBIDDEN_PROFILE,
-  ENABLE_PII_REDACTION,
-  PII_EXTRA_COLUMNS,
-  PII_EXTRA_COLUMN_PATTERNS,
-  PII_ALLOW_INTROSPECTION,
-  PII_BLOCK_INTROSPECTION,
   APP_SCHEMAS,
   CODE_BRANCH,
   MYSQL_CATALOG_ENABLED,
@@ -40,7 +35,6 @@ import {
   MYSQL_MAX_TIMEOUT_SECONDS,
   MAX_RESPONSE_ROWS,
 } from "./src/config/index.js";
-import { isPIIColumn, DEFAULT_PII_COLUMNS } from "./src/security/redact.js";
 import {
   catalogIdentity,
   SchemaCatalog,
@@ -395,36 +389,20 @@ export default function createMcpServer() {
     user: String(mysqlSettings.user ?? ""),
     customPath: MYSQL_CATALOG_PATH,
   });
-  const piiColumnList = [...DEFAULT_PII_COLUMNS, ...PII_EXTRA_COLUMNS];
-  // The catalog reads information_schema directly, so it bypasses the
-  // introspection guard inside executeReadOnlyQuery. PII_BLOCK_INTROSPECTION is
-  // documented as a hard block on every schema-introspection statement — the
-  // filterable ones included — so honouring it means switching the catalog off
-  // entirely rather than filtering what it stores. Otherwise the catalog would
-  // be a way to read back exactly what that flag refuses.
-  const introspectionHardBlocked =
-    ENABLE_PII_REDACTION && PII_BLOCK_INTROSPECTION && !PII_ALLOW_INTROSPECTION;
-  if (introspectionHardBlocked && MYSQL_CATALOG_ENABLED) {
-    console.error(
-      "[catalog] disabled: PII_BLOCK_INTROSPECTION forbids reading schema metadata. " +
-        "Set PII_ALLOW_INTROSPECTION=true to allow the catalog to collect it.",
-    );
-  }
   // MYSQL_APP_SCHEMAS is the declared scan range, and nothing outside it is
   // collected (D-1). With none declared the catalog has nothing to scan, so
   // leaving it on would advertise mysql_catalog and tell the model to call
   // describe, and then answer every call with an empty map or an error. Off is
   // the honest state.
   const noDeclaredSchemas = APP_SCHEMAS.length === 0;
-  if (noDeclaredSchemas && MYSQL_CATALOG_ENABLED && !introspectionHardBlocked) {
+  if (noDeclaredSchemas && MYSQL_CATALOG_ENABLED) {
     console.error(
       "[catalog] disabled: MYSQL_APP_SCHEMAS declares no schema, so there is " +
         "nothing to catalog. Declare the app -> schema map to enable it.",
     );
   }
   const catalog = new SchemaCatalog({
-    enabled:
-      MYSQL_CATALOG_ENABLED && !introspectionHardBlocked && !noDeclaredSchemas,
+    enabled: MYSQL_CATALOG_ENABLED && !noDeclaredSchemas,
     profile: MYSQL_PROFILE || "default",
     fingerprint: identity.fingerprint,
     filePath: identity.filePath,
@@ -436,17 +414,12 @@ export default function createMcpServer() {
       typeof mysqlSettings.database === "string"
         ? mysqlSettings.database
         : null,
-    piiRedactionEnabled: ENABLE_PII_REDACTION,
-    isPIIColumn: (column) =>
-      ENABLE_PII_REDACTION &&
-      isPIIColumn(column, piiColumnList, PII_EXTRA_COLUMN_PATTERNS),
   });
   // The read path asks the catalog what is indexed only when a query has
   // already been cancelled. Handing it the catalog here, rather than importing
   // one from the other, keeps `src/catalog` -> `src/db` the single direction.
   setQueryDiagnosticsSource({
     indexFacts: (reference) => catalog.indexFacts(reference),
-    redactsColumns: () => catalog.redactsColumns(),
   });
 
   // Clients cap tool descriptions and cut from the end without telling anyone:
@@ -485,12 +458,10 @@ export default function createMcpServer() {
     //
     // `executeQuery`, because the server is asking on its own behalf. The read
     // path answers a model: it caps rows, it hands back MCP content blocks
-    // instead of rows, and it resolves rather than throws when a guard trips or
-    // the statement is cancelled — none of which a caller that wants a table
-    // list can use. It also rejects `information_schema` outright under PII
-    // redaction, which would leave this listing permanently broken on exactly
-    // the profiles that enable it. This is the same instance-wide scan the
-    // catalog runs, and it runs under the same limits.
+    // instead of rows, and it resolves rather than throws when the statement is
+    // cancelled — none of which a caller that wants a table list can use. This
+    // is the same instance-wide scan the catalog runs, and it runs under the
+    // same limits.
     return await executeQuery<TableRow[]>(`
       SELECT
         table_name as name,
@@ -706,39 +677,19 @@ export default function createMcpServer() {
       }
 
       // `executeQuery` because the caller here is the server, not a model: it
-      // needs the rows themselves, and it applies the PII column filter just
-      // below rather than inheriting the read path's.
+      // needs the rows themselves, where the read path answers with MCP
+      // content blocks.
       const results = (await executeQuery(
         columnsQuery,
         queryParams,
       )) as ColumnRow[];
-
-      // When PII redaction is enabled, hide PII column names from the schema
-      // response so the LLM never learns they exist and won't generate SQL
-      // referencing them. Combined with the SELECT * guard in executeReadOnlyQuery,
-      // this gives end-to-end protection: the LLM only ever sees safe columns
-      // and is forced to project them explicitly.
-      const piiColumnList = [...DEFAULT_PII_COLUMNS, ...PII_EXTRA_COLUMNS];
-      const filtered = ENABLE_PII_REDACTION
-        ? results.filter(
-            (col) =>
-              !isPIIColumn(col.column_name, piiColumnList, PII_EXTRA_COLUMN_PATTERNS),
-          )
-        : results;
-
-      if (ENABLE_PII_REDACTION && filtered.length !== results.length) {
-        log(
-          "info",
-          `[redact] hid ${results.length - filtered.length} PII column(s) from schema for table "${tableName}"`,
-        );
-      }
 
       return {
         contents: [
           {
             uri: request.params.uri,
             mimeType: "application/json",
-            text: JSON.stringify(filtered, null, 2),
+            text: JSON.stringify(results, null, 2),
           },
         ],
       };

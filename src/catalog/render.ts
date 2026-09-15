@@ -180,7 +180,6 @@ export function searchCatalog(
   catalog: CatalogFile,
   query: string,
   limit: number,
-  isPIIColumn: (column: string) => boolean,
 ): SearchResult[] {
   const q = query.trim().toLowerCase();
   if (!q) return [];
@@ -189,11 +188,7 @@ export function searchCatalog(
     for (const [tableName, table] of Object.entries(schema.tables)) {
       const qualified = `${schemaName}.${tableName}`;
       const matchedColumns = table.columns
-        .filter(
-          (column) =>
-            !isPIIColumn(column.name) &&
-            matchScore(column.name, q, 40) > 0,
-        )
+        .filter((column) => matchScore(column.name, q, 40) > 0)
         .map((column) => column.name);
       let score = Math.max(
         matchScore(qualified, q, 80),
@@ -220,49 +215,9 @@ export function searchCatalog(
     .slice(0, limit);
 }
 
-/**
- * The column of a `schema.table.column` join endpoint. Joins reach the catalog
- * already filtered, but every other field of `describe` is filtered again here:
- * persistence and response are meant to be two independent PII boundaries, so
- * a future writer that skips the first one cannot leak through this path.
- */
-function joinEndpointColumn(endpoint: string): string {
-  return endpoint.slice(endpoint.lastIndexOf(".") + 1);
-}
-
-function safeTable(
-  table: CatalogTable,
-  isPIIColumn: (column: string) => boolean,
-): CatalogTable {
-  return {
-    ...table,
-    columns: table.columns.filter((column) => !isPIIColumn(column.name)),
-    pk: table.pk.filter((column) => !isPIIColumn(column)),
-    indexes: table.indexes
-      .map((index) => ({
-        ...index,
-        columns: index.columns.filter((column) => !isPIIColumn(column)),
-      }))
-      .filter((index) => index.columns.length > 0),
-    fks: table.fks.filter(
-      (fk) =>
-        !isPIIColumn(fk.column) && !isPIIColumn(fk.referencedColumn),
-    ),
-    usage: {
-      ...table.usage,
-      columns: Object.fromEntries(
-        Object.entries(table.usage.columns).filter(
-          ([column]) => !isPIIColumn(column),
-        ),
-      ),
-    },
-  };
-}
-
 export function renderDescribe(
   qualifiedName: string,
   table: CatalogTable,
-  isPIIColumn: (column: string) => boolean,
   documents: {
     configured: boolean;
     available: boolean;
@@ -298,16 +253,11 @@ export function renderDescribe(
       guidance: "상태 코드·도메인 규칙은 이 문서를 먼저 읽어라.",
     };
   }
-  const joins = observedJoins.filter(
-    (edge) =>
-      !isPIIColumn(joinEndpointColumn(edge.a)) &&
-      !isPIIColumn(joinEndpointColumn(edge.b)),
-  );
   return JSON.stringify(
     {
       table: qualifiedName,
-      ...safeTable(table, isPIIColumn),
-      ...(joins.length > 0 ? { observedJoins: joins } : {}),
+      ...table,
+      ...(observedJoins.length > 0 ? { observedJoins } : {}),
       docs,
       ...(documents.warning ? { warning: documents.warning } : {}),
     },

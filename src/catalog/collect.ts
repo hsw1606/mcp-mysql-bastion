@@ -12,7 +12,6 @@ import { emptyTable, normalizeName } from "./types.js";
 export interface CatalogCollectorOptions {
   schemas: readonly string[];
   ttlHours: number;
-  isPIIColumn: (column: string) => boolean;
 }
 
 /**
@@ -214,10 +213,7 @@ export class CatalogCollector {
     );
 
     const columns: CatalogColumn[] = rows
-      .filter(
-        (row) =>
-          row.kind === "column" && !this.options.isPIIColumn(row.name),
-      )
+      .filter((row) => row.kind === "column")
       .map((row) => ({
         name: row.name,
         dataType: row.data_type ?? "",
@@ -231,13 +227,7 @@ export class CatalogCollector {
 
     const indexesByName = new Map<string, CatalogIndex>();
     for (const row of rows) {
-      if (
-        row.kind !== "index" ||
-        !row.index_column ||
-        this.options.isPIIColumn(row.index_column)
-      ) {
-        continue;
-      }
+      if (row.kind !== "index" || !row.index_column) continue;
       const index = indexesByName.get(row.name) ?? {
         name: row.name,
         unique: Number(row.non_unique) === 0,
@@ -254,9 +244,7 @@ export class CatalogCollector {
       .filter(
         (row) =>
           row.kind === "fk" &&
-          Boolean(row.fk_column && row.ref_schema && row.ref_table && row.ref_column) &&
-          !this.options.isPIIColumn(row.fk_column as string) &&
-          !this.options.isPIIColumn(row.ref_column as string),
+          Boolean(row.fk_column && row.ref_schema && row.ref_table && row.ref_column),
       )
       .map((row) => ({
         name: row.name,
