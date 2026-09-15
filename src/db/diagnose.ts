@@ -14,12 +14,26 @@ export function isQueryTimeoutError(error: unknown): boolean {
   return candidate.errno === ER_QUERY_TIMEOUT || candidate.code === "ER_QUERY_TIMEOUT";
 }
 
+/**
+ * A row estimate together with what it counts.
+ *
+ * EXPLAIN's row figures are not interchangeable: `rows_examined_per_scan` is
+ * per scan of that table, `rows_produced_per_join` is what the step emits. The
+ * field name is the only thing that says which, so it travels with the number
+ * rather than being flattened to a bare `rows`.
+ */
+export interface PlanRows {
+  value: number;
+  /** Printed as the label, so the reader gets the qualifier the field carried. */
+  unit: string;
+}
+
 /** One table as the optimizer said it would read it. */
 export interface PlanTable {
   /** As EXPLAIN reports it: the alias when the query used one. */
   name: string;
   accessType: string;
-  rows: number | null;
+  rows: PlanRows | null;
   key: string | null;
   /** The plan's `attached_condition`, verbatim. */
   condition: string | null;
@@ -32,11 +46,17 @@ export interface PlanTable {
   synthetic: boolean;
 }
 
-function readRows(node: Record<string, unknown>): number | null {
-  for (const key of ["rows_examined_per_scan", "rows", "rows_produced_per_join"]) {
+const ROW_FIELDS: ReadonlyArray<{ key: string; unit: string }> = [
+  { key: "rows_examined_per_scan", unit: "rows/scan" },
+  { key: "rows", unit: "rows" },
+  { key: "rows_produced_per_join", unit: "rows out" },
+];
+
+function readRows(node: Record<string, unknown>): PlanRows | null {
+  for (const { key, unit } of ROW_FIELDS) {
     const value = node[key];
     const numeric = typeof value === "string" ? Number(value) : value;
-    if (typeof numeric === "number" && Number.isFinite(numeric)) return numeric;
+    if (typeof numeric === "number" && Number.isFinite(numeric)) return { value: numeric, unit };
   }
   return null;
 }
@@ -120,9 +140,9 @@ export interface DiagnosisInput {
  */
 const MAX_PLAN_JSON_CHARS = 12_000;
 
-function formatRows(rows: number | null): string {
-  if (rows == null) return "unknown";
-  return `~${Math.round(rows).toLocaleString("en-US")}`;
+function formatRows(rows: PlanRows | null): string {
+  if (rows == null) return "rows: unknown";
+  return `${rows.unit}: ~${Math.round(rows.value).toLocaleString("en-US")}`;
 }
 
 /** `IDX_name(colA, colB)`, in index order — the order that decides usability. */
@@ -221,7 +241,7 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
     lines.push("[PLAN BY TABLE] in join order.");
     tables.forEach((table, i) => {
       lines.push(
-        `  ${i + 1}. ${table.name} - access: ${table.accessType}, rows: ${formatRows(table.rows)}, key: ${table.key ?? "none"}`,
+        `  ${i + 1}. ${table.name} - access: ${table.accessType}, ${formatRows(table.rows)}, key: ${table.key ?? "none"}`,
       );
       if (table.condition) lines.push(`     condition: ${table.condition}`);
     });
@@ -229,6 +249,8 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
       "  Reading access: ALL is a full table scan and `index` is a full index scan - both",
       "  read every row. A non-empty key does NOT mean the filter was narrowed; a full index",
       "  scan reports one too. const, eq_ref, ref and range did narrow the table.",
+      "  rows/scan is per scan of that table, so an inner table of a join is read once for",
+      "  every row the step above it produced - multiply before calling it cheap.",
       "",
     );
   } else {
