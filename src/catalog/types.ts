@@ -1,6 +1,13 @@
 import type { AppSchemaEntry } from "../types/index.js";
 
-export const CATALOG_VERSION = 1;
+/**
+ * Bumped to 2 when column and index names stopped being filtered out of the
+ * catalog. A file written by a build that still filtered them is missing those
+ * entries, and nothing in it records the omission — so on the TTL alone it
+ * would keep answering with short column lists for up to a day. Rejecting the
+ * file outright is what makes the removal take effect on the next start.
+ */
+export const CATALOG_VERSION = 2;
 
 export interface CatalogColumn {
   name: string;
@@ -204,8 +211,6 @@ export interface CatalogOptions {
   docsRepo: string | null;
   docsRef: string | null;
   defaultSchema: string | null;
-  piiRedactionEnabled: boolean;
-  isPIIColumn: (column: string) => boolean;
 }
 
 /**

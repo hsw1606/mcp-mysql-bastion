@@ -10,8 +10,7 @@ Tunnel은 서버가 직접 엽니다. 이미 쓰고 있는 `~/.ssh/config` alias
 ## 출처
 
 [benborla/mcp-server-mysql](https://github.com/benborla/mcp-server-mysql)(MIT)에서
-파생됐습니다. MCP 서버, 쿼리 routing, 권한 모델, PII redaction은 그 프로젝트에서
-왔습니다. [LICENSE.md](LICENSE.md)를 참고하세요.
+파생됐습니다. MCP 서버, 쿼리 routing, 권한 모델은 그 프로젝트에서 왔습니다. [LICENSE.md](LICENSE.md)를 참고하세요.
 
 이 저장소에서 새로 추가된 것: SSH tunnel 계층(`src/ssh/`), profile 체계, wrapper
 스크립트, stderr 전용 로깅. 원격 HTTP transport, test suite, eval harness,
@@ -341,7 +340,7 @@ user가 모두 파일명에 들어가므로 서로 다른 환경이 같은 catal
 Catalog에는 schema metadata와 사용 횟수만 들어갑니다. SQL은 어떤 형태로도
 저장하지 않습니다. Query에서 뽑아 쓰는 것은 참조한 table 이름과 join으로 이어진
 column 짝뿐이고, literal은 catalog에 닿기 전에 버려집니다. Row data도 저장하지
-않습니다. PII redaction이 켜지면 PII column은 저장과 응답에서 모두 제외합니다.
+않습니다.
 `MYSQL_CATALOG_ENABLED=false`로 끄면 도구와 resource 동작은 변경 전과 같아집니다.
 `MYSQL_APP_SCHEMAS`가 비어 있을 때도 같습니다. Catalog는 선언된 schema만
 훑으므로, 선언이 없으면 훑을 것이 없어 스스로 꺼지고 stderr에 이유를 남깁니다.
@@ -452,7 +451,16 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | 변수 | 기본값 | 의미 |
 | --- | --- | --- |
 | `ENABLE_LOGGING` | `false` | 진단 출력을 stderr로. 어떤 MCP 클라이언트에서도 안전합니다. |
-| `ENABLE_PII_REDACTION` | `false` | 결과에서 PII로 보이는 값을 redaction 처리합니다. 원본 프로젝트에서 물려받았습니다. |
+
+### 결과는 있는 그대로 반환합니다
+
+Row 값도, column 이름도, index 이름도 가리지 않습니다. 원본 프로젝트의 PII
+redaction 계층은 제거했습니다.
+
+이 서버는 신뢰하는 운영자 한 사람이 자기 환경에 붙여 쓰는 도구이고, 실제 보호는
+redaction이 아니라 그 앞단에 있습니다 — read-only 강제, profile별 권한, SSH
+tunnel, 그리고 애초에 어떤 계정으로 접속하는지입니다. Column 이름 목록을 손으로
+관리해서 얻는 masking 한 겹은 그 위에 얹을 값이 없었습니다.
 
 ## Tunnel이 동작하는 방식
 
@@ -586,9 +594,8 @@ MySQL이 상한 초과로 문장을 취소하면(에러코드 `3024`) 서버는 
 5. 리터럴을 마스킹한 플랜 원문 (너무 크면 생략하고 그렇다고 밝힙니다)
 
 인덱스 목록에서 **없음은 사실이 아니라 무지로 보고합니다.** 카탈로그에 없는
-테이블은 "인덱스가 없다"가 아니라 "여기서는 알 수 없다"로 적고, PII redaction이
-켜져 있으면 가려진 컬럼의 인덱스가 애초에 수집되지 않았다는 단서를 덧붙입니다.
-둘을 뭉뚱그리면 모델이 사용자에게 잘못된 포기를 권하게 됩니다.
+테이블은 "인덱스가 없다"가 아니라 "여기서는 알 수 없다"로 적습니다. 둘을
+뭉뚱그리면 모델이 사용자에게 잘못된 포기를 권하게 됩니다.
 
 `access_type` 읽는 법 한 줄이 함께 붙습니다. **인덱스를 탔는지는 `key`가 아니라
 `access_type`으로 판단합니다.** stage 실측: `WHERE SUBSTRING(accountNumber,1,3)='ABC'`는
@@ -675,7 +682,6 @@ index.ts              MCP 서버, tool + resource handler, 종료 처리
 src/config/           env 로딩, profile 정책, mysql2 옵션
 src/catalog/          로컬 schema catalog, DB metadata 수집과 검색
 src/db/               쿼리 routing, 권한 검사, pool
-src/security/         PII redaction (원본 프로젝트)
 src/ssh/config.ts     ~/.ssh/config Host alias parser
 src/ssh/tunnel.ts     tunnel lifecycle: 열기, 재사용, 재연결, 닫기
 bin/                  MCP 클라이언트용 profile wrapper
