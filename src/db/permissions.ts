@@ -9,7 +9,7 @@ import {
   SCHEMA_UPDATE_PERMISSIONS,
 } from "../config/index.js";
 
-// Schema permission checking functions
+// 스키마 권한 검사 함수들
 function isInsertAllowedForSchema(schema: string | null): boolean {
   if (!schema) {
     return ALLOW_INSERT_OPERATION;

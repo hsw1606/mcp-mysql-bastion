@@ -2,9 +2,8 @@ import type { CatalogIndexFacts } from "../catalog/types.js";
 import type { QualifierMap } from "./utils.js";
 
 /**
- * MySQL's error for a statement it cancelled because `max_execution_time` ran
- * out: `ER_QUERY_TIMEOUT`. Matched on the numeric code rather than the message,
- * which is localised on some builds.
+ * `max_execution_time`이 다 되어 MySQL이 문장을 취소할 때 내는 오류인
+ * `ER_QUERY_TIMEOUT`. 메시지는 빌드에 따라 번역되어 나오므로 숫자 코드로 판별한다.
  */
 const ER_QUERY_TIMEOUT = 3024;
 
@@ -15,33 +14,33 @@ export function isQueryTimeoutError(error: unknown): boolean {
 }
 
 /**
- * A row estimate together with what it counts.
+ * 행 추정치와, 그 숫자가 무엇을 센 것인지를 함께 담는다.
  *
- * EXPLAIN's row figures are not interchangeable: `rows_examined_per_scan` is
- * per scan of that table, `rows_produced_per_join` is what the step emits. The
- * field name is the only thing that says which, so it travels with the number
- * rather than being flattened to a bare `rows`.
+ * EXPLAIN의 행 수치는 서로 바꿔 쓸 수 없다. `rows_examined_per_scan`은 그 테이블을
+ * 한 번 스캔할 때의 값이고, `rows_produced_per_join`은 그 단계가 내보내는 값이다.
+ * 둘을 갈라 주는 것은 필드 이름뿐이다. 그래서 그냥 `rows`로 뭉개지 않고 숫자와 함께
+ * 들고 다닌다.
  */
 export interface PlanRows {
   value: number;
-  /** Printed as the label, so the reader gets the qualifier the field carried. */
+  /** 라벨로 출력한다. 필드가 달고 있던 단서를 읽는 쪽에 그대로 넘긴다. */
   unit: string;
 }
 
-/** One table as the optimizer said it would read it. */
+/** 옵티마이저가 읽겠다고 말한 그대로의 테이블 하나. */
 export interface PlanTable {
-  /** As EXPLAIN reports it: the alias when the query used one. */
+  /** EXPLAIN이 보고한 그대로. 쿼리가 별칭을 썼다면 별칭이 들어온다. */
   name: string;
   accessType: string;
   rows: PlanRows | null;
   key: string | null;
-  /** The plan's `attached_condition`, verbatim. */
+  /** 플랜의 `attached_condition`을 그대로 옮긴 값. */
   condition: string | null;
   /**
-   * True when this node is a step rather than a table: a union result, a
-   * materialized subquery, a derived table. EXPLAIN gives these a `table_name`
-   * like a real table - `<union1,2>`, or for a derived table the alias the
-   * query gave it, which is indistinguishable from a table name by spelling.
+   * 이 노드가 테이블이 아니라 하나의 단계일 때 true다. union 결과, 구체화한
+   * 서브쿼리, 파생 테이블이 여기 해당한다. EXPLAIN은 이런 노드에도 실제 테이블처럼
+   * `table_name`을 붙인다 - `<union1,2>`, 파생 테이블이면 쿼리가 준 별칭인데,
+   * 철자만으로는 테이블 이름과 구분되지 않는다.
    */
   synthetic: boolean;
 }
@@ -62,16 +61,15 @@ function readRows(node: Record<string, unknown>): PlanRows | null {
 }
 
 /**
- * Every table node in an `EXPLAIN FORMAT=JSON` plan, in the order the plan
- * lists them — which is the join order, and worth preserving.
+ * `EXPLAIN FORMAT=JSON` 플랜에 있는 모든 테이블 노드를, 플랜이 나열한 순서 그대로
+ * 모은다 — 그 순서가 곧 조인 순서이고, 지킬 값어치가 있다.
  *
- * Walks the whole document rather than following the shapes MySQL nests tables
- * under — `nested_loop`, `ordering_operation`, `grouping_operation`,
- * `materialized_from_subquery`, `union_result`, and more. A plan shape we did
- * not anticipate degrades to finding fewer tables, never to a crash.
+ * MySQL이 테이블을 품는 구조 — `nested_loop`, `ordering_operation`,
+ * `grouping_operation`, `materialized_from_subquery`, `union_result` 등 — 를
+ * 따라가는 대신 문서 전체를 훑는다. 예상하지 못한 플랜 모양을 만나면 테이블을 덜
+ * 찾을 뿐, 터지지는 않는다.
  *
- * This is extraction, not interpretation: nothing here decides whether a plan
- * is good.
+ * 여기서 하는 일은 추출이지 해석이 아니다. 플랜이 좋은지는 아무것도 판단하지 않는다.
  */
 export function collectPlanTables(node: unknown): PlanTable[] {
   const out: PlanTable[] = [];
@@ -103,9 +101,9 @@ export function collectPlanTables(node: unknown): PlanTable[] {
 }
 
 /**
- * The single-column, single-row payload of `EXPLAIN FORMAT=JSON`, parsed.
- * Returns null for anything unexpected — a plan we cannot read is reported as
- * an unavailable plan, not as an empty one.
+ * `EXPLAIN FORMAT=JSON`이 돌려주는 한 행 한 컬럼짜리 본문을 파싱한다.
+ * 예상 밖의 값이면 null을 돌려준다 — 읽지 못한 플랜은 빈 플랜이 아니라 플랜을
+ * 구하지 못했다고 보고한다.
  */
 export function parseExplainPayload(rows: unknown): unknown | null {
   const first = Array.isArray(rows) ? rows[0] : rows;
@@ -123,20 +121,19 @@ export function parseExplainPayload(rows: unknown): unknown | null {
 export interface DiagnosisInput {
   timeoutSeconds: number;
   maxTimeoutSeconds: number;
-  /** Parsed plan, or null when EXPLAIN could not be run or read. */
+  /** 파싱한 플랜. EXPLAIN을 돌리지 못했거나 읽지 못했으면 null이다. */
   plan: unknown | null;
   qualifiers: QualifierMap;
-  /** Catalog index facts for a table the plan named, or null if unknown. */
+  /** 플랜이 지목한 테이블의 카탈로그 인덱스 정보. 모르면 null이다. */
   lookupIndexes: (name: string) => CatalogIndexFacts | null;
 }
 
 /**
- * Ceiling on the JSON plan appended to the report.
+ * 보고서에 덧붙이는 JSON 플랜의 상한.
  *
- * A plan for a wide query can run to tens of kilobytes, and the per-table
- * summary above it already carries what a decision turns on. Past this size the
- * JSON is dropped rather than cut, because half a JSON document is not a
- * document — it is something the reader has to guess at.
+ * 폭이 넓은 쿼리의 플랜은 수십 킬로바이트에 이르고, 그 위의 테이블별 요약이 이미
+ * 판단의 근거를 담고 있다. 이 크기를 넘으면 잘라 넣지 않고 통째로 뺀다. 반쪽짜리
+ * JSON은 문서가 아니라 읽는 쪽이 추측해야 하는 무언가이기 때문이다.
  */
 const MAX_PLAN_JSON_CHARS = 12_000;
 
@@ -145,7 +142,7 @@ function formatRows(rows: PlanRows | null): string {
   return `${rows.unit}: ~${Math.round(rows.value).toLocaleString("en-US")}`;
 }
 
-/** `IDX_name(colA, colB)`, in index order — the order that decides usability. */
+/** `IDX_name(colA, colB)` 형태. 인덱스 순서대로 쓴다 — 쓸모를 가르는 순서다. */
 function describeIndexes(facts: CatalogIndexFacts): string {
   if (facts.indexes.length === 0) return "none recorded";
   return facts.indexes
@@ -153,22 +150,22 @@ function describeIndexes(facts: CatalogIndexFacts): string {
     .join(", ");
 }
 
-/** A plan node with the name both sections will print it under. */
+/** 두 절이 함께 쓸 이름을 붙여 둔 플랜 노드. */
 interface LabelledTable {
   table: PlanTable;
-  /** The table itself, qualified. What the index list dedupes on. */
+  /** 스키마까지 붙인 테이블 이름. 인덱스 목록은 이 값으로 중복을 제거한다. */
   canonical: string;
-  /** `canonical` with the plan's alias appended when EXPLAIN used one. */
+  /** `canonical`에, EXPLAIN이 별칭을 썼다면 그 별칭을 덧붙인 이름. */
   label: string;
 }
 
 /**
- * Settle on one name per plan node, before either section prints it.
+ * 어느 절에서든 출력하기 전에, 플랜 노드마다 이름을 하나로 정해 둔다.
  *
- * EXPLAIN names the alias where the query used one, so a summary reading `i`
- * over an index list reading `haulla.invoice` leaves the reader to pair the two
- * up - work the qualifier map has already done. The alias stays in parentheses
- * because the plan's conditions are written in terms of it.
+ * 쿼리가 별칭을 썼다면 EXPLAIN은 별칭을 이름으로 적는다. 그래서 요약에는 `i`,
+ * 인덱스 목록에는 `haulla.invoice`가 나오면 둘을 짝짓는 일이 읽는 쪽에 남는다 -
+ * qualifier 맵이 이미 해 둔 일이다. 플랜의 조건문이 별칭으로 쓰여 있으므로 별칭은
+ * 괄호 안에 남겨 둔다.
  */
 function labelTables(input: DiagnosisInput, tables: PlanTable[]): LabelledTable[] {
   return tables.map((table) => {
@@ -188,22 +185,20 @@ function labelTables(input: DiagnosisInput, tables: PlanTable[]): LabelledTable[
 }
 
 /**
- * What the catalog knows about the tables this plan touched.
+ * 이 플랜이 건드린 테이블에 대해 카탈로그가 아는 것.
  *
- * Absence is reported as ignorance, never as fact. "The catalog has no index
- * list for this table" and "this table has no index on that column" read alike
- * in a summary and are not the same claim, and only one of them justifies
- * telling a user to give up.
+ * 없다는 것은 사실이 아니라 모른다는 뜻으로 보고한다. "카탈로그에 이 테이블의 인덱스
+ * 목록이 없다"와 "이 테이블에는 그 컬럼을 덮는 인덱스가 없다"는 요약에서 비슷하게
+ * 읽히지만 같은 주장이 아니다. 사용자에게 포기하라고 말할 근거가 되는 쪽은 하나뿐이다.
  */
 function renderIndexSection(input: DiagnosisInput, tables: LabelledTable[]): string[] {
   const seen = new Set<string>();
   const lines: string[] = [];
   for (const { table, canonical } of tables) {
-    // A step has no index list to be ignorant of, so the catalog is not asked
-    // about one. Saying so instead would explain the model's own plan back to
-    // it. The lookup is by name, and a derived table's alias can be some real
-    // table's name, so skipping is also what keeps that table's indexes from
-    // being reported as the alias's.
+    // 단계에는 모를 만한 인덱스 목록 자체가 없으므로 카탈로그에 묻지 않는다. 대신
+    // 그렇다고 적어 주면 모델 자신의 플랜을 모델에게 되읽어 주는 꼴이 된다. 조회는
+    // 이름으로 하는데, 파생 테이블의 별칭이 어떤 실제 테이블의 이름일 수도 있다.
+    // 건너뛰는 덕에 그 실제 테이블의 인덱스가 별칭의 것으로 보고되는 일도 막는다.
     if (table.synthetic) continue;
     if (seen.has(canonical.toLowerCase())) continue;
     seen.add(canonical.toLowerCase());
@@ -226,22 +221,20 @@ function renderIndexSection(input: DiagnosisInput, tables: LabelledTable[]): str
 }
 
 /**
- * The text returned in place of a cancelled query's rows.
+ * 취소된 쿼리의 결과 행을 대신해 돌려주는 텍스트.
  *
- * Reports what happened and what the optimizer said, and stops there. The plan
- * and the index lists are facts worth a round trip; deciding what they mean is
- * not. A classifier here sees one JSON document, while the model reading this
- * sees the statement, the schema, and the question the user actually asked —
- * so it is the model's call which table is the problem and whether a rewrite
- * preserves the question.
+ * 무슨 일이 있었는지와 옵티마이저가 무엇이라 했는지까지만 알리고 멈춘다. 플랜과
+ * 인덱스 목록은 왕복을 들일 값어치가 있는 사실이지만, 그 뜻을 정하는 일은 아니다.
+ * 여기에 분류기를 두면 JSON 문서 하나만 보게 된다. 반면 이 글을 읽는 모델은 문장과
+ * 스키마, 사용자가 실제로 물은 질문까지 본다 — 그러니 어느 테이블이 문제인지, 고쳐
+ * 쓴 쿼리가 그 질문을 그대로 지키는지는 모델이 판단할 몫이다.
  *
- * What stays is only what the model cannot get for itself here: that EXPLAIN
- * has already run (so it does not run it again, or retry the statement), the
- * plan itself, the catalog's index lists, the one non-obvious
- * rule for reading `access_type`, and the bounds on retrying.
+ * 남기는 것은 모델이 여기서 스스로 얻을 수 없는 것뿐이다. EXPLAIN이 이미 돌았다는
+ * 사실(그래서 다시 돌리거나 문장을 재실행하지 않도록), 플랜 자체, 카탈로그의 인덱스
+ * 목록, `access_type`을 읽는 한 가지 비직관적인 규칙, 그리고 재시도의 한계다.
  *
- * Written in English to sit alongside the other refusals this executor returns.
- * The model translates when it puts the choice to the user.
+ * 이 실행기가 돌려주는 다른 거절문과 나란히 놓이도록 영어로 쓴다. 사용자에게 선택지를
+ * 내밀 때는 모델이 번역한다.
  */
 export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
   const lines: string[] = [
@@ -315,12 +308,11 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
 }
 
 /**
- * The choices available after a cancellation, and nothing about which to take.
+ * 취소된 뒤에 고를 수 있는 선택지들. 무엇을 고르라는 말은 하지 않는다.
  *
- * A prohibition with no alternative just moves the guessing elsewhere, so the
- * options are spelled out — but they are options, not a recommendation. The
- * retry bound is the one hard rule here: without it the model raises the limit
- * again and again on a query that was never going to finish.
+ * 대안 없는 금지는 추측할 자리를 옮길 뿐이라 선택지를 낱낱이 적는다 — 다만 선택지일
+ * 뿐 권고는 아니다. 여기서 유일하게 단단한 규칙은 재시도 한계다. 이것이 없으면 모델은
+ * 애초에 끝날 리 없던 쿼리에 제한 시간을 계속 올려 댄다.
  */
 function renderNextSection(input: DiagnosisInput, hasPlan: boolean): string[] {
   const canExtend = input.timeoutSeconds < input.maxTimeoutSeconds;

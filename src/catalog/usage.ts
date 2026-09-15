@@ -46,9 +46,9 @@ function referencesFromTableList(
     const schema = parts[1] && parts[1] !== "null" ? parts[1] : null;
     const table = parts.slice(2).join("::");
     if (!table) continue;
-    // node-sql-parser includes CTE names in tableList. They are query-local
-    // result sets, not database tables, and must not trigger inventory refreshes
-    // or usage records for an unrelated table with the same name.
+    // node-sql-parser는 tableList에 CTE 이름도 넣는다. CTE는 쿼리 안에서만 사는
+    // 결과 집합이지 DB 테이블이 아니다. 이름이 같은 엉뚱한 테이블의 inventory를
+    // 갱신하거나 사용 기록을 남기게 두면 안 된다.
     if (!schema && commonTableExpressions.has(table.toLowerCase())) continue;
     const key = `${schema ?? ""}.${table}`.toLowerCase();
     if (seen.has(key)) continue;
@@ -133,7 +133,7 @@ function collectJoins(
   }
 }
 
-/** Parse once before query execution. This function never touches the database. */
+/** 쿼리를 실행하기 전에 한 번 파싱한다. 이 함수는 DB를 건드리지 않는다. */
 export function prepareCatalogQuery(sql: string): PreparedCatalogQuery {
   try {
     const ast = parser.astify(sql, { database: "mysql" });
@@ -144,8 +144,8 @@ export function prepareCatalogQuery(sql: string): PreparedCatalogQuery {
     collectJoins(ast, aliases, references, new Set<string>(), joins);
     return { references, joins };
   } catch {
-    // Query validation remains the executor's job. A parser miss only means
-    // that this request cannot teach the catalog anything.
+    // 쿼리 검증은 여전히 실행부의 몫이다. 파서가 놓쳤다는 것은 이번 요청에서
+    // 카탈로그가 배울 게 없다는 뜻일 뿐이다.
     return { references: [], joins: [] };
   }
 }
