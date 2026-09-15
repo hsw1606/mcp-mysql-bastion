@@ -674,7 +674,8 @@ async function executeReadOnlyQuery<T>(
 
     // Round trips are counted, not estimated, because the budget is the whole
     // reason this path looks the way it does. Every hop crosses the SSH tunnel
-    // at roughly 160 ms, so the three below are most of what a fast query costs.
+    // at roughly 137 ms measured against stage, so the three below are most of
+    // what a fast query costs.
     const timeoutSeconds = clampTimeoutSeconds(options.timeoutSeconds);
     let roundTrips = await applySessionLimits(connection, {
       maxExecutionTimeMs: timeoutSeconds * 1_000,
