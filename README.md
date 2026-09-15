@@ -13,9 +13,12 @@ Tunnel은 서버가 직접 엽니다. 이미 쓰고 있는 `~/.ssh/config` alias
 파생됐습니다. MCP 서버, 쿼리 routing, 권한 모델은 그 프로젝트에서 왔습니다. [LICENSE.md](LICENSE.md)를 참고하세요.
 
 이 저장소에서 새로 추가된 것: SSH tunnel 계층(`src/ssh/`), profile 체계, wrapper
-스크립트, stderr 전용 로깅. 원격 HTTP transport, test suite, eval harness,
-Docker packaging은 걷어냈습니다 — 이 서버는 로컬 MCP 클라이언트에 stdio로
-서비스할 뿐, 그 외의 일은 하지 않습니다.
+스크립트, schema catalog(`src/catalog/`), 실행 상한과 타임아웃 진단, stderr 전용
+로깅. 원격 HTTP transport, eval harness, Docker packaging은 걷어냈습니다 — 이
+서버는 로컬 MCP 클라이언트에 stdio로 서비스할 뿐, 그 외의 일은 하지 않습니다.
+
+Test suite는 상속받은 것을 걷어낸 뒤 이 저장소의 결정을 고정하는 쪽으로 다시
+썼습니다. `npm test`가 타입 검사와 vitest를 함께 돌립니다.
 
 ## 제공하는 것
 
@@ -38,7 +41,8 @@ Docker packaging은 걷어냈습니다 — 이 서버는 로컬 MCP 클라이언
 
 ## 요구 사항
 
-- Node.js 20 이상
+- Node.js 22.12 이상. 서버를 실행만 하는 데는 Node 18이면 충분하지만, 이 저장소는
+  clone 해서 빌드하는 흐름이고 devDependency인 vitest 5가 22.12를 요구합니다
 - Bastion에 대한 SSH 접근 권한, 그리고 이미 동작하는 키(`ssh <alias>`가 성공할 것)
 - 대상 데이터베이스의 MySQL 사용자 계정
 
@@ -54,6 +58,16 @@ npm run build
 ```
 
 빌드는 `dist/index.js`를 만들며, MCP 클라이언트가 실행하는 것이 바로 이 파일입니다.
+
+나머지 스크립트:
+
+| 스크립트 | 하는 일 |
+| --- | --- |
+| `npm run build` | `tsc`로 `dist/`를 만들고 진입점에 실행 권한을 줍니다. |
+| `npm run watch` | `tsc --watch`. |
+| `npm test` | `tsconfig.test.json`으로 타입을 검사한 뒤 vitest를 한 번 돌립니다. |
+| `npm run test:watch` | vitest watch 모드. |
+| `npm run start:stage` / `start:prod` | 해당 wrapper를 직접 실행합니다. `./bin/mcp-mysql-<profile>.sh`와 같습니다. |
 
 ### 2. `~/.ssh/config`에 bastion 기술하기
 
@@ -118,8 +132,9 @@ Wrapper를 직접 실행하세요. env 파일, credentials, SSH 키를 검증한
 `Ctrl-C`로 중단하세요. 설정이 잘못됐다면 이유를 stderr에 찍고 0이 아닌 코드로
 종료합니다.
 
-무슨 일을 하는지 보고 싶다면 profile에 `ENABLE_LOGGING=true`를 넣고 `[ssh]`
-줄을 확인하세요:
+무슨 일을 하는지 보고 싶다면 profile에 `ENABLE_LOGGING=true`(`1`도 받습니다)를
+넣고 `[ssh]` 줄을 확인하세요. 모든 줄 앞에는 `log()`가 붙이는 `[info]`/`[error]`
+수준 접두사가 옵니다:
 
 ```text
 [ssh] resolved alias "my-stage-db" from ~/.ssh/config: {...}
@@ -185,10 +200,11 @@ codex mcp list          # 둘 다 enabled로 보여야 합니다
 ```
 
 **timeout에 대해.** `startup_timeout_sec`은 MCP handshake만 포함하며, 여기서는
-0.2초 정도 걸립니다 — tunnel은 시작 시점이 아니라 첫 쿼리에서 지연 생성되므로
-`initialize`를 막지 않습니다. 첫 쿼리가 SSH handshake 비용을 치르며 3초 안팎이
-걸리는데, `tool_timeout_sec`이 감당해야 하는 것이 이 값입니다. 위 설정값은 실측치의
-대략 10배입니다.
+0.2초 정도 걸립니다. 서버는 시작하자마자 tunnel을 열고 pool을 만들지만 그 작업을
+await하지 않고 stdio transport에 먼저 연결하므로, SSH handshake가 `initialize`를
+막지 않습니다. 첫 쿼리는 그 준비가 이미 끝났으면 기다리지 않고, 아직이면 남은
+만큼만 기다립니다 — 최악의 경우가 3초 안팎이고 `tool_timeout_sec`이 감당해야
+하는 것이 이 값입니다. 위 설정값은 실측치의 대략 10배입니다.
 
 **sandbox에 대해.** MCP 서버는 `sandbox_mode`가 Codex 자체 shell에 적용하는
 sandbox 바깥에서 돌아갑니다. 따라서 서버가 SSH 키를 읽거나 bastion에 닿기 위해
@@ -262,10 +278,14 @@ map은 authoritative하다고 선언되므로, **틀린 목록은 없는 목록�
 사람만 알고 데이터베이스에 물어볼 수 없는 사실이지만, 그 schema에 어떤 테이블이
 있는지는 catalog가 데이터베이스에서 자동으로 갱신합니다.
 
-resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 제공됩니다. 이름이
-단순 식별자가 아닌 schema(`haulla-shared`)가 있으면 backtick으로 감싸야 한다는
-안내가 덧붙습니다. 이 map이 유발할 수 있는 유일한 문법 오류가 그것이기
-때문입니다.
+이름이 단순 식별자가 아닌 schema(`haulla-shared`)가 하나라도 있으면, 위 툴 설명
+끝에 backtick으로 감싸야 한다는 한 줄이 덧붙습니다. 이 map이 유발할 수 있는
+유일한 문법 오류가 그것이기 때문입니다.
+
+같은 map을 resource로도 읽을 수 있습니다 — `mysql://schemas`가 `profile`,
+`codeBranch`, `apps` 세 키를 담은 JSON을 돌려줍니다. 여기에는 위의 backtick
+안내가 들어가지 않습니다. 그 안내는 모델이 SQL을 쓰기 직전에 읽는 자리, 즉 툴
+설명에만 의미가 있기 때문입니다.
 
 이 map은 filter가 아니라 문서입니다 — 무엇을 쿼리할 수 있는지는 제한하지
 않습니다. 설정하지 않으면 이전 동작 그대로입니다.
@@ -276,9 +296,12 @@ resource를 읽는 클라이언트를 위해 `mysql://schemas` resource로도 �
 ### Schema catalog — 이미 알아낸 구조를 다시 찾지 않기
 
 서버는 `MYSQL_APP_SCHEMAS`에 선언된 schema만 로컬 JSON catalog에 기록합니다.
-시작할 때 table 이름·comment·예상 row 수를 query 한 번으로 갱신합니다. Column,
-primary key, index, foreign key는 table이 실제 SQL에 처음 등장한 뒤 비동기로
-수집합니다. 이 작업은 `mysql_query`의 실행 시간에 포함되지 않습니다.
+시작할 때 table 이름·comment·예상 row 수를 query 한 번으로 갱신하는데, catalog가
+비어 있거나 TTL이 지났을 때만입니다. 매 시작 스캔하지 않는 것은 의도입니다 — MCP
+클라이언트는 세션마다 서버를 새로 띄우므로, 강제로 스캔하면 inventory에 대해서는
+`MYSQL_CATALOG_TTL_HOURS`가 아무 의미도 없어집니다. Column, primary key, index,
+foreign key는 table이 실제 SQL에 처음 등장한 뒤 비동기로 수집합니다. 이 작업은
+`mysql_query`의 실행 시간에 포함되지 않습니다.
 
 모델은 `mysql_catalog` action으로 DB를 다시 탐색하지 않고 구조를 읽습니다:
 
@@ -383,6 +406,24 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 `stage`/`staging`/`dev`/`develop`은 `develop`, `prod`/`production`은 `main`이며,
 그 밖의 profile에서는 아무것도 말하지 않습니다.
 
+## Resource
+
+툴만 읽는 클라이언트라면 이 절은 건너뛰어도 됩니다. Resource를 읽는 클라이언트를
+위해 세 가지를 제공합니다.
+
+| URI | 내용 |
+| --- | --- |
+| `mysql://tables` | 읽을 수 있는 모든 table의 목록. 이름, schema, comment, 예상 row 수. catalog가 켜져 있으면 저장된 inventory로 답하고, 꺼져 있거나 아직 비어 있으면 `information_schema`를 한 번 읽습니다 — 이때는 크기와 생성·수정 시각도 함께 옵니다. |
+| `mysql://tables/<schema>/<table>` | 한 table의 구조. catalog가 켜져 있으면 `mysql_catalog describe`와 같은 내용이고, 실패하면 `information_schema`의 column 목록으로 물러납니다. |
+| `mysql://schemas` | 선언된 app -> schema map. `profile`, `codeBranch`, `apps` 세 키를 담은 JSON입니다. `MYSQL_APP_SCHEMAS`가 비어 있으면 목록에 오르지 않습니다. |
+
+Catalog 이전 형태인 `mysql://tables/<table>`(schema 없이 한 조각)도 계속 읽힙니다.
+
+**`mysql://tables` 목록에는 행 수 상한이 걸리지 않습니다.** 여기서 자르면 잘렸다고
+알릴 자리가 없고, 빠진 table은 클라이언트가 제시조차 하지 않아 `mysql://tables/...`로
+물어볼 수도 없게 됩니다. 분량이 아니라 닿는 범위가 줄어드는 일이라 상한을 걸지
+않았습니다. 자세한 것은 [행 수 상한](#시간-상한과-행-수-상한)을 보세요.
+
 ## 환경 변수
 
 ### Profile
@@ -396,7 +437,7 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | `MYSQL_CATALOG_ENABLED` | `true` | 로컬 schema catalog를 켭니다. `false`이거나 `MYSQL_APP_SCHEMAS`가 비어 있으면 기존 동작을 유지합니다. |
 | `MYSQL_CATALOG_PATH` | `~/.cache/mcp-mysql-bastion/catalog` | profile·대상·user별 JSON 파일을 둘 directory입니다. |
 | `MYSQL_CATALOG_TTL_HOURS` | `24` | DB metadata를 stale로 보는 시간입니다. |
-| `MYSQL_DOCS_REPO` | *(미설정)* | `model.md`가 있는 git 저장소. 미설정이면 문서 catalog만 비활성입니다. |
+| `MYSQL_DOCS_REPO` | *(미설정)* | `model.md`가 있는 git 저장소. 문서 catalog는 이 값과 `MYSQL_CODE_BRANCH`가 **둘 다** 있어야 켜집니다 — ref를 branch에서 가져오기 때문입니다. 둘 중 하나라도 비면 문서 축만 비활성입니다. |
 
 ### SSH tunnel
 
@@ -423,11 +464,17 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 | `MYSQL_PORT` | `3306` | 위와 같습니다. |
 | `MYSQL_USER` / `MYSQL_PASS` | — | 데이터베이스 credentials. 필수입니다. |
 | `MYSQL_DB` | *(비어 있음)* | 비어 있으면 multi-DB 모드가 켜집니다. |
-| `MYSQL_POOL_SIZE` | `10` | pool 크기. |
+| `MYSQL_SOCKET_PATH` | *(미설정)* | Unix socket으로 직접 접속합니다. host/port 대신 쓰이며, tunnel을 열면 무시합니다. |
+| `MYSQL_POOL_SIZE` | `10` | 동시에 열어 두는 커넥션 수. tunnel을 쓰면 SSH 세션 하나 위의 채널이 그만큼 생깁니다. |
+| `MYSQL_QUEUE_LIMIT` | `100` | pool이 꽉 찼을 때 대기열에 쌓아 둘 요청 수. |
 | `MYSQL_CONNECT_TIMEOUT` | `10000` | 접속 timeout(ms). |
 | `MYSQL_BIG_NUMBER_STRINGS` | `false` | BIGINT/DECIMAL을 문자열로 반환합니다. schema가 snowflake ID를 쓴다면 켜세요. |
 | `MYSQL_DATE_STRINGS` | `false` | 날짜를 `Date`가 아닌 문자열로 반환합니다. |
-| `MYSQL_SSL` | `false` | MySQL로의 TLS(SSH tunnel과는 별개). |
+| `MYSQL_TIMEZONE` | *(미설정)* | mysql2에 넘기는 timezone. 날짜 값을 해석하는 기준입니다. |
+| `MYSQL_SSL` | `false` | MySQL로의 TLS(SSH tunnel과는 별개). 아래 네 변수는 이 값이 `true`일 때만 읽습니다. |
+| `MYSQL_SSL_REJECT_UNAUTHORIZED` | `false` | 서버 인증서를 검증합니다. |
+| `MYSQL_SSL_CA` | *(미설정)* | CA 인증서 PEM 경로. |
+| `MYSQL_SSL_CERT` / `MYSQL_SSL_KEY` | *(미설정)* | mTLS용 클라이언트 인증서와 개인 키 PEM 경로. |
 | `MYSQL_MAX_TIMEOUT_SECONDS` | `30` | `timeout_seconds` 인자의 상한. 기본 상한 10초도 이 값 아래로 함께 내려갑니다. |
 | `MYSQL_MAX_RESPONSE_ROWS` | `5000` | 한 응답에 담기는 최대 행 수. 쿼리가 고르는 행이 아니라 **돌려주는** 행입니다. |
 | `MYSQL_CATALOG_TIMEOUT_SECONDS` | `60` | catalog의 `information_schema` 조회에 걸리는 시간 상한. |
@@ -450,7 +497,8 @@ MYSQL_CODE_BRANCH=main       # .env.prod
 
 | 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `ENABLE_LOGGING` | `false` | 진단 출력을 stderr로. 어떤 MCP 클라이언트에서도 안전합니다. |
+| `ENABLE_LOGGING` | `false` | 진단 출력을 stderr로. `1`도 켠 것으로 봅니다. 어떤 MCP 클라이언트에서도 안전합니다. |
+| `MYSQL_DISABLE_READ_ONLY_TRANSACTIONS` | `false` | 탈출구입니다. 읽기를 `START TRANSACTION READ ONLY` 대신 평범한 트랜잭션으로 엽니다. `START TRANSACTION READ ONLY`를 받지 못하는 proxy 뒤에 있을 때만 켜세요. 쓰기 차단은 쿼리 routing이 따로 하므로 이 값으로 쓰기가 열리지는 않지만, 마지막 한 겹이 사라집니다. |
 
 ### 결과는 있는 그대로 반환합니다
 
@@ -511,7 +559,8 @@ forward가 있으면 거기에 붙었습니다. 결과적으로 잘못된 선택
 ## 읽기 전용 강제
 
 Profile 이름이 `prod` 또는 `production`이면 `src/config/index.ts`가
-`ALLOW_INSERT`, `ALLOW_UPDATE`, `ALLOW_DELETE`, `ALLOW_DDL`,
+`ALLOW_INSERT_OPERATION`, `ALLOW_UPDATE_OPERATION`, `ALLOW_DELETE_OPERATION`,
+`ALLOW_DDL_OPERATION`,
 `MULTI_DB_WRITE_MODE`를 `false`로 강제하고 `SCHEMA_*_PERMISSIONS` override를
 비웁니다.
 
@@ -589,9 +638,15 @@ MySQL이 상한 초과로 문장을 취소하면(에러코드 `3024`) 서버는 
 1. 몇 초 상한에 걸려 취소됐는지, 그리고 결과 행이 없다는 사실
 2. **EXPLAIN을 이미 돌렸다**는 명시와, 다시 돌리지도 같은 문장을 재시도하지도
    말라는 금지
-3. 테이블별 요약 — 조인 순서대로 `access_type`·행 수·`key`·조건(리터럴 마스킹)
+3. 테이블별 요약 — 조인 순서대로 `access_type`·행 수·`key`·조건
 4. 카탈로그가 아는 인덱스 목록
-5. 리터럴을 마스킹한 플랜 원문 (너무 크면 생략하고 그렇다고 밝힙니다)
+5. 플랜 원문 (너무 크면 생략하고 그렇다고 밝힙니다)
+
+**보고서는 리터럴을 가리지 않습니다.** EXPLAIN은 쿼리가 필터에 쓴 값을 플랜에
+그대로 싣고, 3번의 조건과 5번의 원문에도 그대로 실려 돌아갑니다. 마스킹 계층은
+PII redaction과 함께 걷어냈고, 그 근거는 [결과는 있는 그대로
+반환합니다](#결과는-있는-그대로-반환합니다)와 같습니다 — 이 플랜을 받는 쪽은
+그 리터럴을 방금 자기가 쓴 호출자뿐입니다.
 
 인덱스 목록에서 **없음은 사실이 아니라 무지로 보고합니다.** 카탈로그에 없는
 테이블은 "인덱스가 없다"가 아니라 "여기서는 알 수 없다"로 적습니다. 둘을
@@ -621,9 +676,11 @@ MySQL이 상한 초과로 문장을 취소하면(에러코드 `3024`) 서버는 
 3. `ROLLBACK`
 
 접근 모드를 세션이 아니라 트랜잭션 범위로 선언하므로 끝나고 원복할 것이
-없습니다. 세션 변수는 물리 커넥션이 처음 만들어질 때 한 번 겁니다. `pool`의
-`connection` 이벤트는 커넥션이 호출자에게 넘어가기 전에 발생하고 명령은 큐
-순서대로 실행되므로, 첫 쿼리가 도는 시점에는 이미 설정이 끝나 있습니다.
+없습니다. 1번은 `MYSQL_DISABLE_READ_ONLY_TRANSACTIONS=true`를 켜면 평범한
+`BEGIN`으로 바뀝니다 — 왕복 수는 같습니다. 세션 변수는 물리 커넥션이 처음
+만들어질 때 한 번 겁니다. `pool`의 `connection` 이벤트는 커넥션이 호출자에게
+넘어가기 전에 발생하고 명령은 큐 순서대로 실행되므로, 첫 쿼리가 도는 시점에는
+이미 설정이 끝나 있습니다.
 tunnel 왕복이 1회당 약 137ms(stage 실측)이므로 이 세 번이 빠른 쿼리 비용의
 대부분입니다.
 
@@ -651,9 +708,12 @@ custom wrapper를 의심하세요. 확인 방법:
 없습니다. `MYSQL_SSH_PRIVATE_KEY_PATH`의 기본값은 `~/.ssh/id_rsa`이며, 키는
 `chmod 600`이어야 하고 암호화되어 있다면 `MYSQL_SSH_PASSPHRASE`가 필요합니다.
 
-**`Local port N is already in use`.** 무언가가 포트를 잡고 있으면서 우리 탐지에
-응답하지 않았습니다. `lsof -nP -i :N`으로 찾거나, `MYSQL_SSH_LOCAL_PORT=0`으로
-자동 할당하세요.
+**`[ssh] local port N is taken; opening our own tunnel on an auto-assigned port
+instead.`** 오류가 아니라 정상 동작입니다. 서버는 남의 tunnel을 빌리지 않고 OS가
+고른 포트에 자기 tunnel을 엽니다. pool은 접속할 주소를 전달받으므로 포트 번호가
+바뀌어도 아무 영향이 없습니다. 선호 포트를 꼭 되찾아야 한다면 `lsof -nP -i :N`으로
+점유한 쪽을 찾으세요. 이 자리에서 실제로 실패로 끝나는 경우는 자동 할당마저
+실패했을 때뿐이고, 그때는 `Failed to open local tunnel listener`가 나옵니다.
 
 **한동안 잘 되다가 쿼리가 실패합니다.** tunnel이 끊겼고 재연결이 포기한
 것입니다. 오류 메시지에 bastion 이름이 담깁니다. bastion에 닿을 수 있게 되면
@@ -682,10 +742,13 @@ git remote set-url origin git@github.com:<owner>/<repo>.git
 index.ts              MCP 서버, tool + resource handler, 종료 처리
 src/config/           env 로딩, profile 정책, mysql2 옵션
 src/catalog/          로컬 schema catalog, DB metadata 수집과 검색
-src/db/               쿼리 routing, 권한 검사, pool
+src/db/               쿼리 routing, 권한 검사, pool, 타임아웃 진단
 src/ssh/config.ts     ~/.ssh/config Host alias parser
 src/ssh/tunnel.ts     tunnel lifecycle: 열기, 재사용, 재연결, 닫기
+src/types/            공유 타입
+src/utils/            stderr 전용 로거, schema 권한 문자열 parser
 bin/                  MCP 클라이언트용 profile wrapper
+test/                 vitest suite (`npm test`)
 ```
 
 ## 라이선스
