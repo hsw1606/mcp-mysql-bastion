@@ -749,6 +749,7 @@ src/types/            공유 타입
 src/utils/            stderr 전용 로거, schema 권한 문자열 parser
 bin/                  MCP 클라이언트용 profile wrapper
 test/                 vitest suite (`npm test`)
+references/           되돌린 결정의 이력 (AGENTS.md가 가리킨다)
 ```
 
 ## 라이선스

@@ -78,18 +78,8 @@ SSH bastion을 거쳐야만 닿을 수 있는 MySQL을 위한 읽기 전용 MCP 
 
 ### 구성
 
-```text
-index.ts              MCP 서버, tool + resource handler, 종료 처리
-src/config/           env 로딩, profile 정책, mysql2 옵션
-src/catalog/          로컬 schema catalog, DB metadata 수집과 검색
-src/db/               쿼리 routing, 권한 검사, pool, 타임아웃 진단
-src/ssh/config.ts     ~/.ssh/config Host alias parser
-src/ssh/tunnel.ts     tunnel lifecycle: 열기, 재사용, 재연결, 닫기
-src/types/            공유 타입
-src/utils/            stderr 전용 로거, schema 권한 문자열 parser
-bin/                  MCP 클라이언트용 profile wrapper
-test/                 vitest suite
-```
+디렉터리별 역할은 [README.md](README.md)의 "구성" 절이 정본이다. 디렉터리를
+더하거나 옮기면 그 절을 고친다.
 
 ### 명령
 
@@ -166,5 +156,3 @@ npm run start:prod     # bin/mcp-mysql-prod.sh
   왜 그 선택을 했고, 무엇을 검증했는지를 쓴다
 - MUST 관심사가 다르면 커밋을 나눈다. 한 PR은 한 가지 관심사만 다룬다
 - MUST 코드를 고쳤으면 **PR 본문도 같이 갱신한다**. 본문에 커밋 목록 표는 넣지 않는다
-- MUST 커밋과 push는 `git-workflow:commit-and-push`, PR은
-  `git-workflow:create-pull-request` 플러그인으로 한다
