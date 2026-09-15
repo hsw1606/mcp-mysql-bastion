@@ -55,6 +55,8 @@ export function diagnosis(options: {
   qualifiers?: Record<string, { schema: string | null; table: string }>;
   /** 카탈로그가 아는 테이블들. 각 항목이 자기 스키마를 들고 있다. */
   catalog?: CatalogIndexFacts[];
+  /** 한정되지 않은 이름이 여러 스키마에 걸릴 때 프로덕션이 집는 스키마. */
+  defaultSchema?: string;
   timeoutSeconds?: number;
   maxTimeoutSeconds?: number;
 }): DiagnosisInput {
@@ -69,16 +71,27 @@ export function diagnosis(options: {
       // 프로덕션의 `diagnoseTimeout`과 같은 순서다. qualifier 맵으로 먼저
       // 풀고, 풀리지 않으면 이름을 그대로 참조로 넘긴다.
       const reference = qualifiers.get(name.toLowerCase()) ?? { schema: null, table: name };
-      // 그리고 `CatalogStore.indexFacts`가 하는 일. 참조에 스키마가 있으면
-      // 정확히 그 스키마의 테이블이어야 하고, 없을 때만 이름으로 찾는다.
-      return (
-        catalog.find(
-          (entry) =>
-            entry.table.toLowerCase() === reference.table.toLowerCase() &&
-            (reference.schema === null ||
-              entry.schema.toLowerCase() === reference.schema.toLowerCase()),
-        ) ?? null
+      // 그다음은 `CatalogStore.lookup` + `Catalog.resolveTable`이다. 스키마가
+      // 적혀 있으면 그 스키마로 범위를 좁히고, 없으면 전부를 후보로 둔다.
+      const matches = catalog.filter(
+        (entry) =>
+          entry.table.toLowerCase() === reference.table.toLowerCase() &&
+          (reference.schema === null ||
+            entry.schema.toLowerCase() === reference.schema.toLowerCase()),
       );
+      // 첫 번째를 집으면 안 된다. 프로덕션은 후보가 정확히 하나일 때만 풀고,
+      // 여럿이면 `defaultSchema`로만 가른다. 그것도 없으면 포기한다 —
+      // 동명 테이블의 인덱스를 찍어 주느니 모른다고 하는 쪽이다.
+      if (matches.length === 1) return matches[0];
+      if (reference.schema === null && options.defaultSchema) {
+        return (
+          matches.find(
+            (entry) =>
+              entry.schema.toLowerCase() === options.defaultSchema!.toLowerCase(),
+          ) ?? null
+        );
+      }
+      return null;
     },
   };
 }

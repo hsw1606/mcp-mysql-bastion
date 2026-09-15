@@ -157,6 +157,38 @@ describe("renderTimeoutDiagnostic", () => {
     expect(report).not.toContain("IDX_route");
   });
 
+  test("한정되지 않은 이름이 두 스키마에 걸리면 어느 쪽도 고르지 않는다", () => {
+    // 프로덕션 `resolveTable`은 후보가 정확히 하나일 때만 푼다. 아무 쪽이나
+    // 집으면 남의 스키마 인덱스를 근거로 쿼리를 고치라고 권하게 된다.
+    const report = renderTimeoutDiagnostic(
+      diagnosis({
+        plan: plan("scan"),
+        qualifiers: { account: ACCOUNT },
+        catalog: [
+          facts("haulla", "account", [index("PRIMARY", "id")]),
+          facts("billing", "account", [index("IDX_billing", "customerId")]),
+        ],
+      }),
+    );
+    expect(section(report, "INDEXES")).not.toContain("IDX_billing");
+    expect(section(report, "INDEXES")).toContain("not in the local catalog");
+  });
+
+  test("defaultSchema가 있으면 그것으로 가른다", () => {
+    const report = renderTimeoutDiagnostic(
+      diagnosis({
+        plan: plan("scan"),
+        qualifiers: { account: ACCOUNT },
+        defaultSchema: "billing",
+        catalog: [
+          facts("haulla", "account", [index("PRIMARY", "id")]),
+          facts("billing", "account", [index("IDX_billing", "customerId")]),
+        ],
+      }),
+    );
+    expect(section(report, "INDEXES")).toContain("IDX_billing");
+  });
+
   test("카탈로그에 없는 테이블은 없다가 아니라 모른다로 적는다", () => {
     const report = renderTimeoutDiagnostic(
       diagnosis({ plan: plan("scan"), qualifiers: { account: ACCOUNT }, catalog: [] }),
