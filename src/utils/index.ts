@@ -2,6 +2,9 @@ import { SchemaPermissions } from "../types/index.js";
 type LogType = "info" | "error";
 
 // @INFO: ENABLE_LOGGING이 true면 로깅을 켠다
+// FIXME: AGENTS.md대로라면 이 값도 src/config/index.ts가 읽어 export해야 한다.
+// 옮기기 전에 순환 import를 먼저 풀어야 한다 — config가 이 파일의
+// parseSchemaPermissions를 import하고 있다.
 const ENABLE_LOGGING =
   process.env.ENABLE_LOGGING === "true" || process.env.ENABLE_LOGGING === "1";
 

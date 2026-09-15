@@ -10,6 +10,9 @@ const parser = new Parser();
 // 그러면 스키마 권한 검사가 전역 기본값으로 흘러가 버렸다.
 function extractSchemaFromQuery(sql: string): string | null {
   // 환경 변수에 지정된 기본 스키마
+  // FIXME: MYSQL_DB를 직접 읽는다. config가 이미 같은 값으로 isMultiDbMode를
+  // 만들고 있으므로, 기본 스키마도 config에서 export해 받아 쓴다 (AGENTS.md의
+  // "환경 변수는 src/config/index.ts에서만 읽는다").
   const defaultSchema = process.env.MYSQL_DB || null;
 
   // 기본 스키마가 있고 다중 DB 모드가 아니면 그대로 쓴다
