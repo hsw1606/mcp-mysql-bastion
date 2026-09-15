@@ -5,9 +5,9 @@ import type { AppSchemaEntry } from "../types/index.js";
 
 const execFileAsync = promisify(execFile);
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1_000;
-// Every git call here is a local read that takes about 150ms. A call that has
-// not returned in ten seconds is wedged, and shutdown waits on these tasks
-// before tearing down the tunnel, so it must not wait forever.
+// 여기서 부르는 git은 모두 150ms 남짓 걸리는 로컬 읽기다. 10초가 지나도 돌아오지
+// 않았다면 멈춰 버린 것이다. 종료 과정은 터널을 닫기 전에 이 작업들을 기다리므로
+// 무한정 기다리게 둘 수 없다.
 const GIT_TIMEOUT_MS = 10_000;
 
 interface DocumentManagerOptions {
@@ -76,9 +76,9 @@ function shellQuote(value: string): string {
 export class CatalogDocuments {
   private attempted = false;
   private wakePromise: Promise<void> | null = null;
-  // Set when a reset lands on a wake that is already in flight. That wake read
-  // the ref before the reset, so its answer is the stale one the caller is
-  // discarding, and the next ensureAwake has to start a fresh read.
+  // 이미 진행 중인 wake 위로 reset이 들어왔을 때 세운다. 그 wake는 reset보다 먼저
+  // ref를 읽었으므로 호출자가 버리려는 낡은 답을 들고 있다. 그래서 다음
+  // ensureAwake는 읽기를 새로 시작해야 한다.
   private wakeSpent = false;
   private disabledReason: string | null = null;
 
@@ -100,11 +100,11 @@ export class CatalogDocuments {
   }
 
   /**
-   * Forget that this session already woke the document axis, so the next wake
-   * re-reads the ref. The server never runs `git fetch`, so this is the only
-   * way a fetch the user ran mid-session becomes visible without a restart.
-   * Clearing the failure reason too gives a repaired repository a second
-   * chance: otherwise one transient git error disables documents for good.
+   * 이 세션이 문서 축을 이미 깨웠다는 사실을 잊는다. 그러면 다음 wake가 ref를 다시
+   * 읽는다. 서버는 `git fetch`를 직접 실행하지 않으므로, 사용자가 세션 도중 실행한
+   * fetch를 재시작 없이 반영하는 방법은 이것뿐이다. 실패 사유까지 지우는 것은
+   * 복구된 저장소에 한 번 더 기회를 주기 위해서다. 그러지 않으면 일시적인 git 에러
+   * 하나로 문서 기능이 영영 꺼진다.
    */
   resetWake(): void {
     this.attempted = false;
@@ -134,10 +134,10 @@ export class CatalogDocuments {
     let promise = this.wakePromise;
     if (!promise || this.wakeSpent) {
       this.attempted = true;
-      // A spent wake is queued behind rather than raced. Two concurrent wakes
-      // rewrite the same document paths, and the older one landing last would
-      // persist exactly the commit the reset asked to replace. Its failure is
-      // swallowed so a repaired repository still gets its fresh read.
+      // 소진된 wake와 경쟁시키지 않고 그 뒤에 줄을 세운다. wake 둘이 동시에 돌면
+      // 같은 문서 경로를 겹쳐 쓰는데, 오래된 쪽이 마지막에 도착하면 reset이 바꾸라고
+      // 한 바로 그 커밋이 그대로 남는다. 앞선 실패는 삼킨다. 그래야 복구된 저장소도
+      // 새로 읽은 결과를 받는다.
       const previous =
         promise && this.wakeSpent ? promise.catch(() => undefined) : null;
       this.wakeSpent = false;
@@ -154,9 +154,9 @@ export class CatalogDocuments {
     try {
       await promise;
     } finally {
-      // Only the call that installed this handle clears it. Clearing from every
-      // awaiter let a late one drop a newer wake's handle, and the next
-      // ensureAwake then returned before the paths were populated.
+      // 이 핸들을 걸어 둔 호출만 그것을 지운다. 기다리는 쪽이 모두 지우게 두었더니,
+      // 늦게 깨어난 호출이 더 새로운 wake의 핸들을 지워 버렸다. 그러면 다음
+      // ensureAwake가 경로가 채워지기도 전에 반환했다.
       if (this.wakePromise === promise) this.wakePromise = null;
     }
   }
@@ -280,11 +280,10 @@ export class CatalogDocuments {
       throw new Error(`Schema "${schemaName}" is not declared in MYSQL_APP_SCHEMAS.`);
     }
     const catalog = this.store.snapshot();
-    // The app name from MYSQL_APP_SCHEMAS is assumed to be the monorepo
-    // directory, which is what narrows 91 documents down to the ~24 that can
-    // belong to this schema. It is a convention, not a fact the server can
-    // verify, so a prefix that matches nothing falls back to the full list
-    // rather than reporting "no documents".
+    // MYSQL_APP_SCHEMAS의 앱 이름이 모노레포 디렉토리와 같다고 가정한다. 이 가정
+    // 덕분에 문서 91개가 이 스키마에 속할 수 있는 24개 남짓으로 좁혀진다. 다만 이는
+    // 관례일 뿐 서버가 확인할 수 있는 사실이 아니다. 그래서 prefix가 아무것도 걸러
+    // 내지 못하면 "문서 없음"이라고 말하지 않고 전체 목록으로 물러난다.
     const prefix = `apps/${mapping.app}/`;
     const inPrefix = catalog.docs.paths.filter((path) => path.startsWith(prefix));
     const scoped = inPrefix.length > 0;
@@ -397,8 +396,8 @@ export class CatalogDocuments {
   }
 
   staleWarning(): string | null {
-    // On the query response path. Reads the document axis alone: a full
-    // snapshot would clone every table's metadata to check one timestamp.
+    // 쿼리 응답 경로에서 돈다. 문서 축만 읽는다. 전체 스냅샷을 뜨면 타임스탬프
+    // 하나 보려고 모든 테이블의 메타데이터를 복제하게 된다.
     const updatedAt = this.store.docsView().refUpdatedAt;
     if (!updatedAt) return null;
     const age = Date.now() - Date.parse(updatedAt);

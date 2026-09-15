@@ -1,8 +1,8 @@
 import type { CatalogFile, CatalogJoin, CatalogTable } from "./types.js";
 
-// `map` is an overview. Both unlinked lists grow with the schema — 164 tables
-// and 91 documents on a cold catalog — so they are sampled and counted rather
-// than emitted whole. describe and docs_list give the per-table detail.
+// `map`은 개요다. 연결 안 된 목록 둘은 스키마를 따라 자란다 — 갓 만든 카탈로그에서
+// 테이블 164개, 문서 91개다 — 그래서 통째로 내보내지 않고 표본과 개수만 준다.
+// 테이블별 상세는 describe와 docs_list가 준다.
 const UNLINKED_SAMPLE_LIMIT = 30;
 const HOT_TABLE_LIMIT = 10;
 
@@ -41,11 +41,10 @@ function usedAt(table: CatalogTable): number {
 }
 
 /**
- * Successful reads are the primary signal and recency breaks ties. A failed
- * query means the model could not read that table, so counting attempts would
- * promote exactly the tables that answered nothing. The row estimate is a last
- * resort for the `map` overview only — the tool description drops unread tables
- * rather than guessing importance from size.
+ * 성공한 읽기가 주된 신호이고, 동점은 최근성으로 가른다. 실패한 쿼리는 모델이 그
+ * 테이블을 읽지 못했다는 뜻이다. 그래서 시도 횟수를 세면 아무것도 답하지 못한 테이블이
+ * 오히려 위로 올라온다. 행 추정치는 `map` 개요에서만 쓰는 최후의 수단이다 — 도구
+ * 설명은 크기로 중요도를 짐작하는 대신 읽힌 적 없는 테이블을 아예 뺀다.
  */
 function rankTables(tables: RankedTable[]): RankedTable[] {
   return tables.sort((a, b) => {
@@ -71,18 +70,15 @@ function allTables(catalog: CatalogFile): RankedTable[] {
 }
 
 /**
- * The tail of the `mysql_query` tool description, built to fit `budget`
- * characters.
+ * `mysql_query` 도구 설명의 꼬리 부분. `budget` 글자 수에 맞춰 만든다.
  *
- * The budget is what the base description left over, because a client that
- * caps tool descriptions cuts from the end and says nothing — so overflowing
- * here does not lose the least important text, it loses whatever happens to be
- * last. Counting characters rather than bytes is what the cap is stated in;
- * measuring this Korean guidance in UTF-8 bytes would price it at three times
- * what it costs.
+ * 예산은 기본 설명이 쓰고 남긴 몫이다. 도구 설명에 상한을 두는 클라이언트는 아무 말
+ * 없이 뒤에서부터 자르기 때문이다 — 그래서 여기서 넘치면 덜 중요한 글이 아니라 그저
+ * 맨 뒤에 놓인 글이 사라진다. 바이트가 아니라 글자로 세는 것은 상한 자체가 글자 수로
+ * 쓰여 있어서다. 이 한국어 안내를 UTF-8 바이트로 재면 실제 비용의 세 배로 쳐진다.
  *
- * Guidance outranks the table list: one is an instruction, the other is a
- * starting hint that `mysql_catalog map` gives in full anyway.
+ * 안내가 테이블 목록보다 우선한다. 하나는 지시이고, 다른 하나는 어차피
+ * `mysql_catalog map`이 전부 알려 주는 출발점 힌트일 뿐이다.
  */
 export function renderToolDescriptionSuffix(
   catalog: CatalogFile,
@@ -93,15 +89,14 @@ export function renderToolDescriptionSuffix(
     "SQL을 쓰기 전에 mysql_catalog describe로 확인하라.";
   if (staticGuidance.length > budget) return "";
 
-  // Only tables a query has actually read. Seeding this from row estimates
-  // filled all ten slots with the largest event and log tables — the opposite
-  // of where a model should start — and that went into the tool description of
-  // every session. No list is better guidance than a wrong one.
+  // 쿼리가 실제로 읽은 테이블만 넣는다. 행 추정치로 채웠더니 열 자리가 전부 가장 큰
+  // 이벤트·로그 테이블로 찼다 — 모델이 출발해야 할 곳과 정반대다 — 그리고 그것이 모든
+  // 세션의 도구 설명에 실렸다. 틀린 목록보다는 목록이 없는 편이 나은 안내다.
   //
-  // Names only. The read count and date that used to follow each name ranked
-  // the list, and the list is already in that order; spelling the ranking out
-  // cost about 55 characters a table for something the order says. `map`
-  // still reports both for anyone who wants to see the ranking itself.
+  // 이름만 적는다. 예전에 이름 뒤에 붙던 읽은 횟수와 날짜는 목록의 순위를 매기던
+  // 값인데, 목록은 이미 그 순서로 놓여 있다. 순서가 말해 주는 것을 굳이 적느라
+  // 테이블마다 55자쯤을 썼다. 순위 자체를 보고 싶은 사람에게는 `map`이 여전히 둘 다
+  // 알려 준다.
   const hot = rankTables(
     allTables(catalog).filter(({ entry }) => entry.usage.successCount > 0),
   )
@@ -116,8 +111,7 @@ export function renderToolDescriptionSuffix(
     if ((heading + next + staticGuidance).length > budget) break;
     listed = next;
   }
-  // A heading with nothing under it is noise, and it is the case where even
-  // the first name did not fit.
+  // 아래에 아무것도 없는 제목은 잡음이다. 첫 이름조차 들어가지 못한 경우가 그렇다.
   if (!listed) return staticGuidance;
   return heading + listed + staticGuidance;
 }
