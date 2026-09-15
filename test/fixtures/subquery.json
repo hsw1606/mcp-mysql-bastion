@@ -1,0 +1,67 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "4332.04"
+    },
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "account",
+          "access_type": "ALL",
+          "rows_examined_per_scan": 10100,
+          "rows_produced_per_join": 10100,
+          "filtered": "100.00",
+          "cost_info": {
+            "read_cost": "482.21",
+            "eval_cost": "1010.00",
+            "prefix_cost": "1492.21",
+            "data_read_per_join": "298M"
+          },
+          "used_columns": [
+            "id",
+            "status"
+          ]
+        }
+      },
+      {
+        "table": {
+          "table_name": "<subquery2>",
+          "access_type": "eq_ref",
+          "key": "<auto_distinct_key>",
+          "key_length": "1022",
+          "ref": [
+            "haulla.account.status"
+          ],
+          "rows_examined_per_scan": 1,
+          "materialized_from_subquery": {
+            "using_temporary_table": true,
+            "query_block": {
+              "table": {
+                "table_name": "account",
+                "access_type": "ALL",
+                "possible_keys": [
+                  "PRIMARY"
+                ],
+                "rows_examined_per_scan": 10100,
+                "rows_produced_per_join": 3366,
+                "filtered": "33.33",
+                "cost_info": {
+                  "read_cost": "1155.57",
+                  "eval_cost": "336.63",
+                  "prefix_cost": "1492.21",
+                  "data_read_per_join": "99M"
+                },
+                "used_columns": [
+                  "id",
+                  "status"
+                ],
+                "attached_condition": "(`haulla`.`account`.`id` > 5)"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
