@@ -826,9 +826,7 @@ export default function createMcpServer() {
       // 장치다. 범위를 벗어난 숫자 하나로 호출을 거절하면, 스키마에 이미 적혀 있는 한계를
       // 알아내려고 사용자가 왕복을 한 번 더 해야 한다.
       const timeoutSeconds = clampTimeoutSeconds(
-        typeof request.params.arguments?.timeout_seconds === "number"
-          ? (request.params.arguments.timeout_seconds as number)
-          : undefined,
+        request.params.arguments?.timeout_seconds,
       );
       const references = catalog.prepareQuery(sql);
       let result: {
