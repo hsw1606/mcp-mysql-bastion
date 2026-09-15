@@ -153,6 +153,40 @@ function describeIndexes(facts: CatalogIndexFacts): string {
     .join(", ");
 }
 
+/** A plan node with the name both sections will print it under. */
+interface LabelledTable {
+  table: PlanTable;
+  /** The table itself, qualified. What the index list dedupes on. */
+  canonical: string;
+  /** `canonical` with the plan's alias appended when EXPLAIN used one. */
+  label: string;
+}
+
+/**
+ * Settle on one name per plan node, before either section prints it.
+ *
+ * EXPLAIN names the alias where the query used one, so a summary reading `i`
+ * over an index list reading `haulla.invoice` leaves the reader to pair the two
+ * up - work the qualifier map has already done. The alias stays in parentheses
+ * because the plan's conditions are written in terms of it.
+ */
+function labelTables(input: DiagnosisInput, tables: PlanTable[]): LabelledTable[] {
+  return tables.map((table) => {
+    if (table.synthetic) return { table, canonical: table.name, label: table.name };
+    const facts = input.lookupIndexes(table.name);
+    const resolved = input.qualifiers.get(table.name.toLowerCase());
+    const canonical = facts
+      ? `${facts.schema}.${facts.table}`
+      : resolved
+        ? `${resolved.schema ? `${resolved.schema}.` : ""}${resolved.table}`
+        : table.name;
+    const alias = table.name.toLowerCase();
+    const named =
+      canonical.toLowerCase() === alias || canonical.toLowerCase().endsWith(`.${alias}`);
+    return { table, canonical, label: named ? canonical : `${canonical} (${table.name})` };
+  });
+}
+
 /**
  * What the catalog knows about the tables this plan touched.
  *
@@ -161,27 +195,23 @@ function describeIndexes(facts: CatalogIndexFacts): string {
  * in a summary and are not the same claim, and only one of them justifies
  * telling a user to give up.
  */
-function renderIndexSection(input: DiagnosisInput, tables: PlanTable[]): string[] {
+function renderIndexSection(input: DiagnosisInput, tables: LabelledTable[]): string[] {
   const seen = new Set<string>();
   const lines: string[] = [];
-  for (const table of tables) {
+  for (const { table, canonical } of tables) {
     // A step has no index list to be ignorant of, so the catalog is not asked
     // about one. Saying so instead would explain the model's own plan back to
     // it. The lookup is by name, and a derived table's alias can be some real
     // table's name, so skipping is also what keeps that table's indexes from
     // being reported as the alias's.
     if (table.synthetic) continue;
-    const resolved = input.qualifiers.get(table.name.toLowerCase());
-    const label = resolved
-      ? `${resolved.schema ? `${resolved.schema}.` : ""}${resolved.table}`
-      : table.name;
-    if (seen.has(label.toLowerCase())) continue;
-    seen.add(label.toLowerCase());
+    if (seen.has(canonical.toLowerCase())) continue;
+    seen.add(canonical.toLowerCase());
 
     const facts = input.lookupIndexes(table.name);
     if (!facts) {
       lines.push(
-        `  ${label}: not in the local catalog - its index list is unknown here, so absence of an index cannot be concluded.`,
+        `  ${canonical}: not in the local catalog - its index list is unknown here, so absence of an index cannot be concluded.`,
       );
       continue;
     }
@@ -190,7 +220,7 @@ function renderIndexSection(input: DiagnosisInput, tables: PlanTable[]): string[
       : facts.detailScannedAt === null
         ? "  (not scanned in detail yet - may be incomplete)"
         : "";
-    lines.push(`  ${facts.schema}.${facts.table}: ${describeIndexes(facts)}${staleness}`);
+    lines.push(`  ${canonical}: ${describeIndexes(facts)}${staleness}`);
   }
   return lines;
 }
@@ -229,7 +259,7 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
     return lines.join("\n");
   }
 
-  const tables = collectPlanTables(input.plan);
+  const tables = labelTables(input, collectPlanTables(input.plan));
 
   lines.push(
     "[EXPLAIN ALREADY RUN] The server ran EXPLAIN FORMAT=JSON on this statement and attached the",
@@ -239,9 +269,9 @@ export function renderTimeoutDiagnostic(input: DiagnosisInput): string {
 
   if (tables.length > 0) {
     lines.push("[PLAN BY TABLE] in join order.");
-    tables.forEach((table, i) => {
+    tables.forEach(({ table, label }, i) => {
       lines.push(
-        `  ${i + 1}. ${table.name} - access: ${table.accessType}, ${formatRows(table.rows)}, key: ${table.key ?? "none"}`,
+        `  ${i + 1}. ${label} - access: ${table.accessType}, ${formatRows(table.rows)}, key: ${table.key ?? "none"}`,
       );
       if (table.condition) lines.push(`     condition: ${table.condition}`);
     });
