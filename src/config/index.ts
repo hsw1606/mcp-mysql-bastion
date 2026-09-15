@@ -1,7 +1,7 @@
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import { AppSchemaEntry, SchemaPermissions } from "../types/index.js";
-import { parseSchemaPermissions, parseMySQLConnectionString } from "../utils/index.js";
+import { parseSchemaPermissions } from "../utils/index.js";
 
 /**
  * SSL 연결에 쓸 파일(인증서, 키, CA)을 읽고 검증한다.
@@ -224,12 +224,6 @@ export const MYSQL_CATALOG_TTL_HOURS = parseCatalogTtl(
 /** Git 접근은 catalog의 문서 단계에서 더해진다. 경로가 비어 있어도 된다. */
 export const MYSQL_DOCS_REPO = process.env.MYSQL_DOCS_REPO?.trim() || undefined;
 
-// @INFO: 연결 문자열이 있으면 파싱한다
-// 연결 문자열이 개별 환경 변수보다 우선한다
-const connectionStringConfig = process.env.MYSQL_CONNECTION_STRING
-  ? parseMySQLConnectionString(process.env.MYSQL_CONNECTION_STRING)
-  : {};
-
 // @INFO: 데이터베이스가 제대로 잡히도록 환경 설정을 보정한다
 if (process.env.NODE_ENV === "test" && !process.env.MYSQL_DB) {
   process.env.MYSQL_DB = "mcp_test_db"; // @INFO: 테스트에서 쓸 데이터베이스 이름을 확보한다
@@ -377,49 +371,40 @@ export const SCHEMA_DDL_PERMISSIONS: SchemaPermissions =
   schemaPermissions("SCHEMA_DDL_PERMISSIONS");
 
 // 다중 DB 모드인지 확인한다 (특정 DB를 지정하지 않은 경우)
-const dbFromEnvOrConnString = connectionStringConfig.database || process.env.MYSQL_DB;
-export const isMultiDbMode =
-  !dbFromEnvOrConnString || dbFromEnvOrConnString.trim() === "";
+export const isMultiDbMode = !(process.env.MYSQL_DB ?? "").trim();
 
+/**
+ * mysql2에 그대로 넘기는 풀 옵션.
+ *
+ * 이 객체에는 `mysql` 하나만 있다. 예전에는 서버 이름과 전송 방식을 함께 들고
+ * 있었는데, 서버 이름은 `index.ts`가 직접 적고 전송은 stdio 하나뿐이라 둘 다
+ * 읽는 곳이 없었다.
+ */
 export const mcpConfig = {
-  server: {
-    name: "@benborla29/mcp-server-mysql",
-    version: MCP_VERSION,
-    connectionTypes: ["stdio", "streamableHttp"],
-  },
   mysql: {
-    // Unix 소켓이 있으면 그것을 쓰고(연결 문자열이 우선), 없으면 host/port를 쓴다
-    ...(connectionStringConfig.socketPath || process.env.MYSQL_SOCKET_PATH
-      ? {
-          socketPath: connectionStringConfig.socketPath || process.env.MYSQL_SOCKET_PATH,
-        }
+    // Unix 소켓이 있으면 그것을 쓰고, 없으면 host/port를 쓴다.
+    // 터널을 열면 `getPool`이 socketPath를 버리고 loopback 주소로 갈아끼운다.
+    ...(process.env.MYSQL_SOCKET_PATH
+      ? { socketPath: process.env.MYSQL_SOCKET_PATH }
       : {
-          host: connectionStringConfig.host || process.env.MYSQL_HOST || "127.0.0.1",
-          port: connectionStringConfig.port || Number(process.env.MYSQL_PORT || "3306"),
+          host: process.env.MYSQL_HOST || "127.0.0.1",
+          port: Number(process.env.MYSQL_PORT || "3306"),
         }),
-    user: connectionStringConfig.user || process.env.MYSQL_USER || "root",
-    password:
-      connectionStringConfig.password !== undefined
-        ? connectionStringConfig.password
-        : process.env.MYSQL_PASS === undefined
-          ? ""
-          : process.env.MYSQL_PASS,
-    database: connectionStringConfig.database || process.env.MYSQL_DB || undefined, // 다중 DB 모드를 위해 database가 undefined인 것을 허용한다
+    user: process.env.MYSQL_USER || "root",
+    password: process.env.MYSQL_PASS ?? "",
+    database: process.env.MYSQL_DB || undefined, // 다중 DB 모드를 위해 database가 undefined인 것을 허용한다
     connectionLimit: 10,
     waitForConnections: true,
-    queueLimit: process.env.MYSQL_QUEUE_LIMIT ? parseInt(process.env.MYSQL_QUEUE_LIMIT, 10) : 100,
+    queueLimit: process.env.MYSQL_QUEUE_LIMIT
+      ? parseInt(process.env.MYSQL_QUEUE_LIMIT, 10)
+      : 100,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
-    connectTimeout: process.env.MYSQL_CONNECT_TIMEOUT ? parseInt(process.env.MYSQL_CONNECT_TIMEOUT, 10) : 10000,
+    connectTimeout: process.env.MYSQL_CONNECT_TIMEOUT
+      ? parseInt(process.env.MYSQL_CONNECT_TIMEOUT, 10)
+      : 10000,
     authPlugins: {
-      mysql_clear_password: () => () =>
-        Buffer.from(
-          connectionStringConfig.password !== undefined
-            ? connectionStringConfig.password
-            : process.env.MYSQL_PASS !== undefined
-              ? process.env.MYSQL_PASS
-              : ""
-        ),
+      mysql_clear_password: () => () => Buffer.from(process.env.MYSQL_PASS ?? ""),
     },
     ...(process.env.MYSQL_SSL === "true"
       ? {
@@ -443,27 +428,15 @@ export const mcpConfig = {
       : {}),
     // 날짜/시간 처리를 위한 타임존 설정
     ...(process.env.MYSQL_TIMEZONE
-      ? {
-          timezone: process.env.MYSQL_TIMEZONE,
-        }
+      ? { timezone: process.env.MYSQL_TIMEZONE }
       : {}),
     // 날짜 값을 JavaScript Date 객체 대신 문자열로 돌려준다
-    ...(process.env.MYSQL_DATE_STRINGS === "true"
-      ? {
-          dateStrings: true,
-        }
-      : {}),
+    ...(process.env.MYSQL_DATE_STRINGS === "true" ? { dateStrings: true } : {}),
     // 정밀도 손실을 막으려고 BIGINT/DECIMAL 값을 문자열로 돌려준다
     // snowflake ID(19자리)를 쓰는 테이블에는 필수다. Number.MAX_SAFE_INTEGER(2^53-1)를 넘기 때문이다
     ...(process.env.MYSQL_BIG_NUMBER_STRINGS === "true"
-      ? {
-          supportBigNumbers: true,
-          bigNumberStrings: true,
-        }
+      ? { supportBigNumbers: true, bigNumberStrings: true }
       : {}),
-  },
-  paths: {
-    schema: "schema",
   },
 };
 
