@@ -87,7 +87,7 @@ describe("renderTimeoutDiagnostic", () => {
       diagnosis({
         plan: plan("alias"),
         qualifiers: { a: ACCOUNT, account: ACCOUNT },
-        catalog: { account: facts("haulla", "account", [index("PRIMARY", "id")]) },
+        catalog: [facts("haulla", "account", [index("PRIMARY", "id")])],
       }),
     );
     expect(section(report, "PLAN BY TABLE")).toContain("haulla.account (a)");
@@ -101,7 +101,7 @@ describe("renderTimeoutDiagnostic", () => {
       diagnosis({
         plan: plan("scan"),
         qualifiers: { account: ACCOUNT },
-        catalog: { account: facts("haulla", "account", [index("PRIMARY", "id")]) },
+        catalog: [facts("haulla", "account", [index("PRIMARY", "id")])],
       }),
     );
     expect(section(report, "PLAN BY TABLE")).toContain("1. haulla.account - access: ALL");
@@ -123,7 +123,7 @@ describe("renderTimeoutDiagnostic", () => {
         diagnosis({
           plan: plan(fixture),
           qualifiers: { account: ACCOUNT },
-          catalog: { account: facts("haulla", "account", [index("PRIMARY", "id")]) },
+          catalog: [facts("haulla", "account", [index("PRIMARY", "id")])],
         }),
       );
       const step = collectPlanTables(plan(fixture)).find((t) => t.synthetic)!.name;
@@ -135,6 +135,9 @@ describe("renderTimeoutDiagnostic", () => {
       expect(entries(section(report, "PLAN BY TABLE"))).toContainEqual(
         expect.stringContaining(step),
       );
+      // 긍정 단언을 먼저 건다. `section`은 머리말이 없으면 빈 문자열을 주므로,
+      // 아래 부정 단언 하나만 두면 [INDEXES]가 통째로 사라져도 통과한다.
+      expect(entries(section(report, "INDEXES"))).toContain("haulla.account");
       expect(entries(section(report, "INDEXES"))).not.toContain(step);
     },
   );
@@ -144,11 +147,11 @@ describe("renderTimeoutDiagnostic", () => {
       diagnosis({
         plan: plan("derived"),
         qualifiers: { account: ACCOUNT },
-        catalog: {
-          account: facts("haulla", "account", [index("PRIMARY", "id")]),
+        catalog: [
+          facts("haulla", "account", [index("PRIMARY", "id")]),
           // 진짜 `d` 테이블이 있다. `d`로 별칭 붙은 서브쿼리는 그것이 아니다.
-          d: facts("haulla", "d", [index("IDX_route", "routeId", "day")]),
-        },
+          facts("haulla", "d", [index("IDX_route", "routeId", "day")]),
+        ],
       }),
     );
     expect(report).not.toContain("IDX_route");
@@ -156,7 +159,7 @@ describe("renderTimeoutDiagnostic", () => {
 
   test("카탈로그에 없는 테이블은 없다가 아니라 모른다로 적는다", () => {
     const report = renderTimeoutDiagnostic(
-      diagnosis({ plan: plan("scan"), qualifiers: { account: ACCOUNT }, catalog: {} }),
+      diagnosis({ plan: plan("scan"), qualifiers: { account: ACCOUNT }, catalog: [] }),
     );
     // "여기서는 인덱스 목록을 모른다"와 "인덱스가 없다"는 사용자에게 권할
     // 다음 행동이 다르다.
@@ -177,7 +180,7 @@ describe("renderTimeoutDiagnostic", () => {
       diagnosis({
         plan: selfJoin,
         qualifiers: { a: ACCOUNT, b: ACCOUNT },
-        catalog: { account: facts("haulla", "account", [index("PRIMARY", "id")]) },
+        catalog: [facts("haulla", "account", [index("PRIMARY", "id")])],
       }),
     );
     expect(section(report, "PLAN BY TABLE")).toContain("haulla.account (a)");
