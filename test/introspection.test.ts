@@ -7,7 +7,7 @@ import {
 } from "../src/db/utils.js";
 
 /**
- * `executeReadOnlyQuery`가 src/db/index.ts:572에서 세우는 규칙.
+ * `executeReadOnlyQuery`가 `isUnparseableIntrospection`으로 세우는 규칙.
  *
  * AST를 걸어서 찾아낸 kind는 파서가 그 문장을 처리했다는 뜻이다. 그러니
  * 쿼리 타입 검사와 권한 검사를 계속 거쳐야 한다. 우회시키면 쓰기 라우팅까지
@@ -67,6 +67,10 @@ describe("isIntrospectionQuery", () => {
       // `EXPLAIN <테이블>`은 DESCRIBE라서 우회해야 하지만,
       // `EXPLAIN <문장>`은 파서가 처리하는 플랜 조회다. 우회시키면 그 문장이
       // 쓰기 라우팅을 지나쳐 간다.
+      //
+      // `describe`가 아니라는 것만으로는 부족하다. 우회 조건은
+      // `information_schema`와 `mysql_schema`를 뺀 모든 kind이므로, 회귀가
+      // 이 문장들을 다른 아무 kind로나 분류해도 쓰기는 그대로 나간다.
       for (const sql of [
         "EXPLAIN SELECT id FROM account",
         "EXPLAIN ANALYZE SELECT id FROM account",
@@ -75,6 +79,7 @@ describe("isIntrospectionQuery", () => {
         "EXPLAIN (SELECT 1)",
       ]) {
         expect(isIntrospectionQuery(sql).kind).not.toBe("describe");
+        expect(bypassesParser(sql)).toBe(false);
       }
     });
   });
