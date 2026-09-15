@@ -23,6 +23,13 @@ export interface PlanTable {
   key: string | null;
   /** The plan's `attached_condition`, verbatim. */
   condition: string | null;
+  /**
+   * True when this node is a step rather than a table: a union result, a
+   * materialized subquery, a derived table. EXPLAIN gives these a `table_name`
+   * like a real table - `<union1,2>`, or for a derived table the alias the
+   * query gave it, which is indistinguishable from a table name by spelling.
+   */
+  synthetic: boolean;
 }
 
 function readRows(node: Record<string, unknown>): number | null {
@@ -65,6 +72,8 @@ export function collectPlanTables(node: unknown): PlanTable[] {
           typeof obj.attached_condition === "string" && obj.attached_condition
             ? obj.attached_condition
             : null,
+        synthetic:
+          obj.table_name.startsWith("<") || "materialized_from_subquery" in obj,
       });
     }
     for (const child of Object.values(obj)) visit(child);
@@ -136,6 +145,12 @@ function renderIndexSection(input: DiagnosisInput, tables: PlanTable[]): string[
   const seen = new Set<string>();
   const lines: string[] = [];
   for (const table of tables) {
+    // A step has no index list to be ignorant of, so the catalog is not asked
+    // about one. Saying so instead would explain the model's own plan back to
+    // it. The lookup is by name, and a derived table's alias can be some real
+    // table's name, so skipping is also what keeps that table's indexes from
+    // being reported as the alias's.
+    if (table.synthetic) continue;
     const resolved = input.qualifiers.get(table.name.toLowerCase());
     const label = resolved
       ? `${resolved.schema ? `${resolved.schema}.` : ""}${resolved.table}`
