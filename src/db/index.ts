@@ -497,8 +497,8 @@ function clampTimeoutSeconds(requested: number | undefined): number {
  * EXPLAIN does not execute the statement, so it cannot repeat the timeout. It
  * does bypass the introspection guard, though — it is issued from inside this
  * executor rather than sent by a caller — and plans carry the literals a query
- * filtered on. Masking those is `renderTimeoutDiagnostic`'s job, and no plan
- * reaches the response by any other route.
+ * filtered on, which go back to the caller that wrote them. No plan reaches the
+ * response by any other route.
  */
 async function diagnoseTimeout(
   connection: mysql2.PoolConnection,
