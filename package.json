@@ -5,6 +5,9 @@
   "description": "Read-only MySQL MCP server that reaches its database through an SSH bastion, with per-environment profiles",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "dist/index.js",
   "bin": {
     "mcp-mysql-bastion": "dist/index.js"
