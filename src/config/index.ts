@@ -353,6 +353,34 @@ export const MAX_RESPONSE_ROWS = parsePositiveInt(
   5000,
 );
 
+/**
+ * 동시에 열어 두는 MySQL 커넥션 수.
+ *
+ * 터널을 쓰면 이 커넥션들은 SSH 세션 하나 위의 독립된 채널이 된다. 그래서 값을
+ * 올리는 비용은 bastion 쪽 채널 몇 개이지 SSH 핸드셰이크가 아니다. 기본값이 작은
+ * 것은 이 서버를 쓰는 쪽이 모델 하나이고, 그 모델은 도구 호출을 한 번에 하나씩
+ * 하기 때문이다.
+ */
+export const MYSQL_POOL_SIZE = parsePositiveInt(
+  "MYSQL_POOL_SIZE",
+  process.env.MYSQL_POOL_SIZE,
+  10,
+);
+
+/** 풀이 꽉 찼을 때 대기열에 쌓아 둘 요청 수. */
+export const MYSQL_QUEUE_LIMIT = parsePositiveInt(
+  "MYSQL_QUEUE_LIMIT",
+  process.env.MYSQL_QUEUE_LIMIT,
+  100,
+);
+
+/** TCP·핸드셰이크까지 포함한 접속 제한 시간(ms). */
+export const MYSQL_CONNECT_TIMEOUT = parsePositiveInt(
+  "MYSQL_CONNECT_TIMEOUT",
+  process.env.MYSQL_CONNECT_TIMEOUT,
+  10000,
+);
+
 // 스키마별 권한.
 //
 // 전역 플래그를 스키마 단위로 *덮어쓰는* 값이라, 쓰기 금지 프로필에서는 이것도
@@ -393,16 +421,12 @@ export const mcpConfig = {
     user: process.env.MYSQL_USER || "root",
     password: process.env.MYSQL_PASS ?? "",
     database: process.env.MYSQL_DB || undefined, // 다중 DB 모드를 위해 database가 undefined인 것을 허용한다
-    connectionLimit: 10,
+    connectionLimit: MYSQL_POOL_SIZE,
     waitForConnections: true,
-    queueLimit: process.env.MYSQL_QUEUE_LIMIT
-      ? parseInt(process.env.MYSQL_QUEUE_LIMIT, 10)
-      : 100,
+    queueLimit: MYSQL_QUEUE_LIMIT,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
-    connectTimeout: process.env.MYSQL_CONNECT_TIMEOUT
-      ? parseInt(process.env.MYSQL_CONNECT_TIMEOUT, 10)
-      : 10000,
+    connectTimeout: MYSQL_CONNECT_TIMEOUT,
     authPlugins: {
       mysql_clear_password: () => () => Buffer.from(process.env.MYSQL_PASS ?? ""),
     },
