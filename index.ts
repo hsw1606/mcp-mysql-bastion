@@ -462,6 +462,22 @@ export default function createMcpServer() {
     // cancelled — none of which a caller that wants a table list can use. This
     // is the same instance-wide scan the catalog runs, and it runs under the
     // same limits.
+    //
+    // The absent row cap is the part worth defending, because the response cap
+    // is otherwise applied to everything. Three reasons, each sufficient:
+    //
+    //   - A cut here cannot be announced. Truncation is reported by the read
+    //     path, which appends a `[TRUNCATED]` block; this executor returns bare
+    //     rows and has nowhere to say it, so a capped listing would read as a
+    //     whole one.
+    //   - It would disagree with the catalog. `listTables` flattens the stored
+    //     snapshot uncapped, so capping only the fallback makes one resource
+    //     report different completeness depending on whether the inventory scan
+    //     has finished — worse than being consistently either way.
+    //   - These rows are the listing, not a result set. The cap exists to keep a
+    //     query's rows from crowding the model's context; a table missing from
+    //     this list is one the client never offers and `mysql://tables/{name}`
+    //     can no longer be asked for. That removes reach, not volume.
     return await executeQuery<TableRow[]>(`
       SELECT
         table_name as name,
