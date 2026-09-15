@@ -450,9 +450,24 @@ export class CatalogStore {
 
   private loadFromDisk(): void {
     if (!fs.existsSync(this.options.filePath)) return;
-    const parsed = JSON.parse(
-      fs.readFileSync(this.options.filePath, "utf8"),
-    ) as Partial<CatalogFile>;
+    let parsed: Partial<CatalogFile>;
+    try {
+      parsed = JSON.parse(
+        fs.readFileSync(this.options.filePath, "utf8"),
+      ) as Partial<CatalogFile>;
+    } catch (error) {
+      // 읽을 수 없는 파일은 카탈로그를 끌 이유가 못 된다. 캐시가 없는 것과 같게
+      // 다루면 되고, 다음 flush의 원자적 rename이 그 파일을 우리 내용으로
+      // 교체한다. 카탈로그를 끄는 것은 디스크 자체를 쓸 수 없을 때뿐이다 —
+      // 그쪽은 `initialize`의 mkdir이 잡는다. 같은 파일의 `readExternal`도
+      // flush 경로에서 이미 이렇게 관용한다.
+      console.error(
+        `[catalog] ignoring unreadable ${this.options.filePath}; it will be replaced: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
     if (
       parsed.version !== CATALOG_VERSION ||
       parsed.profile !== this.options.profile ||
