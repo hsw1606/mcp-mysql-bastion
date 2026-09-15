@@ -602,7 +602,12 @@ export default function createMcpServer() {
         };
       }
 
-      if (catalog.isEnabled() && request.params.uri === "mysql://tables") {
+      // Answered for a disabled catalog too. The URI is listed unconditionally,
+      // and it has no trailing slash, so the parsing below reads it as the bare
+      // table name "tables" with no schema — and returns the columns of
+      // `information_schema.tables` to a caller that asked for the table list.
+      // `loadResourceTables` already handles a disabled or empty catalog.
+      if (request.params.uri === "mysql://tables") {
         return {
           contents: [
             {
