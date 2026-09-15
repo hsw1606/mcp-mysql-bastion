@@ -10,7 +10,7 @@ import {
 import {
   extractSchemaFromQuery,
   getQueryTypes,
-  isIntrospectionQuery,
+  isUnparseableIntrospection,
   extractQualifiers,
 } from "./utils.js";
 import {
@@ -533,19 +533,9 @@ async function executeReadOnlyQuery<T>(
   let connection;
   try {
     assertTunnelHealthy();
-    // `node-sql-parser`는 introspection 문장 대부분을 파싱하지 못한다. SHOW TABLE STATUS,
-    // SHOW SCHEMAS, SHOW CHARSET 모두 그대로 실패한다. 그래서 여기서 먼저 가려내고, 아래의
-    // 쿼리 종류·권한 블록을 건너뛰게 한다. 그 블록에 들어가면 파싱 오류를 이유로 거부당한다.
-    //
-    // `isIntrospectionQuery` 전체보다 일부러 좁게 잡는다. `information_schema`와
-    // `mysql_schema` 종류는 AST를 훑어서 찾아내는데, 그건 파서가 처리했다는 뜻이다. 게다가
-    // 그 둘까지 블록을 건너뛰면 `UPDATE mysql.user SET ...` 같은 문장의 쓰기 라우팅도 함께
-    // 건너뛰게 된다.
-    const introspectionKind = isIntrospectionQuery(sql).kind;
-    const isUnparseableIntrospection =
-      introspectionKind !== null &&
-      introspectionKind !== "information_schema" &&
-      introspectionKind !== "mysql_schema";
+    // 왜 이 블록을 건너뛰는지, 왜 종류 둘은 제외하는지는 판정 함수의 JSDoc에 적혀 있다.
+    // 테스트가 그 함수를 그대로 불러 검사하도록 조건을 여기 두지 않았다.
+    const bypassesQueryTypeChecks = isUnparseableIntrospection(sql);
 
     let queryTypes: string[] = [];
     let schema: string | null = null;
@@ -554,7 +544,7 @@ async function executeReadOnlyQuery<T>(
     let isDeleteOperation = false;
     let isDDLOperation = false;
 
-    if (!isUnparseableIntrospection) {
+    if (!bypassesQueryTypeChecks) {
       queryTypes = await getQueryTypes(sql);
       schema = extractSchemaFromQuery(sql);
       isUpdateOperation = queryTypes.some((type) => ["update"].includes(type));
