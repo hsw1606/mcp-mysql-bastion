@@ -3,20 +3,20 @@ import {
   extractQualifiers,
   getQueryTypes,
   isIntrospectionQuery,
+  isUnparseableIntrospection,
   stripExplainModifiers,
 } from "../src/db/utils.js";
 
 /**
- * `executeReadOnlyQuery`가 `isUnparseableIntrospection`으로 세우는 규칙.
+ * `executeReadOnlyQuery`가 쿼리 종류·권한 블록을 건너뛸지 정하는 바로 그 판정을
+ * 부른다. 조건을 여기 베껴 쓰면, `src` 쪽에 제외 종류가 하나 더 붙는 날 이
+ * 파일은 옛 규칙을 단언하며 계속 통과한다.
  *
- * AST를 걸어서 찾아낸 kind는 파서가 그 문장을 처리했다는 뜻이다. 그러니
- * 쿼리 타입 검사와 권한 검사를 계속 거쳐야 한다. 우회시키면 쓰기 라우팅까지
+ * AST를 걸어서 찾아낸 kind는 파서가 그 문장을 처리했다는 뜻이다. 그러니 쿼리
+ * 타입 검사와 권한 검사를 계속 거쳐야 한다. 우회시키면 쓰기 라우팅까지
  * 건너뛴다.
  */
-const bypassesParser = (sql: string): boolean => {
-  const kind = isIntrospectionQuery(sql).kind;
-  return kind !== null && kind !== "information_schema" && kind !== "mysql_schema";
-};
+const bypassesParser = isUnparseableIntrospection;
 
 describe("isIntrospectionQuery", () => {
   test.each([

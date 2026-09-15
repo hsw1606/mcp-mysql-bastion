@@ -278,10 +278,35 @@ function extractQualifiers(sql: string): QualifierMap {
   return map;
 }
 
+/**
+ * 이 문장이 실행기의 쿼리 종류·권한 블록을 건너뛰어야 하는가.
+ *
+ * `node-sql-parser`는 introspection 문장 대부분을 파싱하지 못한다. SHOW TABLE
+ * STATUS, SHOW SCHEMAS, SHOW CHARSET 모두 그대로 실패한다. 그 블록에 들어가면
+ * 파싱 오류를 이유로 거부당하므로 먼저 가려내 흘려보낸다.
+ *
+ * `isIntrospectionQuery` 전체보다 일부러 좁게 잡는다. `information_schema`와
+ * `mysql_schema` 종류는 AST를 훑어서 찾아낸 것이고, 그건 파서가 그 문장을
+ * 처리했다는 뜻이다. 게다가 그 둘까지 건너뛰면 `UPDATE mysql.user SET ...`
+ * 같은 문장의 쓰기 라우팅도 함께 건너뛴다. 이 판정이 틀리면 읽기 전용 서버에서
+ * 쓰기가 나간다 — 이 파일에서 그런 결과를 낼 수 있는 유일한 자리다.
+ *
+ * 조건을 `executeReadOnlyQuery` 안의 지역 변수로 두지 않고 여기로 꺼내 둔다.
+ * 테스트가 같은 조건을 손으로 베껴 쓰면, 여기에 제외 종류가 하나 더 붙는 날
+ * 테스트는 옛 규칙을 단언하며 초록색으로 남는다.
+ */
+function isUnparseableIntrospection(sql: string): boolean {
+  const kind = isIntrospectionQuery(sql).kind;
+  return (
+    kind !== null && kind !== "information_schema" && kind !== "mysql_schema"
+  );
+}
+
 export {
   extractSchemaFromQuery,
   getQueryTypes,
   isIntrospectionQuery,
+  isUnparseableIntrospection,
   extractQualifiers,
   stripExplainModifiers,
 };
