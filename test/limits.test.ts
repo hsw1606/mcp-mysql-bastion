@@ -116,6 +116,18 @@ describe("운영자 상한", () => {
   });
 });
 
+describe("숫자 환경 변수", () => {
+  test("못 쓸 MYSQL_PORT는 NaN이 되는 대신 기본값으로 떨어진다", async () => {
+    // 상한 값들과 달리 여기만 맨 Number()를 썼던 탓에 NaN이 그대로 mysql2까지
+    // 갔다. 그러면 접속은 실패하는데 무엇이 잘못됐는지는 아무도 말해주지 않는다.
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubEnv("MYSQL_PORT", "three");
+    const c = await config();
+    expect((c.mcpConfig.mysql as { port: number }).port).toBe(3306);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("MYSQL_PORT"));
+  });
+});
+
 describe("쓰기가 금지된 profile", () => {
   test("플래그가 뭐라고 하든 모든 쓰기를 거절한다", async () => {
     vi.stubEnv("MYSQL_PROFILE", "prod");
