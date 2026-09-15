@@ -99,12 +99,6 @@ export interface DiagnosisInput {
   qualifiers: QualifierMap;
   /** Catalog index facts for a table the plan named, or null if unknown. */
   lookupIndexes: (name: string) => CatalogIndexFacts | null;
-  /**
-   * Whether PII redaction drops columns from the catalog's index lists. When it
-   * does, a column absent from a list below may still be indexed, and the
-   * report has to say so rather than let absence read as fact.
-   */
-  indexListMayOmitColumns: boolean;
 }
 
 /**
@@ -162,12 +156,6 @@ function renderIndexSection(input: DiagnosisInput, tables: PlanTable[]): string[
         ? "  (not scanned in detail yet - may be incomplete)"
         : "";
     lines.push(`  ${facts.schema}.${facts.table}: ${describeIndexes(facts)}${staleness}`);
-  }
-  if (lines.length > 0 && input.indexListMayOmitColumns) {
-    lines.push(
-      "  PII redaction is on, so an index on a redacted column was never recorded:",
-      "  a column missing above may still be indexed in the database.",
-    );
   }
   return lines;
 }

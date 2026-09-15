@@ -119,7 +119,6 @@ export class SchemaCatalog {
     this.collector = new CatalogCollector(this.store, {
       schemas: options.appSchemas.map((entry) => entry.schema),
       ttlHours: options.ttlHours,
-      isPIIColumn: options.isPIIColumn,
     });
     this.documents = new CatalogDocuments(this.store, {
       repo: options.docsRepo,
@@ -278,12 +277,7 @@ export class SchemaCatalog {
     }
     const limit = Math.min(100, Math.max(1, requestedLimit ?? 20));
     return JSON.stringify(
-      searchCatalog(
-        this.store.snapshot(),
-        query,
-        limit,
-        this.options.isPIIColumn,
-      ),
+      searchCatalog(this.store.snapshot(), query, limit),
       null,
       2,
     );
@@ -309,7 +303,6 @@ export class SchemaCatalog {
     return renderDescribe(
       `${resolved.schema}.${resolved.table}`,
       entry,
-      this.options.isPIIColumn,
       {
         configured: this.documents.isConfigured(),
         available: this.documents.isAvailable(),
@@ -692,18 +685,6 @@ export class SchemaCatalog {
     return this.store.tableIndexes(resolved.schema, resolved.table);
   }
 
-  /**
-   * Whether PII redaction is filtering what the catalog records.
-   *
-   * When it is, an index on a redacted column is dropped at collection time, so
-   * a column missing from a stored index list may still be indexed in the
-   * database. Anything presenting those lists has to say so, or absence reads
-   * as fact.
-   */
-  redactsColumns(): boolean {
-    return this.options.piiRedactionEnabled;
-  }
-
   async listTables(): Promise<TableRow[]> {
     if (!this.isEnabled()) return [];
     if (this.collector.inventoryNeedsRefresh()) {
@@ -834,9 +815,7 @@ export class SchemaCatalog {
         // The database usage path remains healthy when the document axis fails.
       });
     }
-    const columns = resultColumnNames(result.content?.[0]?.text ?? "").filter(
-      (column) => !this.options.isPIIColumn(column),
-    );
+    const columns = resultColumnNames(result.content?.[0]?.text ?? "");
     const now = new Date().toISOString();
     this.store.update((catalog) => {
       for (const value of unique.values()) {
@@ -855,12 +834,6 @@ export class SchemaCatalog {
       }
       if (succeeded) {
         for (const join of prepared.joins) {
-          if (
-            this.options.isPIIColumn(join.a.column) ||
-            this.options.isPIIColumn(join.b.column)
-          ) {
-            continue;
-          }
           const left = this.resolveTable(
             join.a.schema ? `${join.a.schema}.${join.a.table}` : join.a.table,
           );
