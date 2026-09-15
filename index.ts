@@ -64,20 +64,19 @@ import { realpathSync } from 'fs';
 
 log("info", `Starting MySQL MCP server v${version}...`);
 
-// Update tool description to include multi-DB mode and schema-specific permissions
-// npm_package_version is only set when launched through an npm script; the MCP
-// clients exec dist/index.js directly, so fall back to the compiled version.
+// 도구 설명에 multi-DB 모드와 스키마별 권한을 반영한다.
+// npm_package_version은 npm 스크립트로 실행할 때만 설정된다. MCP 클라이언트는
+// dist/index.js를 직접 실행하므로, 그럴 때는 빌드된 버전 값으로 대신한다.
 const toolVersion = `MySQL MCP Server [v${process.env.npm_package_version ?? version}]`;
 
-// Characters a client keeps of a tool description. Claude Code's number; it is
-// not negotiated over the protocol and nothing reports it back, so the smallest
-// cap we know of is the one to build against.
+// 클라이언트가 도구 설명에서 남겨 두는 글자 수. Claude Code 기준값이다. 이 값은
+// 프로토콜로 협상하지도 않고 누구도 되돌려 알려 주지 않는다. 그래서 우리가 아는
+// 가장 작은 상한에 맞춰 만든다.
 const TOOL_DESCRIPTION_LIMIT = 2048;
 let baseToolDescription = `[${toolVersion}] Run SQL queries against the ${PROFILE_LABEL} MySQL database`;
 
-// Name the environment first, before any capability text. A tool description is
-// the only thing the model reliably reads before choosing a tool, so this is
-// where "you are talking to production" has to appear.
+// 기능 설명보다 환경 이름을 먼저 적는다. 모델이 도구를 고르기 전에 확실히 읽는 것은
+// 도구 설명뿐이다. 그래서 "지금 프로덕션을 상대하고 있다"는 사실은 여기에 있어야 한다.
 if (MYSQL_PROFILE) {
   baseToolDescription += IS_WRITE_FORBIDDEN_PROFILE
     ? ` — ENVIRONMENT: ${PROFILE_LABEL}, STRICTLY READ-ONLY (writes are refused by policy)`
@@ -94,7 +93,7 @@ if (
   ALLOW_DELETE_OPERATION ||
   ALLOW_DDL_OPERATION
 ) {
-  // At least one write operation is enabled
+  // 쓰기 작업이 하나 이상 켜져 있다
   baseToolDescription += " with support for:";
 
   if (ALLOW_INSERT_OPERATION) {
@@ -113,7 +112,7 @@ if (
     baseToolDescription += " DDL,";
   }
 
-  // Remove trailing comma and add READ operations
+  // 끝의 쉼표를 지우고 READ 작업을 덧붙인다
   baseToolDescription =
     baseToolDescription.replace(/,$/, "") + " and READ operations";
 
@@ -126,23 +125,21 @@ if (
     baseToolDescription += " (Schema-specific permissions enabled)";
   }
 } else {
-  // Only read operations are allowed
+  // 읽기 작업만 허용한다
   baseToolDescription += " (READ-ONLY)";
 }
 
-// Everything below is here to spare the model a discovery round-trip. A tool
-// description is read before the first call; anything it does not say has to be
-// found with a query, and `SHOW DATABASES` followed by guesswork is both slow
-// and easy to get wrong.
+// 아래 내용은 모델이 탐색용 왕복을 한 번 덜 하도록 넣었다. 도구 설명은 첫 호출 전에
+// 읽힌다. 여기 적히지 않은 것은 쿼리로 찾아야 하는데, `SHOW DATABASES`를 던지고 추측
+// 으로 메우는 방식은 느린 데다 틀리기도 쉽다.
 
-// Both limits are stated up front because both change how a query should be
-// written, and the model only gets to read this before it writes one. Learning
-// about the row cap from a truncation warning means the query has already been
-// asked the wrong way.
+// 두 상한을 모두 앞에서 밝힌다. 둘 다 쿼리를 어떻게 써야 하는지를 바꾸는데, 모델은
+// 쿼리를 쓰기 전에만 이 글을 읽을 수 있기 때문이다. 잘림 경고를 보고서야 행 수 상한을
+// 알았다면, 그 쿼리는 이미 잘못된 방식으로 던져진 뒤다.
 //
-// What a cancelled query should do next is not here, though: the abort report
-// says it, the `timeout_seconds` argument says it, and neither costs this
-// budget. Only what changes how the query is *written* earns a place.
+// 반면 취소된 쿼리를 다음에 어떻게 할지는 여기 적지 않는다. 중단 보고서가 그것을
+// 말해 주고 `timeout_seconds` 인자도 말해 주며, 둘 다 이 예산을 쓰지 않는다. 쿼리를
+// *쓰는 방식*을 바꾸는 내용만 여기에 자리를 얻는다.
 baseToolDescription +=
   `\n\nLIMITS: every read is cancelled after ${MYSQL_DEFAULT_TIMEOUT_SECONDS}s ` +
   `(raise per call with timeout_seconds, up to ${MYSQL_MAX_TIMEOUT_SECONDS}) and returns at most ` +
@@ -176,7 +173,7 @@ if (APP_SCHEMAS.length > 0) {
   }
 }
 
-// Determine if we're in read-only mode (no write operations enabled)
+// 읽기 전용 모드인지 판단한다 (쓰기 작업이 하나도 켜지지 않은 상태)
 const isReadOnly = !(
   ALLOW_INSERT_OPERATION ||
   ALLOW_UPDATE_OPERATION ||
@@ -297,12 +294,12 @@ const mysqlCatalogTool = {
 };
 
 /**
- * Declared once and shared by both registrations of `mysql_query`.
+ * 한 번만 선언해 두고 `mysql_query`의 두 등록 지점이 함께 쓴다.
  *
- * The tool is announced twice — in the server's `capabilities` and again from
- * the `tools/list` handler — and clients differ in which one they read. Two
- * copies of the same literal is one edit away from a client that cannot see an
- * argument the other client can.
+ * 이 도구는 두 번 알려진다 — 서버의 `capabilities`에서 한 번, `tools/list` 핸들러에서
+ * 다시 한 번 — 그리고 클라이언트마다 둘 중 어느 쪽을 읽는지가 다르다. 같은 리터럴을
+ * 두 벌 두면, 한쪽만 고치는 순간 어떤 클라이언트는 다른 클라이언트가 보는 인자를
+ * 보지 못하게 된다.
  */
 const mysqlQueryInputSchema = {
   type: "object" as const,
@@ -325,7 +322,7 @@ const mysqlQueryInputSchema = {
   required: ["sql"],
 };
 
-// @INFO: Add debug logging for configuration
+// @INFO: 설정값을 디버그 로그로 남긴다
 log(
   "info",
   "MySQL Configuration:",
@@ -363,11 +360,10 @@ log(
 );
 
 /**
- * Build the MCP server instance and wire up its request handlers.
+ * MCP 서버 인스턴스를 만들고 요청 핸들러를 연결한다.
  *
- * This fork serves the stdio transport only, so there is no per-session
- * configuration to thread through — the profile is fixed by the environment
- * before the process starts.
+ * 이 포크는 stdio 전송만 제공하므로 세션마다 넘겨야 할 설정이 없다. 프로파일은
+ * 프로세스가 시작되기 전에 환경에서 이미 정해진다.
  */
 export default function createMcpServer() {
   const mysqlSettings = config.mysql as Record<string, unknown>;
@@ -389,11 +385,10 @@ export default function createMcpServer() {
     user: String(mysqlSettings.user ?? ""),
     customPath: MYSQL_CATALOG_PATH,
   });
-  // MYSQL_APP_SCHEMAS is the declared scan range, and nothing outside it is
-  // collected (D-1). With none declared the catalog has nothing to scan, so
-  // leaving it on would advertise mysql_catalog and tell the model to call
-  // describe, and then answer every call with an empty map or an error. Off is
-  // the honest state.
+  // MYSQL_APP_SCHEMAS가 스캔 범위 선언이고, 그 바깥은 아무것도 수집하지 않는다(D-1).
+  // 하나도 선언되지 않으면 카탈로그는 스캔할 것이 없다. 그런데도 켜 두면 mysql_catalog를
+  // 광고하고 모델에게 describe를 부르라고 해 놓고는, 모든 호출에 빈 map이나 오류로
+  // 답하게 된다. 이럴 때는 꺼 두는 쪽이 정직하다.
   const noDeclaredSchemas = APP_SCHEMAS.length === 0;
   if (noDeclaredSchemas && MYSQL_CATALOG_ENABLED) {
     console.error(
@@ -415,23 +410,21 @@ export default function createMcpServer() {
         ? mysqlSettings.database
         : null,
   });
-  // The read path asks the catalog what is indexed only when a query has
-  // already been cancelled. Handing it the catalog here, rather than importing
-  // one from the other, keeps `src/catalog` -> `src/db` the single direction.
+  // 읽기 경로는 쿼리가 이미 취소된 뒤에만 카탈로그에 무엇이 색인돼 있는지 묻는다.
+  // 한쪽이 다른 쪽을 import 하게 두지 않고 여기서 카탈로그를 넘겨 주면, 의존 방향을
+  // `src/catalog` -> `src/db` 한 쪽으로만 유지할 수 있다.
   setQueryDiagnosticsSource({
     indexFacts: (reference) => catalog.indexFacts(reference),
   });
 
-  // Clients cap tool descriptions and cut from the end without telling anyone:
-  // Claude Code keeps 2048 characters. Nothing here can read that number back,
-  // so the two halves of the description have to be budgeted against it on our
-  // side — otherwise the hot-table list, which grows as queries succeed, walks
-  // a profile over the cap weeks after the text was written. The base is
-  // authoritative and fixed at startup; the catalog tail gets what is left.
+  // 클라이언트는 도구 설명에 상한을 두고, 아무 말 없이 뒤쪽을 잘라 낸다. Claude Code는
+  // 2048자를 남긴다. 그 값을 되읽어 올 방법이 없으므로 설명의 두 부분을 우리 쪽에서
+  // 예산으로 나눠 써야 한다. 그러지 않으면 쿼리가 성공할수록 길어지는 자주 쓰는 테이블
+  // 목록이, 글을 쓴 지 몇 주 뒤에 어떤 프로파일을 상한 너머로 밀어낸다. 기본 설명이
+  // 우선이고 시작 시점에 고정된다. 카탈로그 꼬리말은 남은 만큼만 가져간다.
   if (baseToolDescription.length > TOOL_DESCRIPTION_LIMIT) {
-    // Not routed through `log`: a description that no longer fits is a
-    // configuration fault, not diagnostics, and the profiles that hit it are
-    // the ones running with ENABLE_LOGGING off.
+    // `log`을 거치지 않는다. 설명이 상한을 넘겼다는 것은 진단 정보가 아니라 설정 오류이고,
+    // 이 상황에 걸리는 프로파일은 대개 ENABLE_LOGGING을 끈 채 돌아가는 쪽이다.
     console.error(
       `[warn] tool description is ${baseToolDescription.length} characters before the ` +
         `catalog tail; clients keep ${TOOL_DESCRIPTION_LIMIT} and silently drop the rest. ` +
@@ -454,30 +447,27 @@ export default function createMcpServer() {
         );
       }
     }
-    // This is the compatibility path for a disabled or still-empty catalog.
+    // 카탈로그가 꺼져 있거나 아직 비어 있을 때를 위한 호환 경로다.
     //
-    // `executeQuery`, because the server is asking on its own behalf. The read
-    // path answers a model: it caps rows, it hands back MCP content blocks
-    // instead of rows, and it resolves rather than throws when the statement is
-    // cancelled — none of which a caller that wants a table list can use. This
-    // is the same instance-wide scan the catalog runs, and it runs under the
-    // same limits.
+    // `executeQuery`를 쓰는 것은 서버가 제 몫으로 묻고 있기 때문이다. 읽기 경로는 모델에게
+    // 답한다. 행 수를 제한하고, 행 대신 MCP 콘텐츠 블록을 돌려주며, 구문이 취소되면
+    // 예외를 던지는 대신 정상적으로 resolve 한다 — 테이블 목록이 필요한 호출자에게는
+    // 어느 것도 쓸모가 없다. 여기서 도는 것은 카탈로그가 돌리는 것과 같은 인스턴스 전체
+    // 스캔이고, 같은 제한 아래에서 돈다.
     //
-    // The absent row cap is the part worth defending, because the response cap
-    // is otherwise applied to everything. Three reasons, each sufficient:
+    // 행 수 상한이 없다는 점은 따로 변호할 만하다. 응답 상한은 그 밖의 모든 곳에 적용되기
+    // 때문이다. 이유는 셋이고, 각각만으로도 충분하다.
     //
-    //   - A cut here cannot be announced. Truncation is reported by the read
-    //     path, which appends a `[TRUNCATED]` block; this executor returns bare
-    //     rows and has nowhere to say it, so a capped listing would read as a
-    //     whole one.
-    //   - It would disagree with the catalog. `listTables` flattens the stored
-    //     snapshot uncapped, so capping only the fallback makes one resource
-    //     report different completeness depending on whether the inventory scan
-    //     has finished — worse than being consistently either way.
-    //   - These rows are the listing, not a result set. The cap exists to keep a
-    //     query's rows from crowding the model's context; a table missing from
-    //     this list is one the client never offers and `mysql://tables/{name}`
-    //     can no longer be asked for. That removes reach, not volume.
+    //   - 여기서 자르면 잘랐다고 알릴 수가 없다. 잘림은 읽기 경로가 `[TRUNCATED]` 블록을
+    //     덧붙여 보고한다. 이 실행기는 행만 그대로 돌려주므로 그 말을 얹을 자리가 없고,
+    //     잘린 목록이 온전한 목록처럼 읽힌다.
+    //   - 카탈로그와 어긋난다. `listTables`는 저장된 스냅샷을 상한 없이 펼친다. 폴백에만
+    //     상한을 두면 같은 리소스가 인벤토리 스캔이 끝났는지에 따라 완전성을 다르게
+    //     보고한다 — 어느 쪽이든 일관된 것보다 나쁘다.
+    //   - 이 행들은 결과 집합이 아니라 목록 자체다. 상한은 쿼리 결과가 모델의 컨텍스트를
+    //     밀어내지 않게 하려고 있다. 이 목록에서 빠진 테이블은 클라이언트가 아예 제시하지
+    //     않고 `mysql://tables/{name}`으로 물어볼 수도 없게 된다. 분량이 아니라 닿는 범위를
+    //     줄이는 일이다.
     return await executeQuery<TableRow[]>(`
       SELECT
         table_name as name,
@@ -497,7 +487,7 @@ export default function createMcpServer() {
     `);
   };
 
-  // Create the server instance
+  // 서버 인스턴스를 만든다
   const server = new Server(
     {
       name: "MySQL MCP Server",
@@ -533,7 +523,7 @@ export default function createMcpServer() {
     },
   );
 
-  // Register request handlers for resources
+  // 리소스 요청 핸들러를 등록한다
   server.setRequestHandler(ListResourcesRequestSchema, async () => {
     try {
       log("info", "Handling ListResourcesRequest");
@@ -544,12 +534,12 @@ export default function createMcpServer() {
           }`;
       log("info", `Connection info: ${connectionInfo}`);
 
-      // The startup inventory normally answers this without a database read.
-      // A disabled or empty catalog keeps the original resource behaviour.
+      // 보통은 시작 시 모아 둔 인벤토리가 데이터베이스를 읽지 않고 이 요청에 답한다.
+      // 카탈로그가 꺼져 있거나 비어 있으면 원래의 리소스 동작을 그대로 따른다.
       const tables = await loadResourceTables();
       log("info", `Found ${tables.length} tables`);
 
-      // Create resources for each table
+      // 테이블마다 리소스를 만든다
       const resources = tables.map((table) => ({
         uri: catalog.isEnabled()
           ? `mysql://tables/${encodeURIComponent(table.database)}/${encodeURIComponent(table.name)}`
@@ -562,7 +552,7 @@ export default function createMcpServer() {
         mimeType: "application/json",
       }));
 
-      // Add a resource for the list of tables
+      // 테이블 목록 자체를 가리키는 리소스를 추가한다
       resources.push({
         uri: "mysql://tables",
         name: "Tables",
@@ -571,8 +561,7 @@ export default function createMcpServer() {
         mimeType: "application/json",
       });
 
-      // The declared app -> schema map, for clients that read resources rather
-      // than the tool description.
+      // 선언된 app -> schema 매핑. 도구 설명 대신 리소스를 읽는 클라이언트를 위한 것이다.
       if (APP_SCHEMAS.length > 0) {
         resources.push({
           uri: "mysql://schemas",
@@ -590,14 +579,13 @@ export default function createMcpServer() {
     }
   });
 
-  // Register request handler for reading resources
+  // 리소스 읽기 요청 핸들러를 등록한다
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     try {
       log("info", "Handling ReadResourceRequest:", request.params.uri);
 
-      // The app -> schema map is configuration, not data: answer it without
-      // touching the database, and before the table-name parsing below can
-      // mistake "schemas" for a table.
+      // app -> schema 매핑은 데이터가 아니라 설정이다. 데이터베이스를 건드리지 않고 답하며,
+      // 아래의 테이블 이름 파싱이 "schemas"를 테이블로 오해하기 전에 처리한다.
       if (request.params.uri === "mysql://schemas") {
         return {
           contents: [
@@ -618,11 +606,10 @@ export default function createMcpServer() {
         };
       }
 
-      // Answered for a disabled catalog too. The URI is listed unconditionally,
-      // and it has no trailing slash, so the parsing below reads it as the bare
-      // table name "tables" with no schema — and returns the columns of
-      // `information_schema.tables` to a caller that asked for the table list.
-      // `loadResourceTables` already handles a disabled or empty catalog.
+      // 카탈로그가 꺼져 있어도 여기서 답한다. 이 URI는 조건 없이 목록에 오르고 끝에
+      // 슬래시가 없다. 그래서 아래 파싱은 이것을 스키마 없는 테이블 이름 "tables"로 읽고,
+      // 테이블 목록을 요청한 호출자에게 `information_schema.tables`의 컬럼을 돌려준다.
+      // 카탈로그가 꺼져 있거나 비어 있는 경우는 `loadResourceTables`가 이미 처리한다.
       if (request.params.uri === "mysql://tables") {
         return {
           contents: [
@@ -635,11 +622,10 @@ export default function createMcpServer() {
         };
       }
 
-      // Two URI shapes are in circulation: `mysql://tables/<table>` from the
-      // pre-catalog server and `mysql://tables/<schema>/<table>` from the
-      // catalog. Parse from the prefix rather than popping segments blindly, so
-      // the single-segment form cannot mistake the literal "tables" segment for
-      // a schema name.
+      // 통용되는 URI 형태가 둘이다. 카탈로그 이전 서버가 쓰던 `mysql://tables/<table>`과
+      // 카탈로그가 쓰는 `mysql://tables/<schema>/<table>`. 세그먼트를 뒤에서부터 무작정
+      // 꺼내지 말고 접두사를 기준으로 파싱한다. 그래야 세그먼트가 하나인 형태에서
+      // "tables"라는 글자를 스키마 이름으로 오해하지 않는다.
       let dbName: string | null = null;
       let tableName: string | undefined;
 
@@ -665,10 +651,10 @@ export default function createMcpServer() {
               ],
             };
           } catch (error) {
-            // The catalog has not learned this table yet — an inventory scan
-            // still in flight, or a schema that MYSQL_APP_SCHEMAS does not
-            // declare. The resource was listed, so it has to stay readable:
-            // fall through to information_schema as the older server did.
+            // 카탈로그가 아직 이 테이블을 모른다 — 인벤토리 스캔이 진행 중이거나,
+            // MYSQL_APP_SCHEMAS가 선언하지 않은 스키마다. 이미 리소스로 목록에 올린
+            // 이상 계속 읽을 수 있어야 한다. 예전 서버가 그랬듯 information_schema로
+            // 넘어간다.
             log(
               "info",
               `[catalog] describe fallback for ${request.params.uri}: ${
@@ -687,7 +673,7 @@ export default function createMcpServer() {
         throw new Error(`Invalid resource URI: ${request.params.uri}`);
       }
 
-      // Modify query to include schema information
+      // 스키마 정보까지 포함하도록 쿼리를 손본다
       let columnsQuery =
         "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?";
       let queryParams = [tableName as string];
@@ -697,9 +683,8 @@ export default function createMcpServer() {
         queryParams.push(dbName);
       }
 
-      // `executeQuery` because the caller here is the server, not a model: it
-      // needs the rows themselves, where the read path answers with MCP
-      // content blocks.
+      // 여기서 `executeQuery`를 쓰는 것은 호출자가 모델이 아니라 서버이기 때문이다.
+      // 서버에는 행 자체가 필요한데, 읽기 경로는 MCP 콘텐츠 블록으로 답한다.
       const results = (await executeQuery(
         columnsQuery,
         queryParams,
@@ -720,7 +705,7 @@ export default function createMcpServer() {
     }
   });
 
-  // Register handler for tool calls
+  // 도구 호출 핸들러를 등록한다
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       log("info", "Handling CallToolRequest:", request.params.name);
@@ -837,9 +822,9 @@ export default function createMcpServer() {
       }
 
       const sql = request.params.arguments?.sql as string;
-      // Clamped rather than validated: the argument bounds a runaway query, and
-      // refusing a call over an out-of-range number would cost the user a round
-      // trip to learn a limit the schema already states.
+      // 검증해서 거절하지 않고 범위 안으로 맞춘다. 이 인자는 폭주하는 쿼리를 묶어 두는
+      // 장치다. 범위를 벗어난 숫자 하나로 호출을 거절하면, 스키마에 이미 적혀 있는 한계를
+      // 알아내려고 사용자가 왕복을 한 번 더 해야 한다.
       const timeoutSeconds = clampTimeoutSeconds(
         typeof request.params.arguments?.timeout_seconds === "number"
           ? (request.params.arguments.timeout_seconds as number)
@@ -861,8 +846,8 @@ export default function createMcpServer() {
         : catalog.queryDocumentGuidance(references);
       catalog.afterQuery(references, result);
 
-      // Prepend the environment banner to every result — success or refusal —
-      // so a stage answer can never be mistaken for a prod one.
+      // 성공이든 거절이든 모든 결과 앞에 환경 배너를 붙인다. 그래야 stage의 답을
+      // prod의 답으로 착각하는 일이 생기지 않는다.
       return {
         ...result,
         content: [
@@ -886,7 +871,7 @@ export default function createMcpServer() {
     }
   });
 
-  // Register handler for listing tools
+  // 도구 목록 요청 핸들러를 등록한다
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     log("info", "Handling ListToolsRequest");
 
@@ -916,16 +901,15 @@ export default function createMcpServer() {
     return toolsResponse;
   });
 
-  // The hot-table list in mysql_query's description fills on the first query
-  // that reads a table, not at startup. The catalog calls this once, which is
-  // what holds the notification to one a session; a client that ignores it
-  // still gets the fresh description from its next tools/list, so a failure
-  // here needs neither retry nor warning.
+  // mysql_query 설명에 붙는 자주 쓰는 테이블 목록은 시작 시점이 아니라, 테이블을 읽는
+  // 첫 쿼리에서 채워진다. 카탈로그는 이 콜백을 한 번만 부르고, 그래서 알림도 세션당 한
+  // 번으로 묶인다. 알림을 무시하는 클라이언트도 다음 tools/list에서 최신 설명을 받으므로,
+  // 여기서 실패해도 재시도나 경고가 필요하지 않다.
   catalog.onToolDescriptionFilled(async () => {
     await server.sendToolListChanged().catch(() => undefined);
   });
 
-  // Initialize database connection and set up shutdown handlers
+  // 데이터베이스 연결을 초기화하고 종료 핸들러를 준비한다
   (async () => {
     try {
       if (SSH_ENABLED) {
@@ -938,19 +922,18 @@ export default function createMcpServer() {
         );
       }
       log("info", "Attempting to test database connection...");
-      // Test the connection before fully starting the server
+      // 서버를 완전히 띄우기 전에 연결을 확인한다
       const pool = await getPool();
       const connection = await pool.getConnection();
       log("info", "Database connection test successful");
       connection.release();
-      // Inventory collection is intentionally detached. The MCP client can
-      // receive query responses while this single metadata query runs.
+      // 인벤토리 수집은 일부러 떼어 놓는다. 이 메타데이터 쿼리 하나가 도는 동안에도
+      // MCP 클라이언트는 쿼리 응답을 받을 수 있다.
       catalog.startInventory();
     } catch (error) {
-      // Startup failure is the one place where the operator needs the reason
-      // regardless of ENABLE_LOGGING — a silent exit here looks to the MCP
-      // client like an unexplained handshake failure. stderr only: stdout is
-      // reserved for the MCP protocol.
+      // 시작 실패는 ENABLE_LOGGING과 무관하게 운영자가 이유를 알아야 하는 유일한 지점이다.
+      // 여기서 조용히 종료하면 MCP 클라이언트에는 설명 없는 핸드셰이크 실패로 보인다.
+      // stderr로만 쓴다. stdout은 MCP 프로토콜 몫이다.
       console.error(
         `[startup] fatal error for profile ${PROFILE_LABEL}: ` +
           (error instanceof Error ? error.message : String(error)),
@@ -961,28 +944,27 @@ export default function createMcpServer() {
     }
   })();
 
-  // Setup shutdown handlers
+  // 종료 핸들러를 설정한다
   const shutdown = async (signal: string): Promise<void> => {
     log("error", `Received ${signal}. Shutting down...`);
     try {
       await catalog.close();
-      // Only attempt to close the pool if it was created
+      // 풀이 실제로 만들어졌을 때만 닫기를 시도한다
       if (poolPromise) {
         const pool = await poolPromise;
         await pool.end();
       }
     } catch (err) {
-      // Log and continue: the tunnel must be closed even if the pool is already
-      // broken, otherwise we leak the SSH session and the loopback listener.
+      // 기록만 하고 계속 진행한다. 풀이 이미 망가졌더라도 터널은 반드시 닫아야 한다.
+      // 그러지 않으면 SSH 세션과 loopback 리스너가 그대로 샌다.
       log("error", "Error closing pool:", err);
     } finally {
       await stopTunnel();
     }
   };
 
-  // An MCP client signals shutdown by closing our stdin rather than sending a
-  // signal. Without this the process would linger — holding the tunnel open —
-  // after the client is gone.
+  // MCP 클라이언트는 시그널을 보내는 대신 우리 stdin을 닫아서 종료를 알린다. 이 처리가
+  // 없으면 클라이언트가 사라진 뒤에도 프로세스가 터널을 연 채로 남는다.
   const shutdownAndExit = async (reason: string): Promise<void> => {
     try {
       await shutdown(reason);
@@ -1015,7 +997,7 @@ export default function createMcpServer() {
     }
   });
 
-  // Add unhandled error listeners
+  // 처리되지 않은 오류를 받을 리스너를 등록한다
   process.on("uncaughtException", (error) => {
     log("error", "Uncaught exception:", error);
     safeExit(1);
@@ -1030,37 +1012,37 @@ export default function createMcpServer() {
 }
 
 /**
-* Checks if the current module is the main module (the entry point of the application).
-* This function works for both ES Modules (ESM) and CommonJS.
-* @returns {boolean} - True if the module is the main module, false otherwise.
+* 현재 모듈이 메인 모듈(애플리케이션의 진입점)인지 확인한다.
+* ES Modules(ESM)와 CommonJS 양쪽에서 모두 동작한다.
+* @returns {boolean} - 메인 모듈이면 true, 아니면 false.
 */
 const isMainModule = () => {
-  // 1. Standard check for CommonJS
-  // `require.main` refers to the application's entry point module.
-  // If it's the same as the current `module`, this file was executed directly.
+  // 1. CommonJS의 표준 확인 방법
+  // `require.main`은 애플리케이션의 진입점 모듈을 가리킨다.
+  // 그것이 현재 `module`과 같으면 이 파일이 직접 실행된 것이다.
   if (typeof require !== 'undefined' && require.main === module) {
     return true;
   }
-  // 2. Check for ES Modules (ESM)
-  // `import.meta.url` provides the file URL of the current module.
-  // `process.argv[1]` provides the path of the executed script.
+  // 2. ES Modules(ESM)의 확인 방법
+  // `import.meta.url`은 현재 모듈의 파일 URL을 알려 준다.
+  // `process.argv[1]`은 실행된 스크립트의 경로를 알려 준다.
   if (typeof import.meta !== 'undefined' && import.meta.url && process.argv[1]) {
-    // Convert the `import.meta.url` (e.g., 'file:///path/to/file.js') to a system-standard absolute path.
+    // `import.meta.url`(예: 'file:///path/to/file.js')을 시스템 표준 절대 경로로 바꾼다.
     const currentModulePath = fileURLToPath(import.meta.url);
-    // Resolve `process.argv[1]` (which can be a relative path) to a standard absolute path.
+    // 상대 경로일 수 있는 `process.argv[1]`을 표준 절대 경로로 정규화한다.
     const mainScriptPath = realpathSync(process.argv[1]);
-    // Compare the two standardized absolute paths.
+    // 정규화한 두 절대 경로를 비교한다.
     return currentModulePath === mainScriptPath;
   }
-  // Fallback if neither of the above conditions are met.
+  // 위 두 조건 어디에도 해당하지 않을 때의 기본값.
   return false;
 }
 
-// Start the server if this file is being run directly
+// 이 파일을 직접 실행한 경우에만 서버를 띄운다
 if (isMainModule()) {
   log("info", "Running in standalone mode");
 
-  // Start the server
+  // 서버를 시작한다
   (async () => {
     try {
       const mcpServer = createMcpServer();
@@ -1068,11 +1050,10 @@ if (isMainModule()) {
       await mcpServer.connect(transport);
       log("info", "Server started and listening on stdio");
     } catch (error) {
-      // Building the server resolves the SSH tunnel target and the catalog
-      // identity, so a misconfigured environment fails here rather than in the
-      // startup block inside `createMcpServer`. Print the reason regardless of
-      // ENABLE_LOGGING for the same reason that block does: to an MCP client a
-      // silent exit looks like an unexplained handshake failure.
+      // 서버를 만드는 과정에서 SSH 터널 대상과 카탈로그 식별자가 정해진다. 그래서 환경
+      // 설정이 잘못되면 `createMcpServer` 안의 시작 블록이 아니라 여기서 실패한다. 그
+      // 블록과 같은 이유로 ENABLE_LOGGING과 무관하게 이유를 출력한다. MCP 클라이언트에는
+      // 조용한 종료가 설명 없는 핸드셰이크 실패로 보이기 때문이다.
       console.error(
         `[startup] fatal error for profile ${PROFILE_LABEL}: ` +
           (error instanceof Error ? error.message : String(error)),
