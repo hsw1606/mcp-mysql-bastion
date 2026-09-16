@@ -1,12 +1,6 @@
-import { SchemaPermissions } from "../types/index.js";
-type LogType = "info" | "error";
+import { ENABLE_LOGGING } from "../config/index.js";
 
-// @INFO: ENABLE_LOGGING이 true면 로깅을 켠다
-// FIXME: AGENTS.md대로라면 이 값도 src/config/index.ts가 읽어 export해야 한다.
-// 옮기기 전에 순환 import를 먼저 풀어야 한다 — config가 이 파일의
-// parseSchemaPermissions를 import하고 있다.
-const ENABLE_LOGGING =
-  process.env.ENABLE_LOGGING === "true" || process.env.ENABLE_LOGGING === "1";
+type LogType = "info" | "error";
 
 /**
  * 진단용 로깅. 언제나 stderr로 보내고 stdout은 쓰지 않는다.
@@ -16,33 +10,15 @@ const ENABLE_LOGGING =
  * 스트림이 깨지고 클라이언트 handshake가 JSON 파싱 에러로 실패한다. 모든 레벨을
  * `console.error`로 보내면 어떤 MCP 클라이언트에서도 `ENABLE_LOGGING=true`를
  * 안심하고 켤 수 있다.
+ *
+ * 스위치는 `src/config/index.ts`에서 받는다. 예전에는 이 파일이 직접
+ * `process.env.ENABLE_LOGGING`을 읽었는데, 그러면 config가 이 파일의
+ * `parseSchemaPermissions`를 import하던 것과 맞물려 순환이 됐다. 그 함수를
+ * config로 옮겨 순환을 끊었다.
  */
 export function log(type: LogType = "info", ...args: any[]): void {
   if (!ENABLE_LOGGING) return;
 
   const prefix = type === "error" ? "[error]" : "[info]";
   console.error(prefix, ...args);
-}
-
-// 환경 변수에서 스키마별 권한을 파싱하는 함수
-export function parseSchemaPermissions(
-  permissionsString?: string,
-): SchemaPermissions {
-  const permissions: SchemaPermissions = {};
-
-  if (!permissionsString) {
-    return permissions;
-  }
-
-  // 형식: "schema1:true,schema2:false"
-  const permissionPairs = permissionsString.split(",");
-
-  for (const pair of permissionPairs) {
-    const [schema, value] = pair.split(":");
-    if (schema && value) {
-      permissions[schema.trim()] = value.trim() === "true";
-    }
-  }
-
-  return permissions;
 }

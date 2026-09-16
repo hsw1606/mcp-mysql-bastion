@@ -1,4 +1,4 @@
-import { isMultiDbMode } from "./../config/index.js";
+import { MYSQL_DB, isMultiDbMode } from "./../config/index.js";
 import { log } from "./../utils/index.js";
 import SqlParser, { AST } from "node-sql-parser";
 
@@ -9,11 +9,9 @@ const parser = new Parser();
 // 예전의 정규식 방식은 SQL 주석으로 우회할 수 있었고(예: USE/**/schema_name),
 // 그러면 스키마 권한 검사가 전역 기본값으로 흘러가 버렸다.
 function extractSchemaFromQuery(sql: string): string | null {
-  // 환경 변수에 지정된 기본 스키마
-  // FIXME: MYSQL_DB를 직접 읽는다. config가 이미 같은 값으로 isMultiDbMode를
-  // 만들고 있으므로, 기본 스키마도 config에서 export해 받아 쓴다 (AGENTS.md의
-  // "환경 변수는 src/config/index.ts에서만 읽는다").
-  const defaultSchema = process.env.MYSQL_DB || null;
+  // 프로필이 고정한 기본 스키마. config가 읽어 둔 값을 그대로 쓴다 —
+  // `isMultiDbMode`도 같은 값에서 나오므로 둘이 어긋날 수 없다.
+  const defaultSchema = MYSQL_DB ?? null;
 
   // 기본 스키마가 있고 다중 DB 모드가 아니면 그대로 쓴다
   if (defaultSchema && !isMultiDbMode) {

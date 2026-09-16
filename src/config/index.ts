@@ -1,7 +1,32 @@
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import { AppSchemaEntry, SchemaPermissions } from "../types/index.js";
-import { parseSchemaPermissions } from "../utils/index.js";
+
+/**
+ * `SCHEMA_*_PERMISSIONS`를 스키마별 플래그로 파싱한다. 형식은
+ * `"schema1:true,schema2:false"`.
+ *
+ * 예전에는 `src/utils/index.ts`에 있었다. 그러다 이 파일이 그것을 import하고
+ * `log()`는 `ENABLE_LOGGING`을 직접 읽는 구조가 되어, "환경 변수는 config에서만
+ * 읽는다"를 지키려면 반드시 풀어야 할 순환이 생겼다. 환경 변수 하나의 문법을
+ * 해석하는 함수이므로 원래 자리가 여기다.
+ */
+function parseSchemaPermissions(permissionsString?: string): SchemaPermissions {
+  const permissions: SchemaPermissions = {};
+
+  if (!permissionsString) {
+    return permissions;
+  }
+
+  for (const pair of permissionsString.split(",")) {
+    const [schema, value] = pair.split(":");
+    if (schema && value) {
+      permissions[schema.trim()] = value.trim() === "true";
+    }
+  }
+
+  return permissions;
+}
 
 /**
  * SSL 연결에 쓸 파일(인증서, 키, CA)을 읽고 검증한다.
@@ -224,10 +249,46 @@ export const MYSQL_CATALOG_TTL_HOURS = parseCatalogTtl(
 /** Git 접근은 catalog의 문서 단계에서 더해진다. 경로가 비어 있어도 된다. */
 export const MYSQL_DOCS_REPO = process.env.MYSQL_DOCS_REPO?.trim() || undefined;
 
+/**
+ * 진단 로깅 스위치. `src/utils/index.ts`의 `log()`가 이 값만 본다.
+ *
+ * `1`도 켠 것으로 받는 것은 README가 그렇게 약속했기 때문이다.
+ */
+export const ENABLE_LOGGING =
+  process.env.ENABLE_LOGGING === "true" || process.env.ENABLE_LOGGING === "1";
+
+/**
+ * 테스트 러너 안에서 도는가.
+ *
+ * `src/db/index.ts`의 `safeExit`가 이 값으로 `process.exit`를 가른다. 테스트가
+ * 워커를 통째로 죽이면 남은 경우들이 실행되지 못한다. vitest는 `NODE_ENV`를
+ * 건드리지 않고 `VITEST`만 세우는 실행 경로가 있어서 둘 다 본다.
+ */
+export const IS_TEST_ENVIRONMENT =
+  process.env.NODE_ENV === "test" || Boolean(process.env.VITEST);
+
+/**
+ * MCP 클라이언트에 알리는 버전.
+ *
+ * `npm_package_version`은 npm 스크립트로 실행할 때만 채워진다. MCP 클라이언트는
+ * `dist/index.js`를 직접 실행하므로 그때는 빌드된 `MCP_VERSION`으로 간다.
+ */
+export const PACKAGE_VERSION =
+  process.env.npm_package_version?.trim() || MCP_VERSION;
+
 // @INFO: 데이터베이스가 제대로 잡히도록 환경 설정을 보정한다
 if (process.env.NODE_ENV === "test" && !process.env.MYSQL_DB) {
   process.env.MYSQL_DB = "mcp_test_db"; // @INFO: 테스트에서 쓸 데이터베이스 이름을 확보한다
 }
+
+/**
+ * 프로필이 고정한 기본 스키마. 없으면 다중 DB 모드다.
+ *
+ * 공백만 든 값은 없는 것으로 본다. 예전에는 `isMultiDbMode`만 trim하고 풀 옵션의
+ * `database`는 원문을 썼다. `MYSQL_DB=" "`이면 서버는 다중 DB 모드라고 말하면서
+ * mysql2에는 이름이 " "인 스키마를 넘겼다.
+ */
+export const MYSQL_DB = process.env.MYSQL_DB?.trim() || undefined;
 
 // 쓰기 작업 플래그 (전역 기본값).
 //
@@ -289,6 +350,32 @@ function parsePositiveInt(
     return fallback;
   }
   return Math.floor(value);
+}
+
+/**
+ * 포트 환경 변수를 읽는다. 값이 없거나 못 쓸 값이면 `undefined`를 주고, 호출자는
+ * 자기 다음 후보(`~/.ssh/config` alias, 그다음 기본값)로 넘어간다.
+ *
+ * 예전에는 `src/ssh/tunnel.ts`가 같은 일을 하면서 **던졌다**. 그래서 같은
+ * `MYSQL_PORT` 하나를 두고 두 정책이 공존했다 — config는 3306으로 물러나며
+ * 계속 간다고 알리고, 터널 경로는 프로세스를 죽였다. `MYSQL_SSH_ENABLED=true`인
+ * 프로필에서는 알림이 무의미했다. 알리는 쪽으로 통일한다. "설정 오류 하나로
+ * 서버를 죽이지 않는다"가 이 저장소의 규칙이고, 포트는 그 예외가 아니다.
+ *
+ * `parsePositiveInt`와 따로 두는 이유는 0 때문이다. `MYSQL_SSH_LOCAL_PORT=0`은
+ * "OS가 빈 포트를 고르게 하라"는 뜻으로 README에 적힌 유효한 값이다.
+ */
+function parsePortEnv(name: string, raw: string | undefined): number | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  const port = Number(trimmed);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.error(
+      `[config] ignoring ${name}="${raw}": expected an integer between 0 and 65535.`,
+    );
+    return undefined;
+  }
+  return port;
 }
 
 /**
@@ -381,6 +468,89 @@ export const MYSQL_CONNECT_TIMEOUT = parsePositiveInt(
   10000,
 );
 
+/**
+ * MySQL 접속 대상.
+ *
+ * 세 값 모두 풀 옵션(`mcpConfig.mysql`)과 SSH 터널의 forwarding 대상이 함께
+ * 본다. 두 경로가 각자 `process.env`를 읽던 시절에는 기본값이 갈라졌다 —
+ * 한쪽은 `127.0.0.1`, 다른 쪽은 `localhost`, 못 쓸 포트에서는 한쪽은 `NaN`,
+ * 다른 쪽은 예외. 읽는 자리를 하나로 묶으면 갈라질 자리가 없어진다.
+ *
+ * `MYSQL_HOST`는 일부러 기본값을 씌우지 않는다. 터널 경로는 "값이 없다"를
+ * 설정 부족으로 보고 무엇이 빠졌는지 알려야 하기 때문이다. 직접 접속의 기본값
+ * `127.0.0.1`은 아래 `mcpConfig`가 씌운다.
+ */
+export const MYSQL_SOCKET_PATH =
+  process.env.MYSQL_SOCKET_PATH?.trim() || undefined;
+export const MYSQL_HOST = process.env.MYSQL_HOST?.trim() || undefined;
+export const MYSQL_PORT = parsePositiveInt(
+  "MYSQL_PORT",
+  process.env.MYSQL_PORT,
+  3306,
+);
+
+/** 직접 접속에서 `MYSQL_HOST`가 비었을 때 쓰는 주소. README의 표와 같은 값이다. */
+export const DEFAULT_MYSQL_HOST = "127.0.0.1";
+
+/**
+ * SSL 설정. 경로와 스위치만 export한다.
+ *
+ * 파일 **내용**은 아래 `mcpConfig.mysql.ssl`에만 담긴다. 진단 로그처럼 설정을
+ * 사람에게 보여 주는 자리는 경로만 쓴다 — 거기서 `mcpConfig`를 펼치면 클라이언트
+ * 개인 키가 통째로 stderr에 찍힌다.
+ */
+export const MYSQL_SSL_ENABLED = process.env.MYSQL_SSL === "true";
+export const MYSQL_SSL_REJECT_UNAUTHORIZED =
+  process.env.MYSQL_SSL_REJECT_UNAUTHORIZED === "true";
+export const MYSQL_SSL_CA_PATH = process.env.MYSQL_SSL_CA?.trim() || undefined;
+export const MYSQL_SSL_CERT_PATH =
+  process.env.MYSQL_SSL_CERT?.trim() || undefined;
+export const MYSQL_SSL_KEY_PATH = process.env.MYSQL_SSL_KEY?.trim() || undefined;
+
+/** 그 밖의 mysql2 전달 옵션. */
+export const MYSQL_TIMEZONE = process.env.MYSQL_TIMEZONE?.trim() || undefined;
+export const MYSQL_DATE_STRINGS = process.env.MYSQL_DATE_STRINGS === "true";
+export const MYSQL_BIG_NUMBER_STRINGS =
+  process.env.MYSQL_BIG_NUMBER_STRINGS === "true";
+
+/** bastion 터널을 열지 여부. `src/ssh/tunnel.ts`가 이 값으로 갈린다. */
+export const SSH_ENABLED = process.env.MYSQL_SSH_ENABLED === "true";
+
+/**
+ * 우리 터널을 새로 열지 않고, 이미 listen 중인 forward에 붙는다.
+ *
+ * 기본값은 꺼짐이고, 이는 의도한 선택이다. 재사용하면 이 프로세스의 DB 접속이
+ * 터널을 연 다른 프로세스의 수명에 묶인다. MCP 클라이언트는 서버를 수시로 켜고
+ * 끄므로 터널 주인이 먼저 종료되는 일이 잦고, 그때 빌려 쓰던 쪽의 커넥션은 쿼리
+ * 도중 PROTOCOL_CONNECTION_LOST로 끊긴다. 우리 터널을 직접 소유하면 SSH 세션
+ * 하나를 더 쓰는 대신 이 실패 유형이 통째로 사라진다.
+ *
+ * 외부에서 관리하는 forward(오래 떠 있는 `ssh -L`)를 공유할 의도가 있을 때만 켠다.
+ */
+export const SSH_REUSE_EXISTING =
+  process.env.MYSQL_SSH_REUSE_EXISTING === "true";
+
+/**
+ * 터널 설정의 원자재.
+ *
+ * 해석은 `src/ssh/tunnel.ts`의 `resolveTunnelConfig()`가 한다 — 여기 없는 값을
+ * `~/.ssh/config` alias로 채우고, `~`를 펼치고, 그래도 빈 자리가 남으면 무엇이
+ * 없는지 알린다. 이 파일은 읽기만 맡는다.
+ */
+export const SSH_CONFIG_HOST =
+  process.env.MYSQL_SSH_CONFIG_HOST?.trim() || undefined;
+export const SSH_HOST = process.env.MYSQL_SSH_HOST?.trim() || undefined;
+export const SSH_USER = process.env.MYSQL_SSH_USER?.trim() || undefined;
+export const SSH_PORT = parsePortEnv("MYSQL_SSH_PORT", process.env.MYSQL_SSH_PORT);
+export const SSH_PRIVATE_KEY_PATH =
+  process.env.MYSQL_SSH_PRIVATE_KEY_PATH?.trim() || undefined;
+export const SSH_PASSPHRASE =
+  process.env.MYSQL_SSH_PASSPHRASE?.trim() || undefined;
+export const SSH_LOCAL_PORT = parsePortEnv(
+  "MYSQL_SSH_LOCAL_PORT",
+  process.env.MYSQL_SSH_LOCAL_PORT,
+);
+
 // 스키마별 권한.
 //
 // 전역 플래그를 스키마 단위로 *덮어쓰는* 값이라, 쓰기 금지 프로필에서는 이것도
@@ -399,7 +569,7 @@ export const SCHEMA_DDL_PERMISSIONS: SchemaPermissions =
   schemaPermissions("SCHEMA_DDL_PERMISSIONS");
 
 // 다중 DB 모드인지 확인한다 (특정 DB를 지정하지 않은 경우)
-export const isMultiDbMode = !(process.env.MYSQL_DB ?? "").trim();
+export const isMultiDbMode = !MYSQL_DB;
 
 /**
  * mysql2에 그대로 넘기는 풀 옵션.
@@ -408,19 +578,21 @@ export const isMultiDbMode = !(process.env.MYSQL_DB ?? "").trim();
  * 있었는데, 서버 이름은 `index.ts`가 직접 적고 전송은 stdio 하나뿐이라 둘 다
  * 읽는 곳이 없었다.
  */
+const MYSQL_PASS = process.env.MYSQL_PASS ?? "";
+
 export const mcpConfig = {
   mysql: {
     // Unix 소켓이 있으면 그것을 쓰고, 없으면 host/port를 쓴다.
     // 터널을 열면 `getPool`이 socketPath를 버리고 loopback 주소로 갈아끼운다.
-    ...(process.env.MYSQL_SOCKET_PATH
-      ? { socketPath: process.env.MYSQL_SOCKET_PATH }
+    ...(MYSQL_SOCKET_PATH
+      ? { socketPath: MYSQL_SOCKET_PATH }
       : {
-          host: process.env.MYSQL_HOST || "127.0.0.1",
-          port: parsePositiveInt("MYSQL_PORT", process.env.MYSQL_PORT, 3306),
+          host: MYSQL_HOST || DEFAULT_MYSQL_HOST,
+          port: MYSQL_PORT,
         }),
-    user: process.env.MYSQL_USER || "root",
-    password: process.env.MYSQL_PASS ?? "",
-    database: process.env.MYSQL_DB || undefined, // 다중 DB 모드를 위해 database가 undefined인 것을 허용한다
+    user: process.env.MYSQL_USER?.trim() || "root",
+    password: MYSQL_PASS,
+    database: MYSQL_DB, // 다중 DB 모드를 위해 database가 undefined인 것을 허용한다
     connectionLimit: MYSQL_POOL_SIZE,
     waitForConnections: true,
     queueLimit: MYSQL_QUEUE_LIMIT,
@@ -428,40 +600,49 @@ export const mcpConfig = {
     keepAliveInitialDelay: 0,
     connectTimeout: MYSQL_CONNECT_TIMEOUT,
     authPlugins: {
-      mysql_clear_password: () => () => Buffer.from(process.env.MYSQL_PASS ?? ""),
+      mysql_clear_password: () => () => Buffer.from(MYSQL_PASS),
     },
-    ...(process.env.MYSQL_SSL === "true"
+    ...(MYSQL_SSL_ENABLED
       ? {
           ssl: {
-            rejectUnauthorized:
-              process.env.MYSQL_SSL_REJECT_UNAUTHORIZED === "true",
+            rejectUnauthorized: MYSQL_SSL_REJECT_UNAUTHORIZED,
             // CA 인증서가 있으면 더한다
-            ...(process.env.MYSQL_SSL_CA
-              ? { ca: readCACertificate(process.env.MYSQL_SSL_CA) }
+            ...(MYSQL_SSL_CA_PATH
+              ? { ca: readCACertificate(MYSQL_SSL_CA_PATH) }
               : {}),
             // mTLS용 클라이언트 인증서가 있으면 더한다
-            ...(process.env.MYSQL_SSL_CERT
-              ? { cert: readSSLFile(process.env.MYSQL_SSL_CERT, 'client certificate') }
+            ...(MYSQL_SSL_CERT_PATH
+              ? { cert: readSSLFile(MYSQL_SSL_CERT_PATH, 'client certificate') }
               : {}),
             // mTLS용 클라이언트 개인 키가 있으면 더한다
-            ...(process.env.MYSQL_SSL_KEY
-              ? { key: readSSLFile(process.env.MYSQL_SSL_KEY, 'client private key') }
+            ...(MYSQL_SSL_KEY_PATH
+              ? { key: readSSLFile(MYSQL_SSL_KEY_PATH, 'client private key') }
               : {}),
           },
         }
       : {}),
     // 날짜/시간 처리를 위한 타임존 설정
-    ...(process.env.MYSQL_TIMEZONE
-      ? { timezone: process.env.MYSQL_TIMEZONE }
-      : {}),
+    ...(MYSQL_TIMEZONE ? { timezone: MYSQL_TIMEZONE } : {}),
     // 날짜 값을 JavaScript Date 객체 대신 문자열로 돌려준다
-    ...(process.env.MYSQL_DATE_STRINGS === "true" ? { dateStrings: true } : {}),
+    ...(MYSQL_DATE_STRINGS ? { dateStrings: true } : {}),
     // 정밀도 손실을 막으려고 BIGINT/DECIMAL 값을 문자열로 돌려준다
     // snowflake ID(19자리)를 쓰는 테이블에는 필수다. Number.MAX_SAFE_INTEGER(2^53-1)를 넘기 때문이다
-    ...(process.env.MYSQL_BIG_NUMBER_STRINGS === "true"
+    ...(MYSQL_BIG_NUMBER_STRINGS
       ? { supportBigNumbers: true, bigNumberStrings: true }
       : {}),
   },
 };
+
+/**
+ * 설정에 적힌 접속 대상을 사람이 읽는 한 줄로 만든다. 비밀값은 담지 않는다.
+ *
+ * 터널을 연 뒤의 **실제** endpoint는 여기서 알 수 없다. 그쪽은
+ * `src/db/index.ts`의 `describeConnection()`이 맡는다.
+ */
+export function describeConfiguredTarget(): string {
+  return MYSQL_SOCKET_PATH
+    ? `socket: ${MYSQL_SOCKET_PATH}`
+    : `${MYSQL_HOST || DEFAULT_MYSQL_HOST}:${MYSQL_PORT}`;
+}
 
 export { readCACertificate, readSSLFile };
