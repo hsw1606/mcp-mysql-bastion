@@ -70,6 +70,19 @@ function allTables(catalog: CatalogFile): RankedTable[] {
 }
 
 /**
+ * 인기 테이블 목록 앞에 붙는 머리말.
+ *
+ * 예전에는 `"CATALOG HOT TABLES (most read first): "`였다. 이 파일이 모델에게
+ * 내보내는 다른 모든 문장은 한국어인데 이 한 줄만 영어라, AGENTS.md의 "한 파일
+ * 안에서 두 언어를 섞지 않는다"를 이 파일 스스로 어기고 있었다.
+ *
+ * 테스트가 문자열 리터럴을 따로 적지 않고 이것을 import하도록 export한다. 양쪽에
+ * 같은 문장을 적어 두면, 머리말을 바꿨을 때 "머리말이 없다"를 검사하는 경우가
+ * 조용히 언제나 통과하는 검사로 바뀐다.
+ */
+export const HOT_TABLES_HEADING = "\n\n카탈로그가 많이 읽은 테이블(읽은 순): ";
+
+/**
  * `mysql_query` 도구 설명의 꼬리 부분. `budget` 글자 수에 맞춰 만든다.
  *
  * 예산은 기본 설명이 쓰고 남긴 몫이다. 도구 설명에 상한을 두는 클라이언트는 아무 말
@@ -104,16 +117,15 @@ export function renderToolDescriptionSuffix(
     .map(({ schema, table }) => `${schema}.${table}`);
   if (hot.length === 0) return staticGuidance;
 
-  const heading = "\n\nCATALOG HOT TABLES (most read first): ";
   let listed = "";
   for (const name of hot) {
     const next = listed ? `${listed}, ${name}` : name;
-    if ((heading + next + staticGuidance).length > budget) break;
+    if ((HOT_TABLES_HEADING + next + staticGuidance).length > budget) break;
     listed = next;
   }
   // 아래에 아무것도 없는 제목은 잡음이다. 첫 이름조차 들어가지 못한 경우가 그렇다.
   if (!listed) return staticGuidance;
-  return heading + listed + staticGuidance;
+  return HOT_TABLES_HEADING + listed + staticGuidance;
 }
 
 export function renderMap(catalog: CatalogFile, warning: string | null = null): string {

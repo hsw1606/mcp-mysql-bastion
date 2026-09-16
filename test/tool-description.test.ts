@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { renderToolDescriptionSuffix } from "../src/catalog/render.js";
+import {
+  HOT_TABLES_HEADING,
+  renderToolDescriptionSuffix,
+} from "../src/catalog/render.js";
 import { catalogWith } from "./helpers.js";
 
 /** Claude Code가 도구 설명에 거는 상한. 단위는 문자다. */
@@ -50,7 +53,7 @@ describe("renderToolDescriptionSuffix", () => {
   test("아래가 빈 머리말을 남기느니 지시문만 남긴다", () => {
     const guidanceOnly = renderToolDescriptionSuffix(busy, 80);
     expect(guidanceOnly).toContain(GUIDANCE);
-    expect(guidanceOnly).not.toContain("CATALOG HOT TABLES");
+    expect(guidanceOnly).not.toContain(HOT_TABLES_HEADING);
   });
 
   test("지시문조차 안 들어가면 아무것도 내지 않는다", () => {
@@ -87,6 +90,6 @@ describe("renderToolDescriptionSuffix", () => {
     const cold = catalogWith([{ schema: "haulla", table: "account", successCount: 0 }]);
     const suffix = renderToolDescriptionSuffix(cold, CLIENT_LIMIT);
     expect(suffix).toContain(GUIDANCE);
-    expect(suffix).not.toContain("CATALOG HOT TABLES");
+    expect(suffix).not.toContain(HOT_TABLES_HEADING);
   });
 });
