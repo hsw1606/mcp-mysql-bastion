@@ -1,6 +1,19 @@
 import * as fs from "fs";
 import * as net from "net";
 import { Client as SSHClient, type ConnectConfig } from "ssh2";
+import {
+  MYSQL_HOST,
+  MYSQL_PORT,
+  SSH_CONFIG_HOST,
+  SSH_ENABLED,
+  SSH_HOST,
+  SSH_LOCAL_PORT,
+  SSH_PASSPHRASE,
+  SSH_PORT,
+  SSH_PRIVATE_KEY_PATH,
+  SSH_REUSE_EXISTING,
+  SSH_USER,
+} from "../config/index.js";
 import { log } from "../utils/index.js";
 import { expandHome, readSSHConfigHost } from "./config.js";
 
@@ -42,49 +55,10 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const PROBE_TIMEOUT_MS = 750;
 const SSH_READY_TIMEOUT_MS = 20000;
 
-// FIXME: AGENTS.md는 환경 변수를 src/config/index.ts에서만 읽으라고 못박는데,
-// 이 모듈은 MYSQL_SSH_* 를 직접 읽는다 — SSH_ENABLED, SSH_REUSE_EXISTING,
-// 그리고 아래 optionalEnv()를 거치는 나머지 전부. config로 옮기고 여기서는
-// 상수를 import한다.
-export const SSH_ENABLED = process.env.MYSQL_SSH_ENABLED === "true";
-
-/**
- * 우리 터널을 새로 열지 않고, 프로필의 로컬 포트에서 이미 listen 중인 forward에
- * 붙는다.
- *
- * 기본값은 꺼짐이고, 이는 의도한 선택이다. 재사용하면 이 프로세스의 DB 접속이
- * 터널을 연 다른 프로세스의 수명에 묶인다. MCP 클라이언트는 서버를 수시로 켜고
- * 끄므로 터널 주인이 먼저 종료되는 일이 잦고, 그때 빌려 쓰던 쪽의 커넥션은 쿼리
- * 도중 PROTOCOL_CONNECTION_LOST로 끊긴다. 우리 터널을 직접 소유하면 SSH 세션
- * 하나를 더 쓰는 대신 이 실패 유형이 통째로 사라진다.
- *
- * 외부에서 관리하는 forward(오래 떠 있는 `ssh -L`)를 공유할 의도가 있을 때만 켠다.
- */
-export const SSH_REUSE_EXISTING =
-  process.env.MYSQL_SSH_REUSE_EXISTING === "true";
-
 // 카탈로그 식별자와 터널 생성은 같은 원격 대상을 가리켜야 한다.
 // 프로세스 내내 바뀌지 않는 설정을 캐시해 두면, 두 단계 사이에 SSH config를
 // 고치더라도 캐시가 다른 DB를 가리키는 일이 생기지 않는다.
 let resolvedTunnelConfig: TunnelConfig | null = null;
-
-function optionalEnv(name: string): string | undefined {
-  const raw = process.env[name];
-  if (raw === undefined) return undefined;
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function parsePort(raw: string | undefined, label: string): number | undefined {
-  if (raw === undefined) return undefined;
-  const port = Number(raw);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
-    throw new Error(
-      `${label} must be an integer between 0 and 65535, got "${raw}".`,
-    );
-  }
-  return port;
-}
 
 /**
  * 환경 변수의 SSH 터널 설정과 선택적인 `~/.ssh/config` alias를 합친다.
@@ -98,7 +72,7 @@ function parsePort(raw: string | undefined, label: string): number | undefined {
  */
 export function resolveTunnelConfig(): TunnelConfig {
   if (resolvedTunnelConfig) return resolvedTunnelConfig;
-  const configHost = optionalEnv("MYSQL_SSH_CONFIG_HOST");
+  const configHost = SSH_CONFIG_HOST;
 
   let fromConfig: ReturnType<typeof readSSHConfigHost> = null;
   if (configHost) {
@@ -121,33 +95,22 @@ export function resolveTunnelConfig(): TunnelConfig {
     );
   }
 
-  const sshHost = optionalEnv("MYSQL_SSH_HOST") ?? fromConfig?.hostName;
-  const sshUser = optionalEnv("MYSQL_SSH_USER") ?? fromConfig?.user;
-  const sshPort =
-    parsePort(optionalEnv("MYSQL_SSH_PORT"), "MYSQL_SSH_PORT") ??
-    fromConfig?.port ??
-    22;
+  const sshHost = SSH_HOST ?? fromConfig?.hostName;
+  const sshUser = SSH_USER ?? fromConfig?.user;
+  const sshPort = SSH_PORT ?? fromConfig?.port ?? 22;
 
   const privateKeyPath = expandHome(
-    optionalEnv("MYSQL_SSH_PRIVATE_KEY_PATH") ??
-      fromConfig?.identityFile ??
-      "~/.ssh/id_rsa",
+    SSH_PRIVATE_KEY_PATH ?? fromConfig?.identityFile ?? "~/.ssh/id_rsa",
   );
 
   // 로컬 포트: 환경 변수, 없으면 alias의 LocalForward, 그래도 없으면 0(자동).
-  const localPort =
-    parsePort(optionalEnv("MYSQL_SSH_LOCAL_PORT"), "MYSQL_SSH_LOCAL_PORT") ??
-    fromConfig?.localForward?.localPort ??
-    0;
+  const localPort = SSH_LOCAL_PORT ?? fromConfig?.localForward?.localPort ?? 0;
 
   // forwarding 대상: alias의 LocalForward가 가장 구체적인 정보다.
-  // 없으면 프로필의 MySQL host/port로 물러난다.
-  const remoteHost =
-    fromConfig?.localForward?.remoteHost ?? optionalEnv("MYSQL_HOST");
-  const remotePort =
-    fromConfig?.localForward?.remotePort ??
-    parsePort(optionalEnv("MYSQL_PORT"), "MYSQL_PORT") ??
-    3306;
+  // 없으면 프로필의 MySQL host/port로 물러난다. 그 둘은 config가 한 번만 읽으므로,
+  // 풀이 직접 접속할 때 쓰는 값과 bastion이 대신 접속할 값이 갈라지지 않는다.
+  const remoteHost = fromConfig?.localForward?.remoteHost ?? MYSQL_HOST;
+  const remotePort = fromConfig?.localForward?.remotePort ?? MYSQL_PORT;
 
   const missing: string[] = [];
   if (!sshHost) missing.push("MYSQL_SSH_HOST (or a HostName in the alias)");
@@ -173,7 +136,7 @@ export function resolveTunnelConfig(): TunnelConfig {
     sshPort,
     sshUser: sshUser!,
     privateKeyPath,
-    passphrase: optionalEnv("MYSQL_SSH_PASSPHRASE"),
+    passphrase: SSH_PASSPHRASE,
     localPort,
     remoteHost: remoteHost!,
     remotePort,
@@ -212,6 +175,8 @@ let endpointPromise: Promise<TunnelEndpoint | null> | null = null;
 let localServer: net.Server | null = null;
 let sshClient: SSHClient | null = null;
 let activeConfig: TunnelConfig | null = null;
+/** 터널이 실제로 열린 뒤의 loopback 주소. 진단 출력이 이것을 보고 말한다. */
+let activeEndpoint: TunnelEndpoint | null = null;
 let shuttingDown = false;
 /** 재연결 시도를 모두 소진했을 때 채워지며, 호출자에게 그대로 전달된다. */
 let fatalError: Error | null = null;
@@ -441,7 +406,8 @@ export function ensureTunnel(): Promise<TunnelEndpoint | null> {
           "error",
           `[ssh] 127.0.0.1:${cfg.localPort} is already accepting connections; reusing it (MYSQL_SSH_REUSE_EXISTING=true).`,
         );
-        return { host: "127.0.0.1", port: cfg.localPort, reused: true };
+        activeEndpoint = { host: "127.0.0.1", port: cfg.localPort, reused: true };
+        return activeEndpoint;
       }
 
       log(
@@ -483,7 +449,8 @@ export function ensureTunnel(): Promise<TunnelEndpoint | null> {
 
       attachDropHandler(client, cfg);
       log("error", `[ssh] tunnel listening on 127.0.0.1:${port}`);
-      return { host: "127.0.0.1", port, reused: false };
+      activeEndpoint = { host: "127.0.0.1", port, reused: false };
+      return activeEndpoint;
     })();
 
     // 실패한 시도는 캐시하면 안 된다. 다음 호출이 자유롭게 재시도할 수 있어야 한다
@@ -491,10 +458,19 @@ export function ensureTunnel(): Promise<TunnelEndpoint | null> {
     endpointPromise.catch(() => {
       endpointPromise = null;
       activeConfig = null;
+      activeEndpoint = null;
     });
   }
 
   return endpointPromise;
+}
+
+/**
+ * 터널이 열려 있으면 풀이 실제로 붙는 loopback 주소. 아직 열리지 않았거나
+ * 터널을 쓰지 않으면 null.
+ */
+export function getTunnelEndpoint(): TunnelEndpoint | null {
+  return activeEndpoint;
 }
 
 /** 재연결을 포기하면서 기록한 에러. 없으면 null. */
@@ -542,5 +518,6 @@ export async function stopTunnel(): Promise<void> {
 
   endpointPromise = null;
   activeConfig = null;
+  activeEndpoint = null;
   shuttingDown = false;
 }
