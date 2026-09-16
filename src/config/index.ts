@@ -483,11 +483,12 @@ export const MYSQL_CONNECT_TIMEOUT = parsePositiveInt(
 export const MYSQL_SOCKET_PATH =
   process.env.MYSQL_SOCKET_PATH?.trim() || undefined;
 export const MYSQL_HOST = process.env.MYSQL_HOST?.trim() || undefined;
-export const MYSQL_PORT = parsePositiveInt(
-  "MYSQL_PORT",
-  process.env.MYSQL_PORT,
-  3306,
-);
+// 포트이므로 `parsePositiveInt`가 아니라 `parsePortEnv`로 읽는다. 상한이 있어야
+// `MYSQL_PORT=70000`이 조용히 mysql2와 터널의 `remotePort`까지 흘러가지 않는다.
+// 0은 거르지 않는다 — DB 포트로 쓸 값은 아니지만, 그렇게 설정할 일이 없어서
+// 이 한 자리를 위해 `parsePortEnv`를 갈래지을 만큼은 아니다.
+export const MYSQL_PORT =
+  parsePortEnv("MYSQL_PORT", process.env.MYSQL_PORT) ?? 3306;
 
 /** 직접 접속에서 `MYSQL_HOST`가 비었을 때 쓰는 주소. README의 표와 같은 값이다. */
 export const DEFAULT_MYSQL_HOST = "127.0.0.1";
