@@ -121,10 +121,49 @@ describe("숫자 환경 변수", () => {
     // 상한 값들과 달리 여기만 맨 Number()를 썼던 탓에 NaN이 그대로 mysql2까지
     // 갔다. 그러면 접속은 실패하는데 무엇이 잘못됐는지는 아무도 말해주지 않는다.
     const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 셸에 socket path가 export돼 있으면 풀 옵션이 host/port 자리를 통째로
+    // 비운다. 그러면 이 검사는 개발자 환경에 따라 undefined를 본다.
+    vi.stubEnv("MYSQL_SOCKET_PATH", "");
     vi.stubEnv("MYSQL_PORT", "three");
     const c = await config();
+    expect(c.MYSQL_PORT).toBe(3306);
     expect((c.mcpConfig.mysql as { port: number }).port).toBe(3306);
     expect(stderr).toHaveBeenCalledWith(expect.stringContaining("MYSQL_PORT"));
+  });
+
+  test("못 쓸 SSH 포트는 서버를 죽이지 않고 물러난다", async () => {
+    // 예전에는 같은 MYSQL_PORT를 두고 두 정책이 공존했다. config는 3306으로
+    // 물러나며 알렸고, 터널 경로는 던져서 프로세스를 끝냈다. 터널을 쓰는
+    // 프로필에서는 알림 쪽이 닿지도 못했다.
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubEnv("MYSQL_SSH_PORT", "twenty-two");
+    vi.stubEnv("MYSQL_SSH_LOCAL_PORT", "70000");
+    const c = await config();
+    expect(c.SSH_PORT).toBeUndefined();
+    expect(c.SSH_LOCAL_PORT).toBeUndefined();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("MYSQL_SSH_PORT"));
+    expect(stderr).toHaveBeenCalledWith(
+      expect.stringContaining("MYSQL_SSH_LOCAL_PORT"),
+    );
+  });
+
+  test("0은 SSH 로컬 포트에서 유효한 값이다", async () => {
+    // README가 "0은 자동 할당"이라고 약속한다. parsePositiveInt로 읽으면
+    // 그 약속이 경고와 함께 사라진다.
+    vi.stubEnv("MYSQL_SSH_LOCAL_PORT", "0");
+    expect((await config()).SSH_LOCAL_PORT).toBe(0);
+  });
+});
+
+describe("기본 스키마", () => {
+  test("공백만 든 MYSQL_DB는 없는 것으로 본다", async () => {
+    // 예전에는 isMultiDbMode만 trim하고 풀 옵션의 database는 원문을 썼다.
+    // 서버는 다중 DB 모드라고 말하면서 mysql2에는 이름이 " "인 스키마를 넘겼다.
+    vi.stubEnv("MYSQL_DB", "   ");
+    const c = await config();
+    expect(c.MYSQL_DB).toBeUndefined();
+    expect(c.isMultiDbMode).toBe(true);
+    expect(c.mcpConfig.mysql.database).toBeUndefined();
   });
 });
 

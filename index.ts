@@ -21,7 +21,6 @@ import {
   SCHEMA_UPDATE_PERMISSIONS,
   isMultiDbMode,
   mcpConfig as config,
-  MCP_VERSION as version,
   MYSQL_PROFILE,
   PROFILE_LABEL,
   IS_WRITE_FORBIDDEN_PROFILE,
@@ -34,6 +33,12 @@ import {
   MYSQL_DEFAULT_TIMEOUT_SECONDS,
   MYSQL_MAX_TIMEOUT_SECONDS,
   MAX_RESPONSE_ROWS,
+  MYSQL_SSL_ENABLED,
+  MYSQL_SSL_CA_PATH,
+  MYSQL_SSL_CERT_PATH,
+  MYSQL_SSL_KEY_PATH,
+  PACKAGE_VERSION,
+  SSH_ENABLED,
 } from "./src/config/index.js";
 import {
   catalogIdentity,
@@ -42,6 +47,7 @@ import {
 } from "./src/catalog/index.js";
 import {
   safeExit,
+  describeConnection,
   getPool,
   executeQuery,
   executeReadOnlyQuery,
@@ -51,7 +57,6 @@ import {
   profileBanner,
 } from "./src/db/index.js";
 import {
-  SSH_ENABLED,
   describeTunnel,
   ensureTunnel,
   resolveTunnelConfig,
@@ -62,12 +67,10 @@ import { fileURLToPath } from 'url';
 import { realpathSync } from 'fs';
 
 
-log("info", `Starting MySQL MCP server v${version}...`);
+log("info", `Starting MySQL MCP server v${PACKAGE_VERSION}...`);
 
 // 도구 설명에 multi-DB 모드와 스키마별 권한을 반영한다.
-// npm_package_version은 npm 스크립트로 실행할 때만 설정된다. MCP 클라이언트는
-// dist/index.js를 직접 실행하므로, 그럴 때는 빌드된 버전 값으로 대신한다.
-const toolVersion = `MySQL MCP Server [v${process.env.npm_package_version ?? version}]`;
+const toolVersion = `MySQL MCP Server [v${PACKAGE_VERSION}]`;
 
 // 클라이언트가 도구 설명에서 남겨 두는 글자 수. Claude Code 기준값이다. 이 값은
 // 프로토콜로 협상하지도 않고 누구도 되돌려 알려 주지 않는다. 그래서 우리가 아는
@@ -323,36 +326,22 @@ const mysqlQueryInputSchema = {
 };
 
 // @INFO: 설정값을 디버그 로그로 남긴다
-// FIXME: 아래 MYSQL_SOCKET_PATH/HOST/PORT/SSL* 는 config가 이미 읽어
-// mcpConfig.mysql로 만들어 둔 값의 두 번째 사본이다. 사본은 이미 어긋나 있다 —
-// ListResources 쪽 사본(아래 FIXME)은 MYSQL_HOST 기본값을 "localhost"로 두는데
-// config와 README는 127.0.0.1이다. mcpConfig에서 받아 쓰도록 바꾼다
-// (AGENTS.md의 "환경 변수는 src/config/index.ts에서만 읽는다").
-// 다만 mcpConfig.mysql만 봐서는 부족하다. MYSQL_SSH_ENABLED=true면 src/db/index.ts의
-// getPool이 socketPath를 버리고 터널 loopback 주소로 갈아끼우므로, mcpConfig의
-// host/port는 터널 이전의 bastion 쪽 주소다. 실제 접속 endpoint를 함께 봐야 한다.
+//
+// SSL은 경로만 적는다. `config.mysql.ssl`에는 인증서와 개인 키의 *내용*이
+// Buffer로 들어 있어서, 그것을 펼치면 키가 통째로 stderr에 찍힌다.
 log(
   "info",
   "MySQL Configuration:",
   JSON.stringify(
     {
-      ...(process.env.MYSQL_SOCKET_PATH
-        ? {
-            socketPath: process.env.MYSQL_SOCKET_PATH,
-            connectionType: "Unix Socket",
-          }
-        : {
-            host: process.env.MYSQL_HOST || "127.0.0.1",
-            port: process.env.MYSQL_PORT || "3306",
-            connectionType: "TCP/IP",
-          }),
+      connection: describeConnection(),
       user: config.mysql.user,
       password: config.mysql.password ? "******" : "not set",
       database: config.mysql.database || "MULTI_DB_MODE",
-      ssl: process.env.MYSQL_SSL === "true" ? "enabled" : "disabled",
-      sslCA: process.env.MYSQL_SSL_CA || "not set",
-      sslCert: process.env.MYSQL_SSL_CERT || "not set",
-      sslKey: process.env.MYSQL_SSL_KEY || "not set",
+      ssl: MYSQL_SSL_ENABLED ? "enabled" : "disabled",
+      sslCA: MYSQL_SSL_CA_PATH ?? "not set",
+      sslCert: MYSQL_SSL_CERT_PATH ?? "not set",
+      sslKey: MYSQL_SSL_KEY_PATH ?? "not set",
       multiDbMode: isMultiDbMode ? "enabled" : "disabled",
       profile: PROFILE_LABEL,
       writePolicy: IS_WRITE_FORBIDDEN_PROFILE
@@ -499,7 +488,7 @@ export default function createMcpServer() {
   const server = new Server(
     {
       name: "MySQL MCP Server",
-      version: process.env.npm_package_version || version,
+      version: PACKAGE_VERSION,
     },
     {
       capabilities: {
@@ -535,15 +524,7 @@ export default function createMcpServer() {
   server.setRequestHandler(ListResourcesRequestSchema, async () => {
     try {
       log("info", "Handling ListResourcesRequest");
-      // FIXME: 위 설정 로그와 같은 문제 — MYSQL_SOCKET_PATH/HOST/PORT를 직접
-      // 읽는다. 게다가 MYSQL_HOST 기본값이 "localhost"라 config·README의
-      // 127.0.0.1과 이미 어긋나 있다. 터널을 연 뒤의 실제 접속 endpoint를 받아 쓴다.
-      const connectionInfo = process.env.MYSQL_SOCKET_PATH
-        ? `socket: ${process.env.MYSQL_SOCKET_PATH}`
-        : `host: ${process.env.MYSQL_HOST || "localhost"}, port: ${
-            process.env.MYSQL_PORT || 3306
-          }`;
-      log("info", `Connection info: ${connectionInfo}`);
+      log("info", `Connection info: ${describeConnection()}`);
 
       // 보통은 시작 시 모아 둔 인벤토리가 데이터베이스를 읽지 않고 이 요청에 답한다.
       // 카탈로그가 꺼져 있거나 비어 있으면 원래의 리소스 동작을 그대로 따른다.

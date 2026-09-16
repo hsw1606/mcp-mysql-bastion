@@ -24,11 +24,15 @@ import * as mysql2 from "mysql2/promise";
 import { log } from "./../utils/index.js";
 import {
   ensureTunnel,
+  getTunnelEndpoint,
   getTunnelFatalError,
   describeTunnel,
 } from "./../ssh/tunnel.js";
 import {
   mcpConfig as config,
+  describeConfiguredTarget,
+  IS_TEST_ENVIRONMENT,
+  SSH_ENABLED,
   MYSQL_PROFILE,
   PROFILE_LABEL,
   CODE_BRANCH,
@@ -46,12 +50,9 @@ if (isMultiDbMode && !MULTI_DB_WRITE_MODE) {
   log("error", "Multi-DB mode detected - enabling read-only mode for safety");
 }
 
-// @INFO: 테스트 모드로 실행 중인지 확인한다
-const isTestEnvironment = process.env.NODE_ENV === "test" || process.env.VITEST;
-
 // @INFO: 프로세스를 안전하게 종료한다 (테스트 중에는 종료하지 않는다)
 function safeExit(code: number): void {
-  if (!isTestEnvironment) {
+  if (!IS_TEST_ENVIRONMENT) {
     process.exit(code);
   } else {
     log("error", `[Test mode] Would have called process.exit(${code})`);
@@ -231,6 +232,30 @@ const getPool = (): Promise<mysql2.Pool> => {
 function assertTunnelHealthy(): void {
   const fatal = getTunnelFatalError();
   if (fatal) throw fatal;
+}
+
+/**
+ * 풀이 **실제로** 붙는 곳을 사람이 읽는 한 줄로 만든다.
+ *
+ * 진단 출력이 접속 정보를 말하는 자리는 전부 이 함수 하나를 부른다. 예전에는
+ * 기동 로그와 ListResources 핸들러가 각자 `process.env`를 읽었고, 그 두 사본은
+ * 기본값부터 갈라져 있었다 — 한쪽은 `127.0.0.1`, 다른 쪽은 `localhost`. 둘 다
+ * 터널을 몰랐으므로 `MYSQL_SSH_ENABLED=true`일 때는 어느 쪽도 맞지 않았다.
+ * 풀은 bastion 쪽 주소가 아니라 터널의 loopback 주소로 간다.
+ *
+ * 터널이 아직 열리지 않았으면 설정에 적힌 대상을 말하되, 그것이 최종 주소가
+ * 아니라는 것을 함께 적는다. 기동 로그는 터널보다 먼저 돌기 때문이다.
+ */
+function describeConnection(): string {
+  const endpoint = getTunnelEndpoint();
+  if (endpoint) {
+    return (
+      `${endpoint.host}:${endpoint.port} ` +
+      `(${endpoint.reused ? "reused" : "new"} ssh tunnel)`
+    );
+  }
+  const target = describeConfiguredTarget();
+  return SSH_ENABLED ? `${target} (via ssh tunnel, not yet established)` : target;
 }
 
 /**
@@ -775,7 +800,7 @@ async function executeReadOnlyQuery<T>(
 
 export {
   profileBanner,
-  isTestEnvironment,
+  describeConnection,
   safeExit,
   executeQuery,
   getPool,
