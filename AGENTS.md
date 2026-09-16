@@ -109,9 +109,10 @@ npm run start:prod     # bin/mcp-mysql-prod.sh
   왜 여기서 읽지 않는지는 마음껏 적는다
 - MUST 숫자 환경 변수는 `parsePositiveInt`로 읽고, 포트는 `parsePortEnv`로 읽는다.
   `Number()`를 그대로 쓰면 빈 문자열이나 잘못된 값에서 `NaN`이 mysql2까지 흘러간다.
-  잘못된 값은 stderr로 알리고 기본값으로 계속 간다. 포트를 따로 두는 것은 0 때문이다
-  — `MYSQL_SSH_LOCAL_PORT=0`은 "OS가 빈 포트를 고르게 하라"는 유효한 값이라
-  `parsePositiveInt`가 거절한다
+  잘못된 값은 stderr로 알리고 기본값으로 계속 간다. 포트를 따로 두는 이유는 둘이다 —
+  `parsePositiveInt`에는 상한이 없어서 `MYSQL_PORT=70000`이 그대로 mysql2와 터널의
+  `remotePort`까지 흘러가고, `MYSQL_SSH_LOCAL_PORT=0`은 "OS가 빈 포트를 고르게 하라"는
+  유효한 값인데 `parsePositiveInt`가 거절한다
 - MUST README의 환경 변수 표에 올린 값은 실제로 읽는다. 표에 있는데 코드가
   하드코딩하고 있으면(과거의 `MYSQL_POOL_SIZE`가 그랬다) 그것은 버그다
 - MUST **이름은 그것이 실제로 하는 일을 말한다.** `sql_select_limit`이 응답 행 수를
