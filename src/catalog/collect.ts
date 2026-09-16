@@ -12,19 +12,17 @@ import { emptyTable, normalizeName } from "./types.js";
 export interface CatalogCollectorOptions {
   schemas: readonly string[];
   ttlHours: number;
-  isPIIColumn: (column: string) => boolean;
 }
 
 /**
- * Start `run` once `pending` settles, or immediately when nothing is in flight.
+ * `pending`이 끝난 뒤에 `run`을 시작한다. 진행 중인 작업이 없으면 바로 시작한다.
  *
- * A forced collection exists to escape a snapshot the caller knows is stale, so
- * joining an unforced scan already in flight defeats it: that scan read the
- * database before the migration the caller is trying to see, and stamping its
- * answer as freshly collected pins the lie. Queueing rather than racing keeps a
- * single writer per table, so the forced result is always the one that lands
- * last. The earlier failure is swallowed because it is the previous caller's to
- * report, not this one's.
+ * force 수집은 호출자가 낡았다고 판단한 스냅샷에서 빠져나오려고 쓴다. 그러므로
+ * 이미 돌고 있는 일반 스캔에 합류하면 목적이 무너진다. 그 스캔은 호출자가 보려는
+ * migration보다 먼저 DB를 읽었고, 그 답에 방금 수집했다는 도장을 찍으면 틀린 값이
+ * 그대로 굳는다. 경쟁시키지 않고 줄을 세우면 테이블마다 writer가 하나로 유지되므로,
+ * force 결과가 언제나 마지막에 남는다. 앞선 실패는 삼킨다. 그것은 이전 호출자가
+ * 보고할 몫이지 이번 호출자의 몫이 아니다.
  */
 function chainAfter(
   pending: Promise<void> | null | undefined,
@@ -37,9 +35,9 @@ function chainAfter(
 function isExpired(value: string | null, ttlHours: number): boolean {
   if (!value) return true;
   const parsed = Date.parse(value);
-  // A timestamp we cannot parse counts as expired, never as fresh. Every
-  // comparison against NaN is false, so returning that result would pin the
-  // entry as valid forever and the table would never be rescanned.
+  // 파싱할 수 없는 타임스탬프는 만료로 본다. 절대 신선한 값으로 보지 않는다.
+  // NaN과의 비교는 모두 false라서, 그 결과를 그대로 돌려주면 항목이 영영 유효한
+  // 것으로 굳고 테이블은 다시 스캔되지 않는다.
   if (!Number.isFinite(parsed)) return true;
   return Date.now() - parsed >= ttlHours * 60 * 60 * 1_000;
 }
@@ -85,11 +83,10 @@ export class CatalogCollector {
        ORDER BY table_schema, table_name`,
       [...this.options.schemas],
     );
-    // `information_schema` compares schema names case-insensitively, so the
-    // SQL above matches rows whose spelling differs from the declaration in
-    // MYSQL_APP_SCHEMAS. Group by the declared spelling instead of comparing
-    // exactly, or every such row is dropped here and the schema is cached as
-    // empty for a full TTL.
+    // `information_schema`는 스키마 이름을 대소문자 구분 없이 비교한다. 그래서 위
+    // SQL은 MYSQL_APP_SCHEMAS에 적힌 것과 철자가 다른 행도 가져온다. 정확히
+    // 비교하지 말고 선언된 철자를 기준으로 묶어야 한다. 그러지 않으면 그런 행이
+    // 여기서 전부 버려지고, 스키마는 TTL 내내 비어 있는 것으로 캐시된다.
     const declaredBySchema = new Map(
       this.options.schemas.map((name) => [normalizeName(name), name]),
     );
@@ -124,9 +121,8 @@ export class CatalogCollector {
         schema.scannedAt = now;
       }
     });
-    // An empty declared schema is almost always a typo in MYSQL_APP_SCHEMAS or
-    // a permission the tunnel user lacks. Say so instead of silently caching
-    // nothing for the rest of the TTL.
+    // 선언한 스키마가 비어 있다면 대개 MYSQL_APP_SCHEMAS의 오타이거나 터널 계정에
+    // 권한이 없는 경우다. TTL이 끝날 때까지 조용히 빈 값을 캐시하지 말고 알린다.
     for (const schemaName of this.options.schemas) {
       if (!rowsBySchema.has(schemaName)) {
         console.error(
@@ -214,10 +210,7 @@ export class CatalogCollector {
     );
 
     const columns: CatalogColumn[] = rows
-      .filter(
-        (row) =>
-          row.kind === "column" && !this.options.isPIIColumn(row.name),
-      )
+      .filter((row) => row.kind === "column")
       .map((row) => ({
         name: row.name,
         dataType: row.data_type ?? "",
@@ -231,13 +224,7 @@ export class CatalogCollector {
 
     const indexesByName = new Map<string, CatalogIndex>();
     for (const row of rows) {
-      if (
-        row.kind !== "index" ||
-        !row.index_column ||
-        this.options.isPIIColumn(row.index_column)
-      ) {
-        continue;
-      }
+      if (row.kind !== "index" || !row.index_column) continue;
       const index = indexesByName.get(row.name) ?? {
         name: row.name,
         unique: Number(row.non_unique) === 0,
@@ -254,9 +241,7 @@ export class CatalogCollector {
       .filter(
         (row) =>
           row.kind === "fk" &&
-          Boolean(row.fk_column && row.ref_schema && row.ref_table && row.ref_column) &&
-          !this.options.isPIIColumn(row.fk_column as string) &&
-          !this.options.isPIIColumn(row.ref_column as string),
+          Boolean(row.fk_column && row.ref_schema && row.ref_table && row.ref_column),
       )
       .map((row) => ({
         name: row.name,

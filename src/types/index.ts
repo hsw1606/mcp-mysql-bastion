@@ -20,14 +20,14 @@ export interface ColumnRow {
 }
 
 /**
- * One entry of the `MYSQL_APP_SCHEMAS` map: which MySQL schema an application
- * owns. Declared by the operator so a model never has to go looking for it.
+ * `MYSQL_APP_SCHEMAS` 맵의 항목 하나. 어떤 애플리케이션이 어떤 MySQL 스키마를
+ * 쓰는지를 담는다. 운영자가 미리 선언하므로 모델이 직접 찾아다닐 일이 없다.
  */
 export interface AppSchemaEntry {
-  /** Application name, as the team refers to it. */
+  /** 팀에서 부르는 그대로의 애플리케이션 이름. */
   app: string;
-  /** MySQL schema (database) the application stores its data in. */
+  /** 애플리케이션이 데이터를 저장하는 MySQL 스키마(데이터베이스). */
   schema: string;
-  /** Optional one-line note about what lives in the schema. */
+  /** 스키마에 무엇이 들어 있는지 적는 한 줄 설명. 선택 사항. */
   description?: string;
 }

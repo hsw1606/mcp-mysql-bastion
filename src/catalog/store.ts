@@ -4,6 +4,7 @@ import type {
   CatalogCurated,
   CatalogDocs,
   CatalogFile,
+  CatalogIndexFacts,
   CatalogJoin,
   CatalogOptions,
   CatalogSchema,
@@ -21,17 +22,16 @@ import {
 const FLUSH_DELAY_MS = 2_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_WAIT_MS = 15_000;
-// Shutdown cannot afford the full wait. The client that closed our stdin is
-// already gone, and blocking here only risks the process being killed before
-// the SSH tunnel is torn down.
+// 종료할 때는 전체 대기 시간을 감당할 수 없다. stdin을 닫은 클라이언트는 이미 떠났고,
+// 여기서 오래 붙들고 있으면 SSH 터널을 내리기도 전에 프로세스가 죽을 수 있다.
 const LOCK_CLOSE_WAIT_MS = 2_000;
 const LOCK_STALE_MS = 30_000;
 const CLOSE_FLUSH_ATTEMPTS = 2;
 
 /**
- * Raised when another writer held the lock for the whole wait. Recoverable on
- * its own: nothing is corrupt and the unflushed revision is still in memory,
- * so the caller retries instead of disabling the catalog.
+ * 다른 writer가 대기 시간 내내 락을 쥐고 있을 때 던진다. 그 자체로 복구할 수 있는
+ * 상황이다. 깨진 데이터는 없고 아직 flush하지 않은 리비전도 메모리에 그대로 있으니,
+ * 호출자는 카탈로그를 꺼 버리는 대신 다시 시도한다.
  */
 class CatalogLockTimeoutError extends Error {}
 
@@ -114,8 +114,8 @@ async function acquireCatalogLock(
         try {
           owner = JSON.parse(text) as Partial<CatalogLockRecord>;
         } catch {
-          // A new owner can be between open and write. Only age can make an
-          // unreadable lock stale, so another writer never removes it early.
+          // 새 소유자가 파일을 열어 놓고 아직 쓰기 전일 수 있다. 읽을 수 없는 락은
+          // 오직 시간이 지나야 stale이 되므로, 다른 writer가 먼저 지우지 않는다.
         }
         stale =
           typeof owner.pid === "number"
@@ -128,8 +128,8 @@ async function acquireCatalogLock(
 
       if (stale && lockText !== null) {
         try {
-          // Re-read before deletion so a recently acquired lock is not removed
-          // after replacing the stale one that we inspected above.
+          // 지우기 전에 다시 읽는다. 위에서 살펴본 stale 락을 대신해 방금 잡힌
+          // 락까지 지워 버리지 않기 위해서다.
           if ((await fs.promises.readFile(lockPath, "utf8")) === lockText) {
             await fs.promises.unlink(lockPath);
             console.error(`[catalog] removed stale lock ${lockPath}`);
@@ -204,8 +204,8 @@ function mergeCurated(
 }
 
 function mergedCounter(external: number, local: number, base: number): number {
-  // A lower local value is an intentional reset from `forget`, not a lost
-  // increment. Preserve only increments another process made after our base.
+  // 로컬 값이 더 작다면 증가분을 잃은 것이 아니라 `forget`이 의도적으로 초기화한
+  // 것이다. 다른 프로세스가 base 이후에 더한 증가분만 살린다.
   if (local < base) return local + Math.max(0, external - base);
   return external + Math.max(0, local - base);
 }
@@ -396,7 +396,7 @@ function mergeCatalog(
       unlinked: [],
     },
     schemas,
-    // Two writers each below the cap can still merge to above it.
+    // 각자 상한 아래였던 writer 둘이 병합되면 상한을 넘길 수 있다.
     joins: pruneJoins([...joins.values()]),
   };
   const linked = new Set<string>();
@@ -421,7 +421,7 @@ export class CatalogStore {
   private revision = 0;
   private flushedRevision = 0;
   private closing = false;
-  /** Case-insensitive name lookup, rebuilt lazily after every mutation. */
+  /** 대소문자를 가리지 않는 이름 조회용 인덱스. 변경 후 필요해질 때 다시 만든다. */
   private nameIndex: Map<
     string,
     { schema: string; tables: Map<string, string> }
@@ -450,9 +450,24 @@ export class CatalogStore {
 
   private loadFromDisk(): void {
     if (!fs.existsSync(this.options.filePath)) return;
-    const parsed = JSON.parse(
-      fs.readFileSync(this.options.filePath, "utf8"),
-    ) as Partial<CatalogFile>;
+    let parsed: Partial<CatalogFile>;
+    try {
+      parsed = JSON.parse(
+        fs.readFileSync(this.options.filePath, "utf8"),
+      ) as Partial<CatalogFile>;
+    } catch (error) {
+      // 읽을 수 없는 파일은 카탈로그를 끌 이유가 못 된다. 캐시가 없는 것과 같게
+      // 다루면 되고, 다음 flush의 원자적 rename이 그 파일을 우리 내용으로
+      // 교체한다. 카탈로그를 끄는 것은 디스크 자체를 쓸 수 없을 때뿐이다 —
+      // 그쪽은 `initialize`의 mkdir이 잡는다. 같은 파일의 `readExternal`도
+      // flush 경로에서 이미 이렇게 관용한다.
+      console.error(
+        `[catalog] ignoring unreadable ${this.options.filePath}; it will be replaced: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
     if (
       parsed.version !== CATALOG_VERSION ||
       parsed.profile !== this.options.profile ||
@@ -466,8 +481,6 @@ export class CatalogStore {
     this.data = this.sanitizeLoaded(parsed as CatalogFile);
     this.invalidateNameIndex();
     this.baseData = structuredClone(this.data);
-    // Rewriting also removes PII columns left by a cache that was created
-    // before redaction was enabled for this profile.
     this.revision += 1;
     this.scheduleFlush();
     console.error(`[catalog] loaded ${this.options.filePath}`);
@@ -487,35 +500,19 @@ export class CatalogStore {
         const table: CatalogTable = {
           ...base,
           ...raw,
-          columns: (raw.columns ?? []).filter(
-            (column) => !this.options.isPIIColumn(column.name),
-          ),
-          pk: (raw.pk ?? []).filter(
-            (column) => !this.options.isPIIColumn(column),
-          ),
-          indexes: (raw.indexes ?? [])
-            .map((index) => ({
-              ...index,
-              columns: index.columns.filter(
-                (column) => !this.options.isPIIColumn(column),
-              ),
-            }))
-            .filter((index) => index.columns.length > 0),
-          fks: (raw.fks ?? []).filter(
-            (fk) =>
-              !this.options.isPIIColumn(fk.column) &&
-              !this.options.isPIIColumn(fk.referencedColumn),
-          ),
+          // `?? []`는 단순한 기본값 이상의 몫을 한다. 예전 빌드가 쓴 카탈로그
+          // 파일에는 이 키들이 통째로 없을 수 있는데, `tableIndexes` 같은 읽기
+          // 쪽은 이들을 아무 방어 없이 순회한다.
+          columns: raw.columns ?? [],
+          pk: raw.pk ?? [],
+          indexes: raw.indexes ?? [],
+          fks: raw.fks ?? [],
           usage: {
             count: raw.usage?.count ?? 0,
             successCount: raw.usage?.successCount ?? raw.usage?.count ?? 0,
             failureCount: raw.usage?.failureCount ?? 0,
             lastUsedAt: raw.usage?.lastUsedAt ?? null,
-            columns: Object.fromEntries(
-              Object.entries(raw.usage?.columns ?? {}).filter(
-                ([column]) => !this.options.isPIIColumn(column),
-              ),
-            ),
+            columns: raw.usage?.columns ?? {},
           },
           curated: {
             notes: raw.curated?.notes ?? [],
@@ -540,17 +537,9 @@ export class CatalogStore {
     }
     fresh.joins = pruneJoins(
       (loaded.joins ?? [])
-        .filter((edge) => {
-          const aColumn = edge.a.slice(edge.a.lastIndexOf(".") + 1);
-          const bColumn = edge.b.slice(edge.b.lastIndexOf(".") + 1);
-          return (
-            !this.options.isPIIColumn(aColumn) &&
-            !this.options.isPIIColumn(bColumn)
-          );
-        })
-        // A cache written before edges were stamped evicts first. It carries no
-        // recency to compare, and the next query that walks the path re-stamps
-        // whichever edges still matter.
+        // 간선에 시각을 찍기 전에 만들어진 캐시는 가장 먼저 밀려난다. 비교할 최근성
+        // 정보가 없고, 이 경로를 다시 지나는 쿼리가 아직 의미 있는 간선에 시각을
+        // 새로 찍어 주기 때문이다.
         .map((edge) => ({ ...edge, lastUsedAt: edge.lastUsedAt ?? EPOCH })),
     );
     return fresh;
@@ -592,23 +581,23 @@ export class CatalogStore {
   }
 
   /**
-   * Full copy of the catalog. Deliberately expensive: only `map`, `search` and
-   * the document actions need every table at once. Anything on the query path
-   * uses the targeted readers below, which is why they exist — resolving a
-   * table name used to clone the entire catalog once per reference.
+   * 카탈로그 전체 복사본. 비싸다는 것을 알고 쓴다. 모든 테이블을 한꺼번에 필요로 하는
+   * 곳은 `map`, `search`, 그리고 문서 관련 동작뿐이다. 쿼리 경로에 있는 코드는 아래의
+   * 좁은 읽기 함수들을 쓴다. 그 함수들이 존재하는 이유가 이것이다. 예전에는 테이블
+   * 이름을 해석할 때마다 참조 하나당 카탈로그 전체를 복제했다.
    */
   snapshot(): CatalogFile {
     return structuredClone(this.data);
   }
 
-  /** Copy of the document axis alone. Cheap enough for the response path. */
+  /** 문서 축만 복사한다. 응답 경로에서 써도 될 만큼 가볍다. */
   docsView(): CatalogDocs {
     return structuredClone(this.data.docs);
   }
 
   /**
-   * Canonical spellings for a possibly differently-cased reference. Returns
-   * every match so an ambiguous unqualified name stays ambiguous to the caller.
+   * 대소문자가 다를 수 있는 참조에 대한 정규 표기. 일치하는 것을 모두 돌려주므로,
+   * 한정되지 않아 모호한 이름은 호출자에게도 모호한 채로 남는다.
    */
   lookup(
     schemaHint: string | null,
@@ -628,13 +617,13 @@ export class CatalogStore {
     return matches;
   }
 
-  /** Whether a schema is declared, and when its inventory was last scanned. */
+  /** 스키마가 선언되어 있는지, 그리고 그 인벤토리를 마지막으로 스캔한 시각. */
   schemaState(schema: string): { scannedAt: string | null } | null {
     const entry = this.data.schemas[schema];
     return entry ? { scannedAt: entry.scannedAt } : null;
   }
 
-  /** Scalar facts about one table, copied without cloning the catalog. */
+  /** 테이블 하나에 대한 단순 값들. 카탈로그를 통째로 복제하지 않고 복사한다. */
   tableMeta(schema: string, table: string): CatalogTableMeta | null {
     const entry = this.data.schemas[schema]?.tables[table];
     if (!entry) return null;
@@ -645,15 +634,37 @@ export class CatalogStore {
     };
   }
 
-  /** One table, cloned. Costs a fraction of a full snapshot. */
+  /**
+   * 테이블 하나의 인덱스 구성. 카탈로그를 통째로 복제하지 않고 복사한다. `tableMeta`가
+   * 있는 이유와 같다. 타임아웃 진단은 오류 경로에서 도는데, 그 경로는 전체 스냅샷
+   * 비용을 치를 수 없고 필요한 필드도 몇 개뿐이다.
+   */
+  tableIndexes(schema: string, table: string): CatalogIndexFacts | null {
+    const entry = this.data.schemas[schema]?.tables[table];
+    if (!entry) return null;
+    return {
+      schema,
+      table,
+      indexes: entry.indexes.map((index) => ({
+        ...index,
+        columns: [...index.columns],
+      })),
+      pk: [...entry.pk],
+      rowsEstimate: entry.rowsEstimate,
+      detailScannedAt: entry.detailScannedAt,
+      detailStale: entry.detailStale === true,
+    };
+  }
+
+  /** 테이블 하나를 복제해서 준다. 전체 스냅샷의 일부 비용만 든다. */
   readTable(schema: string, table: string): CatalogTable | null {
     const entry = this.data.schemas[schema]?.tables[table];
     return entry ? structuredClone(entry) : null;
   }
 
   /**
-   * Whether any table has been read successfully at least once. This is the
-   * moment the hot-table list in the tool description stops being empty.
+   * 테이블 중 하나라도 성공적으로 읽힌 적이 있는지. 도구 설명의 hot-table 목록이
+   * 비어 있지 않게 되는 순간이 바로 여기다.
    */
   hasSuccessfulUse(): boolean {
     for (const schema of Object.values(this.data.schemas)) {
@@ -664,7 +675,7 @@ export class CatalogStore {
     return false;
   }
 
-  /** Observed equality joins touching one table, hottest first. */
+  /** 테이블 하나에 맞닿은, 실제로 관측된 동등 조인. 많이 쓰인 순서. */
   readJoins(schema: string, table: string): CatalogJoin[] {
     const prefix = `${schema}.${table}.`.toLowerCase();
     return this.data.joins
@@ -715,11 +726,11 @@ export class CatalogStore {
       );
       tempPath = `${this.options.filePath}.${process.pid}.${Date.now()}.tmp`;
       const writingRevision = this.revision;
-      // Keep persistence as a second PII boundary. Collectors filter on input,
-      // but future catalog writers must not be able to bypass that policy.
+      // `sanitizeLoaded`는 정규화도 한다. 예전 빌드의 writer가 빠뜨렸을 키를 채워
+      // 넣는 것이 바로 이 함수다.
       let toWrite = this.sanitizeLoaded(structuredClone(this.data));
-      // The lock serializes writers. Always merge the latest file instead of
-      // relying on mtime resolution to prove that no other process wrote it.
+      // 락이 writer들을 한 줄로 세운다. 다른 프로세스가 쓰지 않았음을 mtime 해상도로
+      // 증명하려 들지 말고, 언제나 최신 파일을 병합한다.
       const external = this.readExternal();
       if (
         external &&
@@ -735,11 +746,10 @@ export class CatalogStore {
         this.data = toWrite;
         this.invalidateNameIndex();
       }
-      // Serialize the payload and record the merge ancestor before the first
-      // await. `this.data` now aliases `toWrite`, so `update()` can still
-      // increment counters while the write is in flight — and those increments
-      // are not in the file. Recording them as the ancestor would make the next
-      // three-way merge subtract them from themselves and drop them.
+      // 첫 await 전에 페이로드를 직렬화하고 병합 기준점을 기록한다. 지금 `this.data`는
+      // `toWrite`와 같은 객체를 가리키므로, 쓰기가 진행되는 동안에도 `update()`가
+      // 카운터를 올릴 수 있다. 그 증가분은 파일에 들어가 있지 않다. 이를 기준점으로
+      // 기록해 두면 다음 3방향 병합이 증가분을 자기 자신에서 빼서 없애 버린다.
       const payload = `${JSON.stringify(toWrite, null, 2)}\n`;
       const persisted = structuredClone(toWrite);
       await fs.promises.writeFile(tempPath, payload, {
@@ -757,13 +767,13 @@ export class CatalogStore {
         try {
           await fs.promises.unlink(tempPath);
         } catch {
-          // A failed write often means the temporary file was never created.
+          // 쓰기가 실패했다면 임시 파일이 아예 만들어지지 않았을 때가 많다.
         }
       }
       if (error instanceof CatalogLockTimeoutError) {
-        // Losing a race for the lock is not a reason to stop cataloguing for
-        // the rest of the session. Nothing was written, the pending revision is
-        // still in memory, and `close()` drives its own bounded retries.
+        // 락 경쟁에서 밀렸다고 남은 세션 내내 카탈로그 수집을 멈출 이유는 없다. 쓰인
+        // 것은 없고, 대기 중인 리비전도 메모리에 그대로 있으며, `close()`가 스스로
+        // 횟수를 제한한 재시도를 돌린다.
         console.error(`[catalog] ${error.message}; will retry`);
         this.scheduleFlush();
         return;
@@ -785,9 +795,9 @@ export class CatalogStore {
   }
 
   /**
-   * Read whatever another writer left behind. A truncated or hand-edited file
-   * must not disable the catalog: the atomic rename that follows replaces it
-   * with our own valid content.
+   * 다른 writer가 남긴 내용을 그대로 읽는다. 잘려 있거나 사람이 손댄 파일 때문에
+   * 카탈로그를 꺼서는 안 된다. 뒤이어 일어나는 원자적 rename이 그 파일을 우리의
+   * 올바른 내용으로 대체한다.
    */
   private readExternal(): CatalogFile | null {
     if (!fs.existsSync(this.options.filePath)) return null;
@@ -811,9 +821,9 @@ export class CatalogStore {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    // Bounded, because a lock timeout leaves the revision unflushed and would
-    // otherwise spin here forever while the caller still has to reach
-    // `stopTunnel()`. `closing` also shortens the lock wait per attempt.
+    // 횟수를 제한한다. 락 타임아웃이 나면 리비전이 flush되지 않은 채 남는데, 제한이
+    // 없으면 호출자가 아직 `stopTunnel()`까지 가야 하는 동안 여기서 영영 돈다.
+    // `closing`은 시도마다의 락 대기 시간도 줄여 준다.
     for (let attempt = 0; attempt < CLOSE_FLUSH_ATTEMPTS; attempt += 1) {
       if (!this.enabled || this.revision === this.flushedRevision) return;
       if (this.flushPromise) await this.flushPromise;

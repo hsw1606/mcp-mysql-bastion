@@ -12,6 +12,7 @@ import {
 } from "./render.js";
 import { CatalogStore } from "./store.js";
 import type {
+  CatalogIndexFacts,
   CatalogOptions,
   CatalogForgetScope,
   PreparedCatalogQuery,
@@ -21,27 +22,26 @@ import { emptyUsage, normalizeName, pruneJoins } from "./types.js";
 import { prepareCatalogQuery, resultColumnNames } from "./usage.js";
 
 const UNKNOWN_REFERENCE_REFRESH_COOLDOWN_MS = 60_000;
-// One entry per distinct table name we could not resolve. Bounded so a session
-// that keeps naming tables which do not exist cannot grow this without limit.
+// 해석하지 못한 테이블 이름마다 항목 하나씩 쌓인다. 상한을 두어, 존재하지 않는
+// 테이블을 계속 불러 대는 세션이 이 맵을 무한정 키우지 못하게 한다.
 const UNKNOWN_REFERENCE_MEMORY_LIMIT = 256;
-// Background work is deliberately started after the response is sent, so
-// shutdown drains it. The deadline is what keeps a wedged git call or query
-// from holding the shutdown path open before the tunnel is torn down.
+// 백그라운드 작업은 일부러 응답을 보낸 뒤에 시작하므로, 종료 시점에 이를 모두
+// 흘려보낸다. 데드라인은 멈춰 버린 git 호출이나 쿼리가 터널을 내리기 전까지
+// 종료 경로를 붙잡고 있지 못하게 막는다.
 const CLOSE_DRAIN_DEADLINE_MS = 3_000;
 const NOTE_MAX_LENGTH = 1_000;
 const ALIAS_MAX_LENGTH = 200;
-// Curated text is the one thing here that no automatic pass may overwrite, so
-// the limit refuses the write instead of evicting an older entry the way the
-// derived axes do. A table that has hit either bound wants `forget`, not a
-// silently dropped memo.
+// 사람이 적어 넣은 텍스트는 자동 수집이 절대 덮어쓰지 못하는 유일한 값이다. 그래서
+// 한도에 닿으면 파생 축처럼 오래된 항목을 밀어내지 않고 쓰기 자체를 거부한다. 둘 중
+// 하나라도 상한에 닿은 테이블에 필요한 것은 조용히 사라지는 메모가 아니라 `forget`이다.
 const NOTE_COUNT_LIMIT = 50;
 const ALIAS_COUNT_LIMIT = 20;
 
 /**
- * A referenced timer, plus the means to cancel it. Referenced on purpose: an
- * unreferenced deadline never fires once the hung task is the only thing left
- * on the loop, which is exactly the case the deadline exists for. Cancelling
- * it after the race keeps it from outliving its usefulness.
+ * 참조를 유지하는 타이머와 그것을 취소하는 수단. 참조는 의도적이다. 참조를 놓은
+ * 데드라인은 멈춘 작업만 이벤트 루프에 남았을 때 아예 발화하지 않는데, 그 상황이야말로
+ * 데드라인이 존재하는 이유다. 경쟁이 끝난 뒤 타이머를 취소해서, 쓸모를 다한 타이머가
+ * 살아남지 않게 한다.
  */
 function deadlineTimer(ms: number): { expired: Promise<void>; cancel: () => void } {
   let timer: NodeJS.Timeout;
@@ -53,7 +53,7 @@ function deadlineTimer(ms: number): { expired: Promise<void>; cancel: () => void
 
 export interface CatalogIdentity {
   profile: string;
-  /** Stable identity of the database endpoint, before any local SSH forwarding. */
+  /** 로컬 SSH 포워딩을 거치기 전, 데이터베이스 엔드포인트의 고정된 식별자. */
   target: string;
   user: string;
   customPath?: string;
@@ -64,12 +64,11 @@ function shortHash(value: string): string {
 }
 
 /**
- * The file name and the fingerprint have to be built from the same inputs. The
- * fingerprint decides whether a loaded catalog may be reused, and a mismatch
- * skips the merge and overwrites — so any input the fingerprint counts but the
- * name does not gives two servers one file that each discards on start and
- * clobbers on every flush. The user belongs in both because two accounts on one
- * host hold different grants, and therefore see different tables.
+ * 파일 이름과 fingerprint는 반드시 같은 입력에서 만들어야 한다. fingerprint는 읽어
+ * 들인 카탈로그를 재사용해도 되는지 결정하고, 값이 어긋나면 병합을 건너뛰고 덮어쓴다.
+ * 그래서 fingerprint는 세지만 파일 이름은 세지 않는 입력이 있으면, 서로 다른 두 서버가
+ * 한 파일을 쓰게 되어 각자 시작할 때 상대의 내용을 버리고 flush마다 짓뭉갠다. 사용자도
+ * 양쪽에 들어가야 한다. 한 호스트의 두 계정은 권한이 달라서 보이는 테이블도 다르다.
  */
 export function catalogIdentity(identity: CatalogIdentity): {
   filePath: string;
@@ -77,8 +76,8 @@ export function catalogIdentity(identity: CatalogIdentity): {
 } {
   const profile = identity.profile || "default";
   const safeProfile = profile.replace(/[^A-Za-z0-9_.-]/g, "_");
-  // NUL separates the parts because it cannot appear in a host name or a
-  // MySQL user, so no two distinct endpoints can collapse onto one identity.
+  // 각 부분은 NUL로 구분한다. 호스트 이름이나 MySQL 사용자에는 NUL이 들어갈 수
+  // 없으므로, 서로 다른 두 엔드포인트가 하나의 식별자로 뭉개지지 않는다.
   const endpointHash = shortHash(`${identity.target}\u0000${identity.user}`);
   const directory =
     identity.customPath ??
@@ -94,9 +93,10 @@ function sameName(a: string, b: string): boolean {
 }
 
 /**
- * Resolving a name and mutating the entry are separate steps, and a flush merge
- * or a background inventory scan in between can drop a table the database no
- * longer has. Saying so beats the `undefined` property read that preceded this.
+ * 이름을 해석하는 단계와 항목을 수정하는 단계는 서로 떨어져 있다. 그 사이에 flush
+ * 병합이나 백그라운드 인벤토리 스캔이 끼어들면, 데이터베이스에서 이미 사라진 테이블이
+ * 카탈로그에서도 빠질 수 있다. 그럴 때는 예전처럼 `undefined` 프로퍼티를 읽게 두는
+ * 것보다 이렇게 사정을 알려 주는 편이 낫다.
  */
 function tableVanished(qualified: string): string {
   return `${qualified} is no longer in the catalog; it was dropped while the request was in flight. Run mysql_catalog {action:"map"} to see what remains.`;
@@ -118,7 +118,6 @@ export class SchemaCatalog {
     this.collector = new CatalogCollector(this.store, {
       schemas: options.appSchemas.map((entry) => entry.schema),
       ttlHours: options.ttlHours,
-      isPIIColumn: options.isPIIColumn,
     });
     this.documents = new CatalogDocuments(this.store, {
       repo: options.docsRepo,
@@ -133,11 +132,11 @@ export class SchemaCatalog {
 
   startInventory(): void {
     if (!this.isEnabled() || this.closing) return;
-    // Deliberately not forced. MCP clients start a fresh server per session,
-    // so forcing here would rescan on every session and make
-    // MYSQL_CATALOG_TTL_HOURS meaningless for the inventory. An empty or
-    // expired inventory still refreshes: `inventoryNeedsRefresh` treats a
-    // missing `scannedAt` as expired.
+    // 일부러 강제하지 않는다. MCP 클라이언트는 세션마다 서버를 새로 띄우므로,
+    // 여기서 강제하면 매 세션 다시 스캔하게 되고 인벤토리에 대해서는
+    // MYSQL_CATALOG_TTL_HOURS가 무의미해진다. 비어 있거나 만료된 인벤토리는
+    // 그래도 갱신된다. `inventoryNeedsRefresh`가 `scannedAt`이 없는 경우를
+    // 만료로 보기 때문이다.
     this.trackBackgroundTask(
       this.collector.collectInventory(false).catch((error) => {
         console.error(
@@ -147,16 +146,17 @@ export class SchemaCatalog {
     );
   }
 
-  toolDescriptionSuffix(): string {
+  /** `budget`은 기본 설명이 이 꼬리말 몫으로 남겨 둔 글자 수다. */
+  toolDescriptionSuffix(budget: number): string {
     if (!this.isEnabled()) return "";
-    return renderToolDescriptionSuffix(this.store.snapshot());
+    return renderToolDescriptionSuffix(this.store.snapshot(), budget);
   }
 
   /**
-   * Called once, the first time the hot-table list stops being empty. That list
-   * holds only tables a query has actually read, so the inventory scan is not
-   * the moment the tool description changes — the first successful query is.
-   * One call per process, which is what caps the notification at one a session.
+   * hot-table 목록이 처음으로 비지 않게 되는 순간 한 번만 호출한다. 이 목록에는
+   * 쿼리가 실제로 읽은 테이블만 들어가므로, 도구 설명이 바뀌는 시점은 인벤토리
+   * 스캔이 아니라 첫 성공 쿼리다. 프로세스당 한 번만 부르며, 그래서 알림도 세션당
+   * 한 번으로 묶인다.
    */
   onToolDescriptionFilled(listener: () => void | Promise<void>): void {
     this.toolDescriptionListener = listener;
@@ -178,10 +178,10 @@ export class SchemaCatalog {
   }
 
   /**
-   * Canonical schema and table names for a reference written in any casing.
-   * Resolves through the store's name index rather than a snapshot: this runs
-   * several times per query, and cloning the catalog each time put tens of
-   * milliseconds of blocked event loop on every response.
+   * 대소문자를 아무렇게나 쓴 참조로부터 정규 스키마 이름과 테이블 이름을 얻는다.
+   * 스냅샷이 아니라 store의 이름 인덱스로 해석한다. 이 함수는 쿼리 한 건마다 여러 번
+   * 돌기 때문에, 그때마다 카탈로그를 복제하면 응답마다 수십 밀리초씩 이벤트 루프가
+   * 막혔다.
    */
   private resolveTable(input: string): { schema: string; table: string } | null {
     const cleaned = input.replace(/`/g, "").trim();
@@ -200,7 +200,7 @@ export class SchemaCatalog {
     return null;
   }
 
-  /** Whether a model or user already recorded a document decision. */
+  /** 모델이나 사용자가 문서에 대한 판단을 이미 남겼는지 여부. */
   private documentReviewed(schema: string, table: string): boolean {
     return this.store.tableMeta(schema, table)?.docReviewed === true;
   }
@@ -256,7 +256,7 @@ export class SchemaCatalog {
       try {
         await this.documents.ensureAwake();
       } catch (error) {
-        // A broken document repository must not hide the database catalog.
+        // 문서 저장소가 망가졌다고 데이터베이스 카탈로그까지 가려서는 안 된다.
         documentWarning = error instanceof Error ? error.message : String(error);
       }
     }
@@ -268,20 +268,15 @@ export class SchemaCatalog {
 
   async search(query: string, requestedLimit?: number): Promise<string> {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
-    // Same cold-start guard as `map`. Without it the first search of a session
-    // reads an empty snapshot and returns no hits, which reads to the model as
-    // "no such table" rather than "not scanned yet".
+    // `map`과 같은 콜드 스타트 방어다. 이것이 없으면 세션의 첫 검색이 빈 스냅샷을
+    // 읽어 아무것도 찾지 못하고, 모델은 그 결과를 "아직 스캔 전"이 아니라 "그런
+    // 테이블 없음"으로 읽는다.
     if (this.collector.inventoryNeedsRefresh()) {
       await this.collector.collectInventory(false);
     }
     const limit = Math.min(100, Math.max(1, requestedLimit ?? 20));
     return JSON.stringify(
-      searchCatalog(
-        this.store.snapshot(),
-        query,
-        limit,
-        this.options.isPIIColumn,
-      ),
+      searchCatalog(this.store.snapshot(), query, limit),
       null,
       2,
     );
@@ -299,15 +294,14 @@ export class SchemaCatalog {
         documentError = error instanceof Error ? error.message : String(error);
       }
     }
-    // Read the table once, after both refreshes. Waking the document axis can
-    // drop a link whose file no longer exists at the ref, so an earlier read
-    // would render a document that has just been unlinked.
+    // 두 갱신이 모두 끝난 뒤에 테이블을 한 번만 읽는다. 문서 축을 깨우는 과정에서
+    // 해당 ref에 파일이 없는 링크가 끊길 수 있으므로, 더 일찍 읽으면 방금 끊긴
+    // 문서를 그대로 출력하게 된다.
     const entry = this.store.readTable(resolved.schema, resolved.table);
     if (!entry) throw new Error(`Table disappeared during refresh: ${input}`);
     return renderDescribe(
       `${resolved.schema}.${resolved.table}`,
       entry,
-      this.options.isPIIColumn,
       {
         configured: this.documents.isConfigured(),
         available: this.documents.isAvailable(),
@@ -323,17 +317,16 @@ export class SchemaCatalog {
   }
 
   /**
-   * Force re-collection of what the server derives on its own.
+   * 서버가 스스로 알아내는 정보를 강제로 다시 수집한다.
    *
-   * The automatic invalidation is error-driven: a query that names a column or
-   * table the database does not have marks that entry stale. That only detects
-   * the catalog claiming too much. It is blind the other way — a migration that
-   * *adds* a column, index or foreign key produces no error, because a model
-   * never names something it does not know exists, so nothing marks the entry
-   * stale and the catalog under-reports for up to a full TTL. That case is
-   * worse than a failed query: SQL written without a freshly added `deletedAt`
-   * succeeds and silently returns soft-deleted rows. This is the manual way out
-   * of that window, and it costs one query.
+   * 자동 무효화는 오류에 기대어 돌아간다. 데이터베이스에 없는 컬럼이나 테이블을 부른
+   * 쿼리가 그 항목을 stale로 표시한다. 이렇게 하면 카탈로그가 과하게 주장하는 경우만
+   * 잡힌다. 반대 방향은 보지 못한다. 컬럼, 인덱스, 외래 키를 *추가하는* 마이그레이션은
+   * 오류를 내지 않는다. 모델은 존재를 모르는 것을 부르지 않기 때문이다. 그래서 아무
+   * 항목도 stale이 되지 않고, 카탈로그는 최대 TTL 한 주기 내내 실제보다 적게 보고한다.
+   * 이 경우는 실패한 쿼리보다 나쁘다. 방금 추가된 `deletedAt`을 모르고 쓴 SQL은
+   * 성공하면서 소프트 삭제된 행을 조용히 돌려준다. 이 함수는 그 구간을 수동으로
+   * 빠져나오는 길이며, 비용은 쿼리 한 번이다.
    */
   async refresh(target?: string): Promise<string> {
     if (!this.isEnabled()) throw new Error("The schema catalog is disabled.");
@@ -369,15 +362,15 @@ export class SchemaCatalog {
       );
     }
 
-    // A declared schema name wins over a table of the same name, because this
-    // environment really does have a `call` schema and tables named after
-    // schemas are possible. Qualifying with a dot always means the table.
+    // 선언된 스키마 이름이 같은 이름의 테이블보다 우선한다. 이 환경에는 실제로
+    // `call` 스키마가 있고, 스키마와 같은 이름의 테이블도 있을 수 있기 때문이다.
+    // 점을 찍어 한정하면 언제나 테이블을 뜻한다.
     const declared = requested.includes(".")
       ? undefined
       : this.options.appSchemas.find((entry) => sameName(entry.schema, requested));
     if (declared) {
-      // One query covers every declared schema, so the whole inventory is
-      // rescanned regardless of which schema was named. Report it honestly.
+      // 쿼리 한 번이 선언된 모든 스키마를 훑으므로, 어떤 스키마를 지목했든 인벤토리
+      // 전체를 다시 스캔한다. 결과에도 그 사실을 그대로 밝힌다.
       await this.collector.collectInventory(true);
       return JSON.stringify(
         {
@@ -394,10 +387,10 @@ export class SchemaCatalog {
 
     let resolved = this.resolveTable(requested);
     if (!resolved && requested.includes(".")) {
-      // A table a migration just created is not in the inventory yet, and
-      // asking about it is exactly why someone calls refresh. A qualified name
-      // is an explicit claim that this table exists, so spend the one query to
-      // check. A bare unknown word is far likelier a typo and gets no query.
+      // 마이그레이션이 방금 만든 테이블은 아직 인벤토리에 없고, 바로 그것을 물어보려고
+      // refresh를 부른다. 한정된 이름은 이 테이블이 존재한다는 명시적인 주장이므로
+      // 확인에 쿼리 한 번을 쓴다. 한정되지 않은 낯선 단어는 오타일 가능성이 훨씬 커서
+      // 쿼리를 쓰지 않는다.
       await this.collector.collectInventory(true);
       resolved = this.resolveTable(requested);
     }
@@ -469,7 +462,7 @@ export class SchemaCatalog {
         paths: docs.paths.length,
       };
     } catch (error) {
-      // A broken document repository must not fail the database refresh.
+      // 문서 저장소가 망가졌다고 데이터베이스 갱신까지 실패시켜서는 안 된다.
       return {
         refreshed: false,
         ref: this.options.docsRef,
@@ -672,6 +665,24 @@ export class SchemaCatalog {
     return notices.join("\n\n") || null;
   }
 
+  /**
+   * 테이블 하나의 인덱스 사실. 카탈로그가 보증할 수 없으면 null을 준다.
+   *
+   * 동기 함수이고 부수 효과가 없도록 일부러 그렇게 만들었다. 부르는 곳은 타임아웃
+   * 진단 하나뿐인데, 이 진단은 쿼리가 이미 취소된 뒤에 돈다. 거기서 메타데이터를
+   * 모으면 이 기능이 피하려던 왕복이 도로 생기고, 실패한 쿼리는 더 느려진다.
+   * 카탈로그가 스캔한 적 없는 테이블은 그냥 null이 되고, 진단은 추측하는 대신 그
+   * 사실을 말한다.
+   */
+  indexFacts(reference: TableReference): CatalogIndexFacts | null {
+    if (!this.isEnabled()) return null;
+    const resolved = this.resolveTable(
+      reference.schema ? `${reference.schema}.${reference.table}` : reference.table,
+    );
+    if (!resolved) return null;
+    return this.store.tableIndexes(resolved.schema, resolved.table);
+  }
+
   async listTables(): Promise<TableRow[]> {
     if (!this.isEnabled()) return [];
     if (this.collector.inventoryNeedsRefresh()) {
@@ -710,7 +721,7 @@ export class SchemaCatalog {
       setImmediate(() => {
         const documentWake = this.referencesNeedDocuments(prepared.references)
           ? this.documents.ensureAwake().catch(() => {
-              // CatalogDocuments logs and remembers the document-only failure.
+              // 문서 축에만 생긴 실패는 CatalogDocuments가 로그로 남기고 기억한다.
             })
           : Promise.resolve();
         const queryUpdate = this.processQuery(prepared, result, error).catch(
@@ -799,12 +810,10 @@ export class SchemaCatalog {
       )
     ) {
       await this.documents.ensureAwake().catch(() => {
-        // The database usage path remains healthy when the document axis fails.
+        // 문서 축이 실패해도 데이터베이스 사용 기록 경로는 멀쩡히 돌아간다.
       });
     }
-    const columns = resultColumnNames(result.content?.[0]?.text ?? "").filter(
-      (column) => !this.options.isPIIColumn(column),
-    );
+    const columns = resultColumnNames(result.content?.[0]?.text ?? "");
     const now = new Date().toISOString();
     this.store.update((catalog) => {
       for (const value of unique.values()) {
@@ -823,12 +832,6 @@ export class SchemaCatalog {
       }
       if (succeeded) {
         for (const join of prepared.joins) {
-          if (
-            this.options.isPIIColumn(join.a.column) ||
-            this.options.isPIIColumn(join.b.column)
-          ) {
-            continue;
-          }
           const left = this.resolveTable(
             join.a.schema ? `${join.a.schema}.${join.a.table}` : join.a.table,
           );
@@ -883,10 +886,10 @@ export class SchemaCatalog {
     );
     this.store.update((catalog) => {
       for (const column of columns) {
-        // Membership is checked even when the query touched a single table.
-        // These names come from the result keys, so a projection like
-        // `COUNT(*) AS total` would otherwise persist `total` as a column of
-        // that table and `describe` would report it from then on.
+        // 쿼리가 테이블 하나만 건드렸더라도 그 컬럼이 어디 소속인지 확인한다. 이
+        // 이름들은 결과의 키에서 왔으므로, 확인하지 않으면 `COUNT(*) AS total`
+        // 같은 프로젝션이 `total`을 그 테이블의 컬럼으로 저장해 버리고, 이후
+        // `describe`가 계속 그것을 보고한다.
         const owners = [...unique.values()].filter((value) => {
           const table = catalog.schemas[value.schema]?.tables[value.table];
           return table?.columns.some((known) => sameName(known.name, column));
@@ -903,9 +906,9 @@ export class SchemaCatalog {
   }
 
   /**
-   * Record that we have just refreshed the inventory for an unresolvable name,
-   * evicting the oldest entries once the map reaches its bound. A Map iterates
-   * in insertion order, so re-inserting the key keeps eviction chronological.
+   * 해석되지 않는 이름 때문에 방금 인벤토리를 갱신했다는 사실을 기록한다. 맵이 상한에
+   * 닿으면 가장 오래된 항목부터 밀어낸다. Map은 삽입 순서로 순회하므로, 키를 다시 넣어
+   * 두면 밀려나는 순서가 시간 순으로 유지된다.
    */
   private rememberUnknownReference(key: string, at: number): void {
     this.unknownReferenceRefreshes.delete(key);
@@ -921,13 +924,13 @@ export class SchemaCatalog {
     if (!this.closePromise) {
       this.closing = true;
       this.closePromise = (async () => {
-        // A stdio client commonly closes stdin immediately after receiving its
-        // final tool result. Inventory, detail, and document work deliberately
-        // runs after that result, so drain it before the last durable flush.
+        // stdio 클라이언트는 마지막 도구 결과를 받자마자 stdin을 닫는 경우가 많다.
+        // 인벤토리, 상세, 문서 작업은 일부러 그 결과 뒤에 돌므로, 마지막 영속화
+        // flush 전에 이들을 모두 흘려보낸다.
         //
-        // The deadline is the point: our caller closes the pool and the SSH
-        // tunnel after us, and a task that never settles would leak both.
-        // Whatever is already recorded still gets persisted.
+        // 핵심은 데드라인이다. 우리를 부른 쪽이 우리 다음에 커넥션 풀과 SSH 터널을
+        // 닫는데, 영영 끝나지 않는 작업이 있으면 둘 다 샌다. 이미 기록된 내용은
+        // 그래도 저장된다.
         const deadline = Date.now() + CLOSE_DRAIN_DEADLINE_MS;
         while (this.backgroundTasks.size > 0) {
           const remaining = deadline - Date.now();
@@ -956,6 +959,7 @@ export class SchemaCatalog {
 
 export type {
   CatalogForgetScope,
+  CatalogIndexFacts,
   CatalogOptions,
   TableReference,
 } from "./types.js";

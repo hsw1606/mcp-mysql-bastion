@@ -1,0 +1,26 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1492.20"
+    },
+    "table": {
+      "table_name": "a",
+      "access_type": "ALL",
+      "rows_examined_per_scan": 10100,
+      "rows_produced_per_join": 3366,
+      "filtered": "33.33",
+      "cost_info": {
+        "read_cost": "1155.57",
+        "eval_cost": "336.63",
+        "prefix_cost": "1492.21",
+        "data_read_per_join": "99M"
+      },
+      "used_columns": [
+        "createdAt",
+        "id"
+      ],
+      "attached_condition": "(`haulla`.`a`.`createdAt` > TIMESTAMP'2024-01-01 00:00:00')"
+    }
+  }
+}

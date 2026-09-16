@@ -1,0 +1,84 @@
+{
+  "query_block": {
+    "union_result": {
+      "using_temporary_table": true,
+      "select_id": 3,
+      "table_name": "<union1,2>",
+      "access_type": "ALL",
+      "query_specifications": [
+        {
+          "dependent": false,
+          "cacheable": true,
+          "query_block": {
+            "select_id": 1,
+            "cost_info": {
+              "query_cost": "1492.20"
+            },
+            "table": {
+              "table_name": "account",
+              "access_type": "index",
+              "possible_keys": [
+                "PRIMARY"
+              ],
+              "key": "IDX_ee66d482ebdf84a768a7da36b0",
+              "used_key_parts": [
+                "accountNumber"
+              ],
+              "key_length": "1022",
+              "rows_examined_per_scan": 10100,
+              "rows_produced_per_join": 3366,
+              "filtered": "33.33",
+              "using_index": true,
+              "cost_info": {
+                "read_cost": "1155.57",
+                "eval_cost": "336.63",
+                "prefix_cost": "1492.21",
+                "data_read_per_join": "99M"
+              },
+              "used_columns": [
+                "id"
+              ],
+              "attached_condition": "(`haulla`.`account`.`id` < 10)"
+            }
+          }
+        },
+        {
+          "dependent": false,
+          "cacheable": true,
+          "query_block": {
+            "select_id": 2,
+            "cost_info": {
+              "query_cost": "1492.20"
+            },
+            "table": {
+              "table_name": "account",
+              "access_type": "index",
+              "possible_keys": [
+                "PRIMARY"
+              ],
+              "key": "IDX_ee66d482ebdf84a768a7da36b0",
+              "used_key_parts": [
+                "accountNumber"
+              ],
+              "key_length": "1022",
+              "rows_examined_per_scan": 10100,
+              "rows_produced_per_join": 3366,
+              "filtered": "33.33",
+              "using_index": true,
+              "cost_info": {
+                "read_cost": "1155.57",
+                "eval_cost": "336.63",
+                "prefix_cost": "1492.21",
+                "data_read_per_join": "99M"
+              },
+              "used_columns": [
+                "id"
+              ],
+              "attached_condition": "(`haulla`.`account`.`id` > 100)"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

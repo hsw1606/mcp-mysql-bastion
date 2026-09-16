@@ -24,6 +24,9 @@
     "./src/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    // 루트의 `./*.ts`에 걸리지만 서버의 일부가 아니다. 빼지 않으면
+    // `npm run build`가 dist/vitest.config.js를 같이 내보낸다.
+    "vitest.config.ts"
   ]
 }

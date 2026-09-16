@@ -1,11 +1,10 @@
 import type { CatalogFile, CatalogJoin, CatalogTable } from "./types.js";
 
-// `map` is an overview. Both unlinked lists grow with the schema — 164 tables
-// and 91 documents on a cold catalog — so they are sampled and counted rather
-// than emitted whole. describe and docs_list give the per-table detail.
+// `map`은 개요다. 연결 안 된 목록 둘은 스키마를 따라 자란다 — 갓 만든 카탈로그에서
+// 테이블 164개, 문서 91개다 — 그래서 통째로 내보내지 않고 표본과 개수만 준다.
+// 테이블별 상세는 describe와 docs_list가 준다.
 const UNLINKED_SAMPLE_LIMIT = 30;
 const HOT_TABLE_LIMIT = 10;
-const TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES = 2 * 1024;
 
 function sampled(values: string[]): {
   total: number;
@@ -42,11 +41,10 @@ function usedAt(table: CatalogTable): number {
 }
 
 /**
- * Successful reads are the primary signal and recency breaks ties. A failed
- * query means the model could not read that table, so counting attempts would
- * promote exactly the tables that answered nothing. The row estimate is a last
- * resort for the `map` overview only — the tool description drops unread tables
- * rather than guessing importance from size.
+ * 성공한 읽기가 주된 신호이고, 동점은 최근성으로 가른다. 실패한 쿼리는 모델이 그
+ * 테이블을 읽지 못했다는 뜻이다. 그래서 시도 횟수를 세면 아무것도 답하지 못한 테이블이
+ * 오히려 위로 올라온다. 행 추정치는 `map` 개요에서만 쓰는 최후의 수단이다 — 도구
+ * 설명은 크기로 중요도를 짐작하는 대신 읽힌 적 없는 테이블을 아예 뺀다.
  */
 function rankTables(tables: RankedTable[]): RankedTable[] {
   return tables.sort((a, b) => {
@@ -71,43 +69,63 @@ function allTables(catalog: CatalogFile): RankedTable[] {
   );
 }
 
-export function renderToolDescriptionSuffix(catalog: CatalogFile): string {
+/**
+ * 인기 테이블 목록 앞에 붙는 머리말.
+ *
+ * 예전에는 `"CATALOG HOT TABLES (most read first): "`였다. 이 파일이 모델에게
+ * 내보내는 다른 모든 문장은 한국어인데 이 한 줄만 영어라, AGENTS.md의 "한 파일
+ * 안에서 두 언어를 섞지 않는다"를 이 파일 스스로 어기고 있었다.
+ *
+ * 테스트가 문자열 리터럴을 따로 적지 않고 이것을 import하도록 export한다. 양쪽에
+ * 같은 문장을 적어 두면, 머리말을 바꿨을 때 "머리말이 없다"를 검사하는 경우가
+ * 조용히 언제나 통과하는 검사로 바뀐다.
+ */
+export const HOT_TABLES_HEADING = "\n\n카탈로그가 많이 읽은 테이블(읽은 순): ";
+
+/**
+ * `mysql_query` 도구 설명의 꼬리 부분. `budget` 글자 수에 맞춰 만든다.
+ *
+ * 예산은 기본 설명이 쓰고 남긴 몫이다. 도구 설명에 상한을 두는 클라이언트는 아무 말
+ * 없이 뒤에서부터 자르기 때문이다 — 그래서 여기서 넘치면 덜 중요한 글이 아니라 그저
+ * 맨 뒤에 놓인 글이 사라진다. 바이트가 아니라 글자로 세는 것은 상한 자체가 글자 수로
+ * 쓰여 있어서다. 이 한국어 안내를 UTF-8 바이트로 재면 실제 비용의 세 배로 쳐진다.
+ *
+ * 안내가 테이블 목록보다 우선한다. 하나는 지시이고, 다른 하나는 어차피
+ * `mysql_catalog map`이 전부 알려 주는 출발점 힌트일 뿐이다.
+ */
+export function renderToolDescriptionSuffix(
+  catalog: CatalogFile,
+  budget: number,
+): string {
   const staticGuidance =
     "\n\n테이블의 도메인 규칙·상태 코드 문서가 있을 수 있다. " +
     "SQL을 쓰기 전에 mysql_catalog describe로 확인하라.";
-  // Only tables a query has actually read. Seeding this from row estimates
-  // filled all ten slots with the largest event and log tables — the opposite
-  // of where a model should start — and that went into the tool description of
-  // every session. No list is better guidance than a wrong one.
+  if (staticGuidance.length > budget) return "";
+
+  // 쿼리가 실제로 읽은 테이블만 넣는다. 행 추정치로 채웠더니 열 자리가 전부 가장 큰
+  // 이벤트·로그 테이블로 찼다 — 모델이 출발해야 할 곳과 정반대다 — 그리고 그것이 모든
+  // 세션의 도구 설명에 실렸다. 틀린 목록보다는 목록이 없는 편이 나은 안내다.
+  //
+  // 이름만 적는다. 예전에 이름 뒤에 붙던 읽은 횟수와 날짜는 목록의 순위를 매기던
+  // 값인데, 목록은 이미 그 순서로 놓여 있다. 순서가 말해 주는 것을 굳이 적느라
+  // 테이블마다 55자쯤을 썼다. 순위 자체를 보고 싶은 사람에게는 `map`이 여전히 둘 다
+  // 알려 준다.
   const hot = rankTables(
     allTables(catalog).filter(({ entry }) => entry.usage.successCount > 0),
   )
     .slice(0, HOT_TABLE_LIMIT)
-    .map(({ app, schema, table, entry }) => {
-      const reads = entry.usage.successCount;
-      const signal =
-        `${reads} successful ${reads === 1 ? "query" : "queries"}` +
-        (entry.usage.lastUsedAt
-          ? `, last ${entry.usage.lastUsedAt.slice(0, 10)}`
-          : "");
-      return `\n  - ${app} -> ${schema}.${table} (${signal})`;
-    });
+    .map(({ schema, table }) => `${schema}.${table}`);
   if (hot.length === 0) return staticGuidance;
 
-  const heading =
-    "\n\nCATALOG HOT TABLES (most successful queries first, " +
-    "recency breaks ties):";
-  let suffix = heading;
-  for (const line of hot) {
-    if (
-      Buffer.byteLength(suffix + line + staticGuidance, "utf8") >
-      TOOL_DESCRIPTION_SUFFIX_LIMIT_BYTES
-    ) {
-      break;
-    }
-    suffix += line;
+  let listed = "";
+  for (const name of hot) {
+    const next = listed ? `${listed}, ${name}` : name;
+    if ((HOT_TABLES_HEADING + next + staticGuidance).length > budget) break;
+    listed = next;
   }
-  return suffix + staticGuidance;
+  // 아래에 아무것도 없는 제목은 잡음이다. 첫 이름조차 들어가지 못한 경우가 그렇다.
+  if (!listed) return staticGuidance;
+  return HOT_TABLES_HEADING + listed + staticGuidance;
 }
 
 export function renderMap(catalog: CatalogFile, warning: string | null = null): string {
@@ -168,7 +186,6 @@ export function searchCatalog(
   catalog: CatalogFile,
   query: string,
   limit: number,
-  isPIIColumn: (column: string) => boolean,
 ): SearchResult[] {
   const q = query.trim().toLowerCase();
   if (!q) return [];
@@ -177,11 +194,7 @@ export function searchCatalog(
     for (const [tableName, table] of Object.entries(schema.tables)) {
       const qualified = `${schemaName}.${tableName}`;
       const matchedColumns = table.columns
-        .filter(
-          (column) =>
-            !isPIIColumn(column.name) &&
-            matchScore(column.name, q, 40) > 0,
-        )
+        .filter((column) => matchScore(column.name, q, 40) > 0)
         .map((column) => column.name);
       let score = Math.max(
         matchScore(qualified, q, 80),
@@ -208,49 +221,9 @@ export function searchCatalog(
     .slice(0, limit);
 }
 
-/**
- * The column of a `schema.table.column` join endpoint. Joins reach the catalog
- * already filtered, but every other field of `describe` is filtered again here:
- * persistence and response are meant to be two independent PII boundaries, so
- * a future writer that skips the first one cannot leak through this path.
- */
-function joinEndpointColumn(endpoint: string): string {
-  return endpoint.slice(endpoint.lastIndexOf(".") + 1);
-}
-
-function safeTable(
-  table: CatalogTable,
-  isPIIColumn: (column: string) => boolean,
-): CatalogTable {
-  return {
-    ...table,
-    columns: table.columns.filter((column) => !isPIIColumn(column.name)),
-    pk: table.pk.filter((column) => !isPIIColumn(column)),
-    indexes: table.indexes
-      .map((index) => ({
-        ...index,
-        columns: index.columns.filter((column) => !isPIIColumn(column)),
-      }))
-      .filter((index) => index.columns.length > 0),
-    fks: table.fks.filter(
-      (fk) =>
-        !isPIIColumn(fk.column) && !isPIIColumn(fk.referencedColumn),
-    ),
-    usage: {
-      ...table.usage,
-      columns: Object.fromEntries(
-        Object.entries(table.usage.columns).filter(
-          ([column]) => !isPIIColumn(column),
-        ),
-      ),
-    },
-  };
-}
-
 export function renderDescribe(
   qualifiedName: string,
   table: CatalogTable,
-  isPIIColumn: (column: string) => boolean,
   documents: {
     configured: boolean;
     available: boolean;
@@ -286,16 +259,11 @@ export function renderDescribe(
       guidance: "상태 코드·도메인 규칙은 이 문서를 먼저 읽어라.",
     };
   }
-  const joins = observedJoins.filter(
-    (edge) =>
-      !isPIIColumn(joinEndpointColumn(edge.a)) &&
-      !isPIIColumn(joinEndpointColumn(edge.b)),
-  );
   return JSON.stringify(
     {
       table: qualifiedName,
-      ...safeTable(table, isPIIColumn),
-      ...(joins.length > 0 ? { observedJoins: joins } : {}),
+      ...table,
+      ...(observedJoins.length > 0 ? { observedJoins } : {}),
       docs,
       ...(documents.warning ? { warning: documents.warning } : {}),
     },
