@@ -448,7 +448,7 @@ Catalog 이전 형태인 `mysql://tables/<table>`(schema 없이 한 조각)도 �
 | `MYSQL_SSH_HOST` | alias에서 | bastion 호스트명. |
 | `MYSQL_SSH_PORT` | `22` | bastion SSH 포트. |
 | `MYSQL_SSH_USER` | alias에서 | bastion 사용자. |
-| `MYSQL_SSH_PRIVATE_KEY_PATH` | `~/.ssh/id_rsa` | bastion 인증에 쓰는 키. |
+| `MYSQL_SSH_PRIVATE_KEY_PATH` | alias `IdentityFile`, 없으면 `~/.ssh/id_rsa` | bastion 인증에 쓰는 키. |
 | `MYSQL_SSH_PASSPHRASE` | *(미설정)* | 암호화된 키일 때만 필요합니다. |
 | `MYSQL_SSH_LOCAL_PORT` | alias `LocalForward`, 없으면 `0` | 선호하는 loopback 포트. `0`은 자동 할당. 포트가 이미 쓰이고 있으면 자동 할당된 포트를 대신 씁니다. |
 | `MYSQL_SSH_REUSE_EXISTING` | `false` | 직접 열지 않고 해당 포트에 이미 떠 있는 forward에 붙습니다. 아래 경고를 참고하세요. |
@@ -705,8 +705,10 @@ custom wrapper를 의심하세요. 확인 방법:
 출력이 조금이라도 있다면 그것이 버그입니다.
 
 **`SSH private key not found` 또는 권한 오류.** 키 경로가 틀렸거나 읽을 수
-없습니다. `MYSQL_SSH_PRIVATE_KEY_PATH`의 기본값은 `~/.ssh/id_rsa`이며, 키는
-`chmod 600`이어야 하고 암호화되어 있다면 `MYSQL_SSH_PASSPHRASE`가 필요합니다.
+없습니다. 오류 메시지에 서버가 고른 경로가 나옵니다. 서버는 키를
+`MYSQL_SSH_PRIVATE_KEY_PATH`, alias의 `IdentityFile`, `~/.ssh/id_rsa` 순으로
+고릅니다. 키는 `chmod 600`이어야 하고 암호화되어 있다면
+`MYSQL_SSH_PASSPHRASE`가 필요합니다.
 
 **`[ssh] local port N is taken; opening our own tunnel on an auto-assigned port
 instead.`** 오류가 아니라 정상 동작입니다. 서버는 남의 tunnel을 빌리지 않고 OS가
