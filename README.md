@@ -128,9 +128,21 @@ Wrapper를 직접 실행하세요. env 파일, credentials, SSH 키를 검증한
 ./bin/mcp-mysql-stage.sh
 ```
 
-아무 출력이 없으면 성공입니다 — 서버가 떴고 stdout이 깨끗하다는 뜻입니다.
-`Ctrl-C`로 중단하세요. 설정이 잘못됐다면 이유를 stderr에 찍고 0이 아닌 코드로
-종료합니다.
+몇 초 기다려도 종료되지 않으면 성공입니다. 서버는 뜰 때 DB 연결을 한 번 시험하고,
+설정이나 접속이 잘못됐다면 이유를 stderr에 찍고 0이 아닌 코드로 종료합니다.
+확인했으면 `Ctrl-C`로 중단하세요.
+
+성공해도 stderr에 `[catalog]`로 시작하는 줄이 나올 수 있습니다. 아래 셋은 정상
+안내입니다:
+
+- `[catalog] loaded <경로>` — 저장해 둔 catalog를 불러왔습니다.
+- `[catalog] inventory scan complete: ...` — 첫 스캔을 마쳤습니다.
+- `[catalog] disabled: MYSQL_APP_SCHEMAS declares no schema ...` — 선언된
+  schema가 없어 catalog를 켜지 않았습니다. 위 예시 profile이 이 경우입니다.
+
+`[catalog] disabled:` 뒤에 다른 이유(`cannot initialize`, `cannot write`)가
+나오면 catalog 파일을 다루지 못한 것입니다. 쿼리는 계속 되지만 catalog는
+꺼지므로 `MYSQL_CATALOG_PATH`를 확인하세요.
 
 무슨 일을 하는지 보고 싶다면 profile에 `ENABLE_LOGGING=true`(`1`도 받습니다)를
 넣고 `[ssh]` 줄을 확인하세요. 모든 줄 앞에는 `log()`가 붙이는 `[info]`/`[error]`
