@@ -49,17 +49,16 @@ for var in MYSQL_USER MYSQL_PASS; do
 done
 
 # tunnel에는 ssh_config alias가 있거나, host와 user를 직접 적어야 한다.
-if [ "${MYSQL_SSH_ENABLED:-false}" = "true" ]; then
-  if [ -z "${MYSQL_SSH_CONFIG_HOST:-}" ]; then
-    for var in MYSQL_SSH_HOST MYSQL_SSH_USER; do
-      [ -n "${!var:-}" ] || missing+=("${var}")
-    done
-  fi
-  KEY_PATH="${MYSQL_SSH_PRIVATE_KEY_PATH:-${HOME}/.ssh/id_rsa}"
-  # 맨 앞의 ~를 서버와 같은 방식으로 풀어 준다.
-  KEY_PATH="${KEY_PATH/#\~/${HOME}}"
-  [ -r "${KEY_PATH}" ] || die "SSH private key is not readable: ${KEY_PATH}
-If this runs under a sandbox, grant read access to the key and outbound network access."
+#
+# 키 파일은 여기서 확인하지 않는다. 서버는 키를 MYSQL_SSH_PRIVATE_KEY_PATH,
+# alias의 IdentityFile, ~/.ssh/id_rsa 순으로 고르는데, 여기서 같은 확인을 하려면
+# ssh_config 해석을 bash로 한 벌 더 만들어야 한다. 한때 앞의 하나와 마지막
+# 하나만 보는 확인이 있었고, IdentityFile을 적은 alias를 id_rsa가 없다는 이유로
+# 거절했다. 키가 없으면 서버의 resolveTunnelConfig()가 경로를 밝히며 멈춘다.
+if [ "${MYSQL_SSH_ENABLED:-false}" = "true" ] && [ -z "${MYSQL_SSH_CONFIG_HOST:-}" ]; then
+  for var in MYSQL_SSH_HOST MYSQL_SSH_USER; do
+    [ -n "${!var:-}" ] || missing+=("${var}")
+  done
 fi
 
 if [ ${#missing[@]} -gt 0 ]; then
